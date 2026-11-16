@@ -65,7 +65,7 @@ A flake is a Scheme file whose value is a `<flake>` record.
     (name 'guix)
     (type 'channel)
     (url "https://github.com/hurdkit/goonix")
-    (branch "main"))
+    (branch "goonix"))
    ;; Another flake. Its outputs become available under `inputs`.
    (flake-input
     (name 'toolchain)
@@ -133,7 +133,7 @@ S-expression, so that it can be read with `read` and no code is evaluated:
   ((guix
     (type channel)
     (url "https://github.com/hurdkit/goonix")
-    (branch "main")
+    (branch "goonix")
     (commit "…40 hex digits…")
     (nar-sha256 "…nix-base32…"))
    (toolchain
