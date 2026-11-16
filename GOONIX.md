@@ -8,7 +8,8 @@ unchanged next to this file.
 |---|---|
 | Upstream | `https://codeberg.org/guix/guix.git`, branch `master` |
 | Fork point | commit `fd49d69fbe07557f0bf55bc7e556e60fc5b13082` (2026-11-11), Guix 1.5.0 development series |
-| Our branch | `main` |
+| Our branch | `goonix`: the fork point plus our commits |
+| `main` | a mirror of upstream `master`, without our commits |
 | Licence | GPL-3.0-or-later, unchanged (see `COPYING`) |
 
 ## Why it exists
@@ -34,15 +35,15 @@ services.guix.enable = true;
 Build and run the fork:
 
 ```sh
-nix build github:hurdkit/goonix        # ./result/bin/guix
-nix run   github:hurdkit/goonix -- --version
+nix build github:hurdkit/goonix/goonix        # ./result/bin/guix
+nix run   github:hurdkit/goonix/goonix -- --version
 ```
 
 Pin it from another flake:
 
 ```nix
 {
-  inputs.goonix.url = "github:hurdkit/goonix";
+  inputs.goonix.url = "github:hurdkit/goonix/goonix";
 
   outputs = { self, nixpkgs, goonix }: {
     devShells.x86_64-linux.default =
@@ -105,9 +106,13 @@ missing from the build.
 
 ## Merging from upstream
 
+`main` follows upstream; our work is on `goonix`, which merges `main`:
+
 ```sh
 git remote add upstream https://codeberg.org/guix/guix.git   # once
 git fetch upstream master
+git push origin upstream/master:main    # main mirrors upstream
+git checkout goonix
 git merge upstream/master
 ```
 
