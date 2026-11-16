@@ -34,15 +34,15 @@ services.guix.enable = true;
 Build and run the fork:
 
 ```sh
-nix build github:77787777778777/goonix        # ./result/bin/guix
-nix run   github:77787777778777/goonix -- --version
+nix build github:hurdkit/goonix        # ./result/bin/guix
+nix run   github:hurdkit/goonix -- --version
 ```
 
 Pin it from another flake:
 
 ```nix
 {
-  inputs.goonix.url = "github:77787777778777/goonix";
+  inputs.goonix.url = "github:hurdkit/goonix";
 
   outputs = { self, nixpkgs, goonix }: {
     devShells.x86_64-linux.default =

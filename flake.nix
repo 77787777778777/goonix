@@ -37,8 +37,8 @@
 
           meta = old.meta // {
             description = "Fork of GNU Guix, a functional package manager with a Scheme interface";
-            homepage = "https://github.com/77787777778777/goonix";
-            changelog = "https://github.com/77787777778777/goonix/blob/main/NEWS";
+            homepage = "https://github.com/hurdkit/goonix";
+            changelog = "https://github.com/hurdkit/goonix/blob/main/NEWS";
             maintainers = [ ];
           };
         });
