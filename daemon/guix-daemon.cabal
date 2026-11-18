@@ -14,18 +14,29 @@ library
     import: warnings
     hs-source-dirs: src
     exposed-modules:
+        Goonix.Config
         Goonix.Store.Base32
+        Goonix.Store.Config
+        Goonix.Store.Database
         Goonix.Store.Derivation
         Goonix.Store.Hash
         Goonix.Store.Nar
         Goonix.Store.Path
+        Goonix.Store.ReadOnly
         Goonix.Store.References
+        Goonix.Store.Server
+        Goonix.Store.Settings
+        Goonix.Store.Socket
+        Goonix.Store.Substitute
         Goonix.Store.Wire
-    extra-libraries: gcrypt
+    c-sources: cbits/sockets.c
+    extra-libraries: gcrypt sqlite3
     build-depends:
         base >=4.20 && <5,
         bytestring >=0.12,
         containers >=0.7,
+        directory >=1.3,
+        process >=1.6,
         unix >=2.8
 
 executable guix-daemon
@@ -93,4 +104,27 @@ test-suite wire-proxy
         process,
         network,
         unix,
+        guix-daemon-hs
+
+executable goonix-readonly-probe
+    import: warnings
+    hs-source-dirs: test/readonly
+    main-is: RawClient.hs
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        bytestring,
+        network,
+        guix-daemon-hs
+
+executable goonix-activation-probe
+    import: warnings
+    hs-source-dirs: test/readonly
+    main-is: Activate.hs
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        network,
+        unix,
+        directory,
         guix-daemon-hs

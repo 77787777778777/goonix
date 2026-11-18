@@ -44,18 +44,27 @@
             packages.guix-daemon-hs.source = ./daemon;
             # gcrypt is the C library used by libutil/hash.cc, not Hackage.
             otherOverlays = [
-              (self: super: { gcrypt = nixpkgs.legacyPackages.${system}.libgcrypt; })
+              (self: super: {
+                gcrypt = nixpkgs.legacyPackages.${system}.libgcrypt;
+                sqlite = nixpkgs.legacyPackages.${system}.sqlite.out;
+                sqlite3 = nixpkgs.legacyPackages.${system}.sqlite.out;
+              })
             ];
             settings.guix-daemon-hs = {
               # These suites need the external store vectors and proxy path.
               # They are run explicitly, not by the package's generic checkPhase.
               check = false;
-              librarySystemDepends = [ nixpkgs.legacyPackages.${system}.libgcrypt ];
+              librarySystemDepends = [
+                nixpkgs.legacyPackages.${system}.libgcrypt
+                nixpkgs.legacyPackages.${system}.sqlite
+              ];
             };
             autoWire = [ ];
             devShell = {
               extraLibraries = hp: {
                 gcrypt = nixpkgs.legacyPackages.${system}.libgcrypt;
+                sqlite = nixpkgs.legacyPackages.${system}.sqlite.out;
+                sqlite3 = nixpkgs.legacyPackages.${system}.sqlite.out;
               };
               hoogle = false;
               tools = hp: {
