@@ -675,6 +675,25 @@ static void checkSiblingOrder(const Path & root)
         "referenced sibling is finalised before its dependent");
 }
 
+static void checkOpaqueUtf(const Path & root)
+{
+    configureIsolatedStore(root);
+    string token = baseNameOf(tokenPath("out", "utf")).substr(0, 32);
+    for (unsigned width : {2, 4}) {
+        Path file = root + (width == 2 ? "/utf16" : "/utf32");
+        string bytes;
+        for (char c : token) {
+            bytes.push_back(c);
+            for (unsigned i = 1; i < width; ++i) bytes.push_back(0);
+        }
+        writeFile(file, bytes);
+        string replacement(token.size(), 'x');
+        check(throws([&] { checkRewriteForTest(file, token, replacement); }),
+            width == 2 ? "UTF-16 self-reference is refused" :
+                         "UTF-32 self-reference is refused");
+    }
+}
+
 static void checkOpaqueFragmentBoundary(const Path & root)
 {
     configureIsolatedStore(root);
@@ -707,6 +726,10 @@ static void checkInverseFragmentBoundary(const Path & root)
 
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--opaque-utf") {
+        checkOpaqueUtf(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--inverse-fragment") {
         checkInverseFragmentBoundary(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -59,6 +59,7 @@ if BUILD_DAEMON
 # given an empty directory.
 goonix_ca_store_checks =			\
   inverse-fragment				\
+  opaque-utf					\
   fragment-boundary				\
   sibling-order					\
   staged					\

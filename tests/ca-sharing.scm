@@ -85,8 +85,9 @@
     (build-derivations store (list one))
     (build-derivations store (list two))
     (and (string=? (realised one) (realised two))
-         ;; Both resolved derivations are identical, so one record suffices.
-         (= 1 (length (build-records (resolved-hash one) "out"))))))
+         ;; The environment entry remains in each resolved derivation.  Check
+         ;; the second one's record without claiming that the two R are equal.
+         (= 1 (length (build-records (resolved-hash two) "out"))))))
 
 (test-assert "the choice is authoritative across rebuilds"
   (let* ((drv (ca-drv "rec-choice" (write-output "chosen")))

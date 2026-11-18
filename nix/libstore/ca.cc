@@ -435,7 +435,9 @@ static void rewriteRegularFile(const Path & path, const string & from,
             throw SysError(std::format("reading `{}' for CA rewrite", path)); }
         if (n == 0) break;
         pending.append((const char *) buffer.data(), n);
-        size_t keep = from.size() - 1;
+        /* Keep enough bytes for a UTF-32LE token that crosses the read
+           boundary, not merely a plain token. */
+        size_t keep = from.size() * 4 - 1;
         size_t process = pending.size() > keep ? pending.size() - keep : 0;
         /* A prefix of FROM at the end is a potential whole match crossing
            the next read, not an opaque fragment at this boundary. */

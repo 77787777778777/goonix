@@ -6,6 +6,7 @@
              (guix derivations)
              (guix build utils)
              (ice-9 match)
+             (ice-9 binary-ports)
              (ice-9 ftw)
              (ice-9 threads)
              (srfi srfi-1)
@@ -74,6 +75,11 @@
   (string-append "(call-with-output-file out (lambda (p) (display " 
                  (object->string text) " p)))"))
 
+(define (write-output-bytes bytes)
+  (string-append "(use-modules (rnrs bytevectors) (ice-9 binary-ports))\n"
+                 "(call-with-output-file out (lambda (p) (put-bytevector p "
+                 (object->string bytes) ")) #:binary #t)"))
+
 (define (read-all file) (call-with-input-file file get-string-all))
 (define (realised drv) (realised-output-path store drv "out"))
 
@@ -96,13 +102,47 @@
         (build-derivations store (list drv)))
       #f)))
 
+(define (protocol-error-matching? drv text)
+  (guard (condition ((store-protocol-error? condition)
+                     (string-contains (store-protocol-error-message condition) text)))
+    (build-derivations store (list drv))
+    #f))
+
 (define (build-fails-with? drv text)
-  (and=> (failed-build-log drv) (cut string-contains <> text)))
+  (let ((log (failed-build-log drv)))
+    (when (or (not log) (not (string-contains log text)))
+      (format (current-error-port) "expected build failure ~s for ~a; log: ~s\n"
+              text (derivation-file-name drv) log))
+    (and (string? log) (string-contains log text) text)))
 
 (define (matching-store-files suffix)
   (map (lambda (name) (string-append (%store-prefix) "/" name))
        (scandir (%store-prefix)
                 (lambda (name) (string-suffix? suffix name)))))
+
+(define (count-build-started log drv)
+  "Count actual daemon build events for DRV, not protocol build requests."
+  (let ((prefix (string-append "@ build-started " drv " ")))
+    (length (filter (lambda (line) (string-prefix? prefix line))
+                    (string-split log #\newline)))))
+
+(define (build-recording-events drvs)
+  "Build DRVS and return their daemon build log as a string."
+  (let ((log (open-output-string)))
+    (parameterize ((current-build-output-port log))
+      (build-derivations store drvs))
+    (get-output-string log)))
+
+(define (build-started-path log)
+  (let* ((prefix "@ build-started ")
+         (line (find (lambda (line) (string-prefix? prefix line))
+                     (string-split log #\newline))))
+    (and line
+         (first (string-split (string-drop line (string-length prefix))
+                              #\space)))))
+
+(define (resolved-derivation-for drv)
+  (path-info-deriver (query-path-info store (realised drv))))
 
 (define (resolved-derivation-with-output name output)
   (find (lambda (file)
@@ -127,40 +167,52 @@
     (build-derivations store (list drv))
     (realised drv)))
 
-(test-assert "input-addressed derivation bytes remain unchanged"
-  (let ((drv (shell-drv "legacy-identity" (write-output "legacy")
-                        #:addressing 'input)))
-    (and (not (assoc "goonixAddressing" (derivation-builder-environment-vars drv)))
-         (not (placeholder-path? (derivation->output-path drv)))
-         (not (token-store-path? (derivation->output-path drv)))
-         (string=? (derivation-file-name drv)
-                   (derivation-file-name
-                    (derivation store "legacy-identity" bootstrap-guile
-                                `("--no-auto-compile"
-                                  ,(car (derivation-sources drv)))
-                                #:inputs (list guile-drv)
-                                #:sources (derivation-sources drv)
-                                #:addressing 'input
-                                #:env-vars (derivation-builder-environment-vars drv)))))))
+(test-group "input-addressed derivation compatibility"
+  ;; Literal canonical upstream derivation, independent of the CA constructor.
+  ;; Its output hash is the SHA-256 of this byte sequence.
+  (let* ((text "Derive([(\"out\",\"\",\"\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[\"-c\",\"printf legacy > \\\"$out\\\"\"],[(\"out\",\"\")])")
+         (expected "/gnu/store/xi66n3jhg82kr6bn6l1ggxik9irl7z14-legacy-identity")
+         (drv (read-derivation (open-input-string text))))
+    (test-equal "upstream input-addressed output path"
+      expected (parameterize ((%store-prefix "/gnu/store"))
+                 ((@@ (guix store) output-path)
+                  "out" (derivation-hash drv) "legacy-identity")))
+    (test-equal "upstream input-addressed derivation bytes round-trip"
+      (string->utf8 text)
+      (derivation->bytevector (derivation/masked-inputs drv)))
+    (test-equal "input-addressed derivation has no CA addressing metadata"
+      #f (assoc "goonixAddressing" (derivation-builder-environment-vars drv)))
+    (test-equal "input-addressed derivation has no placeholder"
+      #f (placeholder-path? (derivation->output-path drv)))
+    (test-equal "input-addressed derivation has no self token"
+      #f (token-store-path? (derivation->output-path drv)))))
 
-(test-assert "an unused variable changes neither output nor build"
-  (let* ((one (shell-drv "ca-unused" (write-output "stable")
+(test-group "unused variables retain distinct resolved derivations"
+  (let* ((name (fresh-name "ca-unused"))
+         (one (shell-drv name (write-output "stable")
                          #:env-vars '(("unused" . "one"))))
-         (two (shell-drv "ca-unused" (write-output "stable")
+         (two (shell-drv name (write-output "stable")
                          #:env-vars '(("unused" . "two"))))
          (token (derivation->output-path one)))
-    (test-assert "unused-variable derivation has a placeholder"
-      (placeholder-path? token))
-    (test-assert "unused-variable derivation identities differ"
-      (not (string=? (derivation-file-name one) (derivation-file-name two))))
-    (test-assert "unused-variable derivations build"
-      (build-derivations store (list one two)))
-    (test-equal "unused-variable derivations share one result"
-      (realised one) (realised two))
-    (test-equal "unused-variable result contents"
-      "stable" (read-all (realised one)))
-    (test-assert "unused-variable builds are not cached failures"
-      (null? (query-failed-paths store)))))
+    (test-equal "unused-variable derivation has a placeholder"
+      #t (placeholder-path? token))
+    (test-equal "unused-variable derivation identities differ"
+      #f (string=? (derivation-file-name one) (derivation-file-name two)))
+    (let* ((one-log (build-recording-events (list one)))
+           (one-resolved (build-started-path one-log))
+           (two-log (build-recording-events (list two)))
+           (two-resolved (build-started-path two-log)))
+      (test-equal "unused-variable resolved derivations differ"
+        #f (string=? one-resolved two-resolved))
+      (test-equal "two distinct resolved derivations build once each"
+        2 (+ (count-build-started one-log one-resolved)
+             (count-build-started two-log two-resolved)))
+      (test-equal "unused-variable derivations share one result"
+        (realised one) (realised two))
+      (test-equal "unused-variable result contents"
+        "stable" (read-all (realised one)))
+      (test-equal "unused-variable builds are not cached failures"
+        '() (query-failed-paths store)))))
 
 (test-assert "a second identical CA result is reused without overwriting"
   (let* ((one (shell-drv "ca-existing" (write-output "same")
@@ -183,42 +235,75 @@
                  "(call-with-output-file (string-append out \"/executable\") (lambda (p) (display \"#!/bin/sh\\n\" p)))\n"
                  "(chmod (string-append out \"/executable\") #o755)\n")))
          (path (begin (build-derivations store (list drv)) (realised drv))))
-    (and (not (string-contains (call-with-input-file
-                                  (string-append path "/reference") get-string-all)
-                               (self-token "out")))
+    (and (string=? path
+                   (call-with-input-file
+                    (string-append path "/reference") get-string-all))
          (string=? (basename path)
                    (readlink (string-append path "/link")))
          (file-exists? (string-append path "/" (basename path)))
          (verify-store store #:check-contents? #t #:repair? #f))))
 
-(test-assert "identical dependency content cuts off the downstream chain"
-  (let* ((a1 (shell-drv "ca-a" (write-output "A") #:env-vars '(("v" . "1"))))
-         (a2 (shell-drv "ca-a" (write-output "A") #:env-vars '(("v" . "2"))))
-         (b (shell-drv "ca-b"
-                       "(call-with-output-file out (lambda (p) (display (call-with-input-file (car inputs) (lambda (port) (read-all port))) p) (display \"B\" p)))"
-                       #:inputs `((,a1))))
-         (c (shell-drv "ca-c"
-                       "(call-with-output-file out (lambda (p) (display (call-with-input-file (car inputs) (lambda (port) (read-all port))) p) (display \"C\" p)))"
-                       #:inputs `((,b)))))
-    (build-derivations store (list a1))
-    (build-derivations store (list a2))
-    (and (string=? (realised a1) (realised a2))
-         (build-derivations store (list c))
-         (string=? "ABC" (read-all (realised c))))))
+(test-group "identical dependency content cuts off the downstream chain"
+  (let* ((a-name (fresh-name "ca-a"))
+         (b-name (fresh-name "ca-b"))
+         (c-name (fresh-name "ca-c"))
+         (a1 (shell-drv a-name (write-output "A") #:env-vars '(("v" . "1"))))
+         (a2 (shell-drv a-name (write-output "A") #:env-vars '(("v" . "2"))))
+         (b (lambda (a)
+              (shell-drv b-name
+                         "(call-with-output-file out (lambda (p) (display (call-with-input-file (car inputs) (lambda (port) (read-all port))) p) (display \"B\" p)))"
+                         #:inputs `((,a)))))
+         (c (lambda (b)
+              (shell-drv c-name
+                         "(call-with-output-file out (lambda (p) (display (call-with-input-file (car inputs) (lambda (port) (read-all port))) p) (display \"C\" p)))"
+                         #:inputs `((,b)))))
+         (b1 (b a1)) (b2 (b a2)) (c1 (c b1)) (c2 (c b2)))
+    (let ((first-log (build-recording-events (list a1)))
+          (first-chain-log (build-recording-events (list c1))))
+      (build-derivations store (list a2))
+      (test-equal "both A recipes resolve to the same content"
+        (realised a1) (realised a2))
+      (test-equal "first chain builds B once"
+        1 (count-build-started first-chain-log (resolved-derivation-for b1)))
+      (test-equal "first chain builds C once"
+        1 (count-build-started first-chain-log (resolved-derivation-for c1)))
+      (let ((second-chain-log (build-recording-events (list c2))))
+        (test-equal "B2 has the same resolved derivation as B1"
+          (resolved-derivation-for b1) (resolved-derivation-for b2))
+        (test-equal "C2 has the same resolved derivation as C1"
+          (resolved-derivation-for c1) (resolved-derivation-for c2))
+        (test-equal "second chain builds neither B nor C"
+          0 (+ (count-build-started second-chain-log
+                                    (resolved-derivation-for b2))
+               (count-build-started second-chain-log
+                                    (resolved-derivation-for c2))))
+        (test-equal "second chain uses the first chain's output"
+          (realised c1) (realised c2))
+        (test-equal "cutoff result content"
+          "ABC" (read-all (realised c2)))))))
 
-(test-assert "an unresolved placeholder in an output is refused"
+(test-group "unresolved placeholders are refused at resolution and in outputs"
   (let* ((a (shell-drv "ca-placeholder-input" (write-output "A")))
          (unresolved (placeholder (derivation->bytevector a) "out"
                                   "ca-placeholder-input"))
-         (b (shell-drv "ca-placeholder-output"
-                       (string-append
-                        "(call-with-output-file out (lambda (p) (display \""
-                        unresolved "\" p)))"))))
-    (guard (condition ((store-protocol-error? condition)
-                       (string-contains (store-protocol-error-message condition)
-                                        "placeholder")))
-      (build-derivations store (list b))
-      #f)))
+         (placeholder-parts (list (substring unresolved 0 24)
+                                  (substring unresolved 24)))
+         (in-input (shell-drv "ca-placeholder-in-recipe"
+                              (string-append "(call-with-output-file out "
+                                             "(lambda (p) (display \""
+                                             unresolved "\" p)))")))
+         (in-output (shell-drv "ca-placeholder-output"
+                               (string-append
+                                "(call-with-output-file out (lambda (p) (display (string-append "
+                                (object->string (car placeholder-parts)) " "
+                                (object->string (cadr placeholder-parts)) ") p)))"))))
+    (test-equal "a placeholder in the input recipe is refused during resolution"
+      "unresolved placeholder"
+      (and (protocol-error-matching? in-input "unresolved placeholder")
+           "unresolved placeholder"))
+    (test-equal "a placeholder created by the builder is refused by the output scanner"
+      "unresolved goonix placeholder"
+      (build-fails-with? in-output "unresolved goonix placeholder"))))
 
 (test-assert "--check preserves a self-referencing result and its choice"
   (let* ((drv (shell-drv "ca-check-self"
@@ -230,13 +315,37 @@
          (valid-path? store out)
          (verify-store store #:check-contents? #t #:repair? #f))))
 
+(test-group "opaque self-reference encodings are refused"
+  (let ((token (self-token "out")))
+    (test-equal "a split self-token fragment is refused"
+      "opaque self-reference fragment"
+      (build-fails-with?
+       (shell-drv "ca-split-token"
+                  (write-output-bytes (string->utf8 (substring token 3 15))))
+       "opaque self-reference fragment"))
+    (for-each
+     (lambda (width)
+       (let ((bytes (u8-list->bytevector
+                     (append-map
+                      (lambda (character)
+                        (append (list (char->integer character))
+                                (make-list (- width 1) 0)))
+                      (string->list token)))))
+         (test-equal (format #f "a UTF-~aLE self token is refused" (* 8 width))
+           (format #f "UTF-~a self-reference" (* 8 width))
+           (build-fails-with?
+            (shell-drv (format #f "ca-utf-~a" (* 8 width))
+                       (write-output-bytes bytes))
+            (format #f "UTF-~a self-reference" (* 8 width))))))
+     '(2 4))))
+
 (test-assert "resolved-addressed fallback builds at its final path"
-  (let ((drv (shell-drv "ca-resolved" (write-output "resolved")
-                        #:addressing 'resolved)))
-    (and (build-derivations store (list drv))
-         (direct-store-path? (realised drv))
-         (not (placeholder-path? (realised drv)))
-         (string=? "resolved" (read-all (realised drv))))))
+  (let* ((drv (shell-drv "ca-resolved" (write-output "resolved")
+                         #:addressing 'resolved))
+         (path (begin (build-derivations store (list drv)) (realised drv))))
+    (and (direct-store-path? path)
+         (not (placeholder-path? path))
+         (string=? "resolved" (read-all path)))))
 
 (test-assert "sibling output references are rewritten and registered"
   (let ((drv (shell-drv "ca-multi"
