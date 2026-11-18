@@ -1,6 +1,7 @@
 # Flakes for goonix: design note
 
-Status: design only. Nothing in this note is implemented.
+Status: the first design, kept for its reasoning. What the code does, and
+where it departs from this note, is in [`flakes.md`](flakes.md).
 
 This note describes a Guix-native counterpart of Nix flakes for goonix: a
 project declares what it depends on and what it provides in one Scheme
