@@ -3303,6 +3303,7 @@ void DerivationGoal::registerOutputs()
     auto discardGoonixOutputs = [&] {
         for (auto & output : goonixFinalOutputs)
             if (goonixStagedOutputs.count(output.second) &&
+                !worker.store.isValidPath(output.second) &&
                 pathExists(output.second))
                 deletePath(output.second);
     };
@@ -3368,12 +3369,14 @@ void DerivationGoal::registerOutputs()
                 continue;
             }
             ValidPathInfo info;
+            bool created = false;
             info.path = path;
             Path final = finaliseContentOutput(worker.store, path,
                 i.first, storePathToName(path), allPaths, info.references,
-                info.hash, info.narSize, goonixFinalOutputs, finalisationPath);
+                info.hash, info.narSize, goonixFinalOutputs, finalisationPath,
+                &created);
             goonixFinalOutputs[path] = final;
-            goonixStagedOutputs.insert(final);
+            if (created) goonixStagedOutputs.insert(final);
             worker.store.addTempRoot(final);
             info.path = final;
             info.deriver = drvPath;

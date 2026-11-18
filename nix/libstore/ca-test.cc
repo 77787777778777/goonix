@@ -169,8 +169,10 @@ static void checkExistingItemIsUntouched(const Path & root)
     PathSet references;
     Hash narHash;
     uint64_t narSize = 0;
+    bool created = false;
     Path final = finaliseContentOutput(store, token, "out", "existing-output",
-        PathSet{token}, references, narHash, narSize);
+        PathSet{token}, references, narHash, narSize, {}, "", &created);
+    check(created, "a newly moved final tree is owned by its finaliser");
     ValidPathInfo valid;
     valid.path = final;
     valid.hash = narHash;
@@ -187,7 +189,8 @@ static void checkExistingItemIsUntouched(const Path & root)
     createDirs(againToken);
     writeFile(againToken + "/reference", againToken);
     Path again = finaliseContentOutput(store, againToken, "out", "existing-output",
-        PathSet{againToken}, references, narHash, narSize);
+        PathSet{againToken}, references, narHash, narSize, {}, "", &created);
+    check(!created, "an existing valid final tree is not caller-owned");
     check(again == final, "existing result is reused at the same address");
     check(readFile(final + "/reference") == final,
         "existing self-reference remains in final form");
@@ -215,6 +218,33 @@ static void checkExistingItemIsUntouched(const Path & root)
         "failed early-cutoff comparison leaves the linked item untouched");
     check(readFile(final + "/reference") == againToken,
         "failed early-cutoff comparison leaves the existing item untouched");
+}
+
+static void checkInvalidLeftoverIsReplaced(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "leftover-output");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, token, "out", "leftover-output",
+        PathSet{token}, references, narHash, narSize);
+    /* This simulates a daemon death after the rename but before registration.
+       The final tree has the right content but is not valid. */
+    check(!store.isValidPath(final), "leftover fixture is not registered");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    bool created = false;
+    Path recovered = finaliseContentOutput(store, token, "out", "leftover-output",
+        PathSet{token}, references, narHash, narSize, {}, "", &created);
+    check(recovered == final, "leftover is recovered at its content address");
+    check(created, "recovered leftover belongs to this finalisation");
+    check(readFile(final + "/reference") == final,
+        "recovered leftover contains the final self reference");
 }
 
 static void checkSiblingOutputReferences(const Path & root)
@@ -384,6 +414,10 @@ int main(int argc, char ** argv)
     }
     if (argc == 2 && string(argv[1]) == "--placeholder-vector") {
         checkPlaceholderVector();
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--leftover") {
+        checkInvalidLeftoverIsReplaced(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--siblings") {

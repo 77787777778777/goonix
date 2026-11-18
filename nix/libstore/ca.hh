@@ -59,11 +59,13 @@ Path resolvedAddressedPath(const string & output, const string & name,
     const string & resolvedBytes);
 
 /* Canonicalise and rewrite an entire filesystem tree, then prove the inverse
-   mapping reproduces the original tree hash.  Returns the final path. */
+   mapping reproduces the original tree hash.  Returns the final path.  When
+   CREATED is supplied, it is true only if this call moved a new tree there;
+   an existing valid or same-build sibling path is never owned by the caller. */
 Path finaliseContentOutput(class LocalStore & store, const Path & tokenPath,
     const string & output, const string & name, const PathSet & allPaths,
     PathSet & references, Hash & narHash, uint64_t & narSize,
     const std::map<Path, Path> & finalOutputs = {},
-    const Path & actualTokenPath = "");
+    const Path & actualTokenPath = "", bool * created = nullptr);
 
 }

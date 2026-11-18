@@ -668,8 +668,10 @@ static bool sameContent(const Path & path, const string & final,
 Path finaliseContentOutput(LocalStore & store, const Path & token,
     const string & output, const string & name, const PathSet & allPaths,
     PathSet & references, Hash & narHash, uint64_t & narSize,
-    const std::map<Path, Path> & finalOutputs, const Path & actualTokenPath)
+    const std::map<Path, Path> & finalOutputs, const Path & actualTokenPath,
+    bool * created)
 {
+    if (created) *created = false;
     const Path physical = actualTokenPath.empty() ? token : actualTokenPath;
     PathSet referencePaths = allPaths;
     for (auto & sibling : finalOutputs)
@@ -701,10 +703,15 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         for (auto & sibling : finalOutputs)
             stagedSibling = stagedSibling || sibling.second == final ||
                 (physical == sibling.first && final == sibling.second);
-        if (!store.isValidPath(final) && !stagedSibling)
-            throw BuildError(std::format(
-                "CA final path `{0}' exists but is not a valid store item", final));
-        if (stagedSibling && !store.isValidPath(final)) {
+        if (!store.isValidPath(final) && !stagedSibling) {
+            /* A daemon that died between the rename and registration leaves
+               an unregistered tree here.  The token lock prevents another
+               build of this output from concurrently creating it.  The new
+               token tree has independently selected this content address;
+               replace the leftover and prove the inverse mapping below. */
+            deletePath(final);
+        }
+        if (pathExists(final) && stagedSibling && !store.isValidPath(final)) {
             /* A previous output of this build already produced this path.
                Verify it and leave registration to the output-set commit. */
             bool same = sameContent(final, final, token, built, finalOutputs);
@@ -719,17 +726,19 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
             narSize = result.second;
             return final;
         }
-        bool same = sameContent(final, final, token, built, finalOutputs);
-        if (!same)
-            throw BuildError(std::format(
-                "CA content address collision at `{0}': existing item differs", final));
-        deletePath(physical);
-        HashResult existingNAR;
-        references = scanForReferences(final, referencePaths, existingNAR);
-        auto result = hashPath(htSHA256, final);
-        narHash = result.first;
-        narSize = result.second;
-        return final;
+        if (pathExists(final)) {
+            bool same = sameContent(final, final, token, built, finalOutputs);
+            if (!same)
+                throw BuildError(std::format(
+                    "CA content address collision at `{0}': existing item differs", final));
+            deletePath(physical);
+            HashResult existingNAR;
+            references = scanForReferences(final, referencePaths, existingNAR);
+            auto result = hashPath(htSHA256, final);
+            narHash = result.first;
+            narSize = result.second;
+            return final;
+        }
     }
 
     rewriteTree(physical, oldHash, newHash);
@@ -737,6 +746,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
        Verification is the inverse mapping performed below. */
     if (rename(physical.c_str(), final.c_str()))
         throw SysError(std::format("moving CA output `{}' to `{}'", physical, final));
+    if (created) *created = true;
     /* goonix: the inverse mapping is verified without touching the final tree. */
     bool good = sameContent(final, final, token, built, finalOutputs);
     if (!good) {
