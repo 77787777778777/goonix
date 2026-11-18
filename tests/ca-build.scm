@@ -247,7 +247,7 @@
 
 ;;; CA-2 is also runnable on its own from a small driver that loads these
 ;;; helpers first.  The full suite includes the same forms.
-(include "tests/ca-cutoff.scm")
+(include "ca-cutoff.scm")
 
 (test-assert "--check preserves a self-referencing result and its choice"
   (let* ((drv (shell-drv "ca-check-self"

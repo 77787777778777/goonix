@@ -54,6 +54,7 @@ EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
   build-aux/goonix-upstream-base		\
   tests/ca-vectors.json				\
+  tests/ca-cutoff.scm				\
   tests/fixtures/flake-shells.scm			\
   tests/fixtures/ca-self-token.gz			\
   tests/fixtures/ca-self-token.xz			\
