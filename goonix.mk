@@ -7,6 +7,8 @@ MODULES +=					\
   guix/package-overrides.scm			\
   guix/ca.scm					\
   guix/download-cache.scm			\
+  guix/ca/scan.scm				\
+  guix/scripts/ca.scm				\
   guix/flakes.scm				\
   guix/flakes/syntax.scm			\
   guix/flakes/lock.scm				\

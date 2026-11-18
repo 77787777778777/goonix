@@ -134,3 +134,18 @@ ordering, self tokens, placeholders, content paths with sorted references,
 resolved derivation serialization and paths, unresolved two-output
 derivation serialization with an input derivation and its placeholder, and
 canonical record payload bytes and hashes.
+
+## Store self-reference scan
+
+`guix ca scan` reads existing store items without changing them. It reports
+whole plain self references, 8-character fragments outside whole occurrences,
+UTF-16LE self references, self references in gzip or xz members, file names,
+and symbolic-link targets. It reads regular files in bounded chunks and
+retains enough overlap for a token crossing a read boundary. `--format=jsonl`
+emits one object per item; the default `summary` format prints the same
+counters in a readable line. `--directory=DIR` selects another store tree.
+`--jobs=N` scans at most N items concurrently (three by default), while
+retaining input order in the output.
+Unsupported compressed members and decoding failures are counted separately;
+they are not silently treated as clean. The scan is a measurement tool, not
+the daemon's build finaliser or its deep-scanning policy.

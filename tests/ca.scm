@@ -10,6 +10,8 @@
 
 (define-module (test-ca)
   #:use-module (guix ca)
+  #:use-module (guix ca scan)
+  #:use-module (guix scripts ca)
   #:use-module (guix base16)
   #:use-module (guix derivations)
   #:use-module (guix store)
@@ -19,6 +21,7 @@
   #:use-module (ice-9 textual-ports)
   #:use-module (json parser)
   #:use-module ((gcrypt hash) #:select (sha256))
+  #:use-module ((zlib) #:select (call-with-gzip-output-port))
   #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-34)
   #:use-module (srfi srfi-64)
@@ -195,6 +198,109 @@
        (basename (placeholder bytes (field unresolved "output")
                               (field unresolved "name")))
        0 32))))
+
+(test-group "CA store scanning"
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-fixture"))
+           (hash "0123456789abcdfghijklmnpqrsvwxyz"))
+       (mkdir item)
+       (call-with-output-file (string-append item "/whole")
+         (lambda (port) (display hash port)))
+       (call-with-output-file (string-append item "/fragment")
+         (lambda (port) (display (substring hash 3 15) port)))
+       (call-with-output-file (string-append item "/encoded")
+         (lambda (port)
+           (put-bytevector port (string->utf16 hash (endianness little)))))
+       (symlink hash (string-append item "/link"))
+       (mkdir (string-append item "/" hash))
+       (let ((report (scan-store-item item)))
+         (test-equal "scanner reports a whole self reference"
+           1 (scan-report-full report))
+         (test-equal "scanner reports split self-reference fragments"
+           #t (> (scan-report-fragments report) 0))
+         (test-equal "scanner reports a UTF-16LE self reference"
+           1 (scan-report-utf16 report))
+         (test-equal "scanner reports a self-reference symlink"
+           1 (scan-report-links report))
+         (test-equal "scanner reports a self-reference name"
+           1 (scan-report-names report))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-boundary"))
+            (hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (prefix (make-string (- (* 128 1024) 4) #\x)))
+       (mkdir item)
+       (call-with-output-file (string-append item "/crossing")
+         (lambda (port) (display (string-append prefix hash) port)))
+       (test-equal "scanner retains a self reference across a read boundary"
+         1 (scan-report-full (scan-store-item item))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-binary"))
+            (hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (payload (u8-list->bytevector
+                      `(0 255 65 0 ,@(map char->integer (string->list hash))
+                          0 128 66))))
+       (mkdir item)
+       (call-with-output-file (string-append item "/arbitrary")
+         (lambda (port) (put-bytevector port payload))
+         #:binary #t)
+       (let ((report (scan-store-item item)))
+         (test-equal "scanner finds a hash among arbitrary bytes"
+           1 (scan-report-full report))
+         (test-equal "arbitrary-byte fixture is not a false fragment"
+           0 (scan-report-fragments report))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-gzip"))
+            (hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (compressed (string-append item "/member.gz")))
+       (mkdir item)
+       (call-with-output-file compressed
+         (lambda (port)
+           (call-with-gzip-output-port port
+             (lambda (output) (display hash output)))))
+       (test-equal "scanner reports a self reference in a gzip member"
+         1 (scan-report-hidden (scan-store-item item))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((name "0123456789abcdfghijklmnpqrsvwxyz-cli"))
+       (mkdir (string-append root "/" name))
+       (call-with-output-file (string-append root "/" name "/whole")
+         (lambda (port) (display "0123456789abcdfghijklmnpqrsvwxyz" port)))
+       (let ((second "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-second"))
+         (mkdir (string-append root "/" second))
+         (call-with-output-file (string-append root "/" second "/whole")
+           (lambda (port) (display "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" port)))
+         (test-equal "parallel CLI preserves item order"
+           (list name second)
+           (let* ((text (call-with-output-string
+                         (lambda (port)
+                           (parameterize ((current-output-port port))
+                             (guix-ca "scan" (string-append "--directory=" root)
+                                      "--format=jsonl" "--jobs=3")))))
+                  (lines (filter (negate string-null?)
+                                 (string-split text #\newline))))
+             (map (lambda (line)
+                    (assoc-ref (json->scm (open-input-string line)) "item"))
+                  lines))))
+       (test-equal "guix ca scan emits JSONL"
+         (sort
+          '(("item" . "0123456789abcdfghijklmnpqrsvwxyz-cli")
+            ("files" . 1) ("bytes" . 32) ("full" . 1) ("frag" . 0)
+            ("utf16" . 0) ("hidden" . 0) ("names" . 0) ("links" . 0)
+            ("undecodable" . 0) ("unsupported" . 0))
+          (lambda (a b) (string<? (car a) (car b))))
+         (sort
+          (json->scm
+           (open-input-string
+            (call-with-output-string
+             (lambda (port)
+               (parameterize ((current-output-port port))
+                 (guix-ca "scan" (string-append "--directory=" root)
+                          "--format=jsonl" name))))))
+          (lambda (a b) (string<? (car a) (car b)))))))))
 
 (test-group "build record canonical payload"
   (let* ((vector (field vectors "record"))
