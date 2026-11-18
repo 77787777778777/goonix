@@ -54,30 +54,19 @@
   (bytevector->base16-string
    (sha256 (call-with-input-file (resolved-derivation drv) get-bytevector-all))))
 
-;; Raw wopQueryBuildRecords (83): the client stub flattens the structured
-;; reply, so read the fields directly to inspect paths and signatures.
 (define (build-records hash output)
-  (let ((sock (store-connection-socket store)))
-    (write-int 83 sock)
-    (write-string hash sock)
-    (write-string output sock)
-    (force-output sock)
-    (let loop () (unless ((@@ (guix store) process-stderr) store) (loop)))
-    (let ((n (read-int sock)))
-      (let loop ((i 0) (acc '()))
-        (if (< i n)
-            (let* ((rd (read-string sock))
-                   (o (read-string sock))
-                   (p (read-string sock))
-                   (origin (read-string sock))
-                   (rc (read-int sock))
-                   (sig (read-string sock)))
-              (loop (+ i 1)
-                    (cons (list rd o p origin rc sig) acc)))
-            (reverse acc))))))
+  (query-build-records store (base16-string->bytevector hash) output))
 
 (define (record-paths hash output)
   (map (lambda (r) (list-ref r 2)) (build-records hash output)))
+
+(test-assert "record query leaves the daemon connection synchronized"
+  (let* ((drv (ca-drv "rec-sync" (write-output "sync")))
+         (out (begin (build-derivations store (list drv)) (realised drv)))
+         (records (build-records (resolved-hash drv) "out")))
+    (and (= 1 (length records))
+         (string=? out (list-ref (car records) 2))
+         (valid-path? store out))))
 
 (test-assert "a local build writes a signed record naming the realised path"
   (let* ((drv (ca-drv "rec-signed" (write-output "signed")))
