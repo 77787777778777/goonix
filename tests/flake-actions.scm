@@ -8,9 +8,12 @@
   #:use-module (guix build utils)
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
   #:use-module (guix scripts flake)
+  #:use-module ((guix flakes evaluate) #:select (evaluate-flake-shell))
   #:use-module (guix flakes support)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-64)
+  #:use-module (srfi srfi-11)
+  #:use-module (srfi srfi-34)
   #:use-module (srfi srfi-1))
 
 (test-begin "flake-actions")
@@ -39,25 +42,62 @@
      (commit-all directory)
      (proc directory))))
 
-(test-assert "typed shell description preserves packages and environment"
-  (with-action-fixture
-   "flake-actions-shell.scm"
-   (lambda (directory)
-     (let ((description (flake-shell-description store directory 'default '())))
-       (and (manifest? (car description))
-            (equal? '() (cdr description))
-            (string=? "f6-shell-pkg"
-                      (package-name (manifest-entry-item
-                                     (first (manifest-entries (car description)))))))))))
+;; What 'guix shell' enters is evaluated in the container: only the profile
+;; derivation and the variables come back.  These tests build the profiles
+;; and look inside, so a shell that ignored its name or its packages fails.
+(define (shell-profile directory name . rest)
+  "Return the built profile of the shell NAME and its variables."
+  (let-values (((drv environment)
+                (apply evaluate-flake-shell store directory name
+                       #:bootstrap? #t rest)))
+    (build-derivations store (list drv))
+    (values (derivation->output-path drv) environment)))
 
-(test-assert "named shell reference selects the named shell"
+(define (in-profile? profile tool)
+  (file-exists? (string-append profile "/bin/" tool)))
+
+(test-assert "a shell is the profile of its packages, with its variables"
   (with-action-fixture
-   "flake-actions-shell.scm"
+   "flake-shells.scm"
    (lambda (directory)
-     (let ((description (flake-shell-description store directory 'named '())))
-       (string=? "f6-shell-pkg"
-                 (package-name (manifest-entry-item
-                                (first (manifest-entries (car description))))))))))
+     (let-values (((profile environment) (shell-profile directory 'default)))
+       (and (equal? '(("FLAKE_SHELL" . "default")) environment)
+            (in-profile? profile "flake-tool-one")
+            (not (in-profile? profile "flake-tool-two")))))))
+
+(test-assert "another name selects another shell"
+  (with-action-fixture
+   "flake-shells.scm"
+   (lambda (directory)
+     (let-values (((profile environment) (shell-profile directory 'other)))
+       (and (null? environment)
+            (in-profile? profile "flake-tool-two")
+            (not (in-profile? profile "flake-tool-one")))))))
+
+(test-assert "a package that is no shell is entered as a shell of itself"
+  (with-action-fixture
+   "flake-shells.scm"
+   (lambda (directory)
+     (let-values (((profile environment) (shell-profile directory 'tool)))
+       (in-profile? profile "flake-tool-two")))))
+
+(test-assert "the development environment of a package leaves the package out"
+  (with-action-fixture
+   "flake-shells.scm"
+   (lambda (directory)
+     (let-values (((profile environment)
+                   (shell-profile directory 'tool #:development? #t)))
+       (not (in-profile? profile "flake-tool-two"))))))
+
+(test-assert "a missing shell is an error unless it is optional"
+  (with-action-fixture
+   "flake-shells.scm"
+   (lambda (directory)
+     (and (not (evaluate-flake-shell store directory 'missing
+                                     #:optional? #t #:bootstrap? #t))
+          (guard (condition (#t #t))
+            (evaluate-flake-shell store directory 'missing #:bootstrap? #t)
+            #f)))))
 
 (test-assert "flake checks lower a trivial check"
   (with-action-fixture

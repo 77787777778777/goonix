@@ -35,8 +35,7 @@
   #:autoload   (guix channels) (guix-channel? channel-commit)
   #:use-module (guix scripts)
   #:use-module (guix scripts build)
-  #:autoload   (guix pure-eval) (load-file-purely)
-  #:autoload   (guix flakes evaluate) (evaluate-flake)
+  #:autoload   (guix pure-eval) (load-file-purely) ;goonix: --pure-eval
   #:autoload   (guix scripts pack) (symlink-spec-option-parser)
   #:use-module (guix transformations)
   #:autoload   (ice-9 ftw) (scandir)
@@ -216,6 +215,7 @@ COMMAND or an interactive shell in that environment.\n"))
          (option '("pure") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'pure #t result)))
+         ;; goonix: evaluate files in a container.
          (option '("pure-eval") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'pure-eval? #t result)))
@@ -332,6 +332,7 @@ use '--preserve' instead~%"))
             (_ memo)))
         '() alist))
 
+;; goonix: --pure-eval.
 (define (pure-file->manifest store file)
   "Return a manifest reconstructed from the derivations of a pure evaluation.
 Scheme package and service values never cross the evaluator boundary."
@@ -357,9 +358,6 @@ for the corresponding packages."
   (define system
     (assoc-ref opts 'system))
 
-  ;; goonix: a flake shell resolved by 'guix shell' carries its own manifest.
-  (define flake-shell-manifest (assoc-ref opts 'flake-shell-manifest))
-
   (define (manifest-entry=? e1 e2)
     (and (eq? (manifest-entry-item e1) (manifest-entry-item e2))
          (string=? (manifest-entry-output e1)
@@ -384,50 +382,29 @@ for the corresponding packages."
       ((lst ...)
        (append-map (cut packages->outputs <> mode) lst))))
 
-  (define (flake-reference? spec)
-    (and (string-index spec #\#)
-         (file-exists? (substring spec 0 (string-index spec #\#)))))
-
-  (define (flake-entry spec)
-    (let* ((hash (string-index spec #\#))
-           (directory (substring spec 0 hash))
-           (name (substring spec (+ hash 1)))
-           (drv (evaluate-flake store directory 'packages
-                                (string->symbol name) #:pure? #t)))
-      (manifest-entry
-        (name name) (version "0") (item drv)
-        (output (or (assoc-ref (assoc-ref opts 'outputs) name) "out")))))
-
   (manifest
    (delete-duplicates
-    (append
-     ;; goonix: entries of a resolved flake shell come first.
-     (if flake-shell-manifest
-         (manifest-entries flake-shell-manifest)
-         '())
-     (append-map (match-lambda
+    (append-map (match-lambda
                   (('package 'ad-hoc-package (? string? spec))
-                   (if (flake-reference? spec)
-                       (list (flake-entry spec))
-                       (let-values (((package output)
-                                     (specification->package+output spec)))
-                         (list (package->manifest-entry* package output)))))
+                   (let-values (((package output)
+                                 (specification->package+output spec)))
+                     (list (package->manifest-entry* package output))))
                   (('package 'package (? string? spec))
-                   (if (flake-reference? spec)
-                       (list (flake-entry spec))
-                       (manifest-entries
-                        (package->development-manifest
-                         (transform (specification->package+output spec))
-                         system))))
+                   (manifest-entries
+                    (package->development-manifest
+                     (transform (specification->package+output spec))
+                     system)))
                   (('expression mode str)
                    ;; Add all the outputs of the package STR evaluates to.
                    (packages->outputs (read/eval str) mode))
                   (('load mode file)
                    ;; Add all the outputs of the package defined in FILE.
+                   ;; goonix: --pure-eval.
                    (if (assoc-ref opts 'pure-eval?)
                        (manifest-entries (pure-file->manifest store file))
                        (packages->outputs (load* file '()) mode)))
                   (('manifest . file)
+                   ;; goonix: --pure-eval.
                    (manifest-entries
                     (if (assoc-ref opts 'pure-eval?)
                         (pure-file->manifest store file)
@@ -453,7 +430,7 @@ could not add current Guix to the profile~%"))
                                      (search-paths
                                       (package-native-search-paths guix))))))))
                   (_ '()))
-                opts))
+                opts)
     manifest-entry=?)))
 
 (define (manifest->derivation manifest system bootstrap?)
@@ -1245,10 +1222,7 @@ command-line option processing with 'parse-command-line'."
                            (list %default-shell))))
          (mappings   (pick-all opts 'file-system-mapping))
          (white-list (pick-all opts 'inherit-regexp))
-         (environment-variables
-          ;; goonix: a resolved flake shell contributes its declared variables.
-          (append (or (assoc-ref opts 'flake-shell-environment) '())
-                  (pick-all opts 'environment-variables))))
+         (environment-variables  (pick-all opts 'environment-variables)))
 
     (define store-needed?
       ;; Whether connecting to the daemon is needed.

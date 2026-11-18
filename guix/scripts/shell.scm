@@ -21,9 +21,8 @@
   #:use-module (guix ui)
   #:use-module ((guix diagnostics) #:select (location))
   #:use-module (guix scripts environment)
-  #:autoload   (guix scripts flake) (flake-reference?
-                                     parse-flake-reference
-                                     flake-shell-description)
+  #:autoload   (guix scripts flake) (resolve-flake-shell-reference ;goonix: flake shells
+                                     flake-default-shell-options)
   #:autoload   (guix scripts build) (show-build-options-help
                                      show-native-build-options-help)
   #:autoload   (guix transformations) (options->transformation
@@ -31,7 +30,6 @@
                                        cacheable-transformation-option-key?
                                        show-transformation-options-help)
   #:use-module (guix scripts)
-  #:use-module (guix store)
   #:use-module (guix packages)
   #:use-module (guix profiles)
   #:use-module (srfi srfi-1)
@@ -164,84 +162,6 @@ interactive shell in that environment.\n"))
   `((ad-hoc? . #t)                                ;always true
     ,@%environment-default-options))
 
-;;; goonix: flake shells.
-
-(define (flake-shell-payload? opts)
-  "Whether OPTS already carry a resolved flake shell."
-  (and (assoc-ref opts 'flake-shell-manifest) #t))
-
-(define (resolve-flake-shell-arguments opts)
-  "Turn a leading flake reference among OPTS' package arguments into a
-resolved shell manifest and environment.  DIR#NAME selects shells.NAME; a
-bare DIR selects shells.default.  Non-flake package arguments are left for
-the ordinary resolution path."
-  (define (shell-reference? spec)
-    (and (string? spec)
-         (or (flake-reference? spec)
-             ;; A bare directory that has a flake.scm is a shells.default ref.
-             (and (not (string-index spec #\#))
-                  (or (string=? spec ".") (string-prefix? "./" spec)
-                      (string-prefix? "/" spec) (string-prefix? "../" spec))
-                  (file-exists? (string-append spec "/flake.scm"))))))
-  (let loop ((opts opts) (resolved '()))
-    (match opts
-      (() (reverse resolved))
-      ((('package mode (? string? spec)) . rest)
-       (if (and (null? resolved) (shell-reference? spec))
-           (let* ((ref (parse-flake-reference spec))
-                  (directory (car ref))
-                  (name (cdr ref)))
-             (with-store store
-               (let ((description
-                      (flake-shell-description store directory name opts)))
-                 (loop rest
-                       (append (list (cons 'flake-shell-reference spec)
-                                     (cons 'flake-shell-environment (cdr description))
-                                     (cons 'flake-shell-manifest (car description)))
-                               resolved)))))
-           (loop rest (cons (car opts) resolved))))
-      ((head . rest)
-       (loop rest (cons head resolved))))))
-
-(define (resolve-flake-shell-default opts)
-  "When no payload was given, enter shells.default of a flake.scm found in
-the current directory or an ancestor.  Falls back to OPTS unchanged when
-there is no flake or no shells.default."
-  (if (or (flake-shell-payload? opts)
-          (assoc-ref opts 'explicit-loading?)
-          (options-contain-payload? opts))
-      opts
-      (let ((flake (find-file-in-parent-directories '("flake.scm"))))
-        (if flake
-            (let ((directory (dirname flake)))
-              (with-store store
-                (let ((description
-                       (false-if-exception
-                        (flake-shell-description store directory 'default opts))))
-                  (if description
-                      (begin
-                        (info (G_ "entering shell '~a' from '~a'...~%")
-                              'default flake)
-                        (append (list (cons 'flake-shell-manifest (car description))
-                                      (cons 'flake-shell-environment (cdr description))
-                                      (cons 'flake-shell-reference
-                                            (string-append directory "#default")))
-                                opts))
-                      opts))))
-            opts))))
-
-(define (options-contain-payload? opts)
-  "Whether OPTS specify packages, a manifest, a profile or an expression."
-  (match opts
-    (() #f)
-    ((('package . _) . _) #t)
-    ((('load . _) . _) #t)
-    ((('manifest . _) . _) #t)
-    ((('profile . _) . _) #t)
-    ((('expression . _) . _) #t)
-    ((('flake-shell-manifest . _) . _) #t)
-    ((_ . rest) (options-contain-payload? rest))))
-
 (define (parse-args args)
   "Parse the list of command line arguments ARGS."
   (define (handle-argument arg result)
@@ -265,12 +185,12 @@ there is no flake or no shells.default."
                      args-parsed)))
       (options-with-caching
        (auto-detect-manifest
-        (resolve-flake-shell-default
-         (resolve-flake-shell-arguments
-          (match command
-            (() opts)
-            (("--") opts)
-            (("--" command ...) (alist-cons 'exec command opts))))))))))
+        ;; goonix: a flake reference stands for the profile of its shell.
+        (resolve-flake-shell-reference
+         (match command
+           (() opts)
+           (("--") opts)
+           (("--" command ...) (alist-cons 'exec command opts)))))))))
 
 (define (find-file-in-parent-directories candidates)
   "Find one of CANDIDATES in the current directory or one of its ancestors."
@@ -360,6 +280,16 @@ cache) or a 'gc-root' key (to add the profile to cache)."
   "If OPTS do not specify packages or a manifest, load a \"guix.scm\" or
 \"manifest.scm\" file from the current directory or one of its ancestors.
 Return the modified OPTS."
+  (define (options-contain-payload? opts)
+    (match opts
+      (() #f)
+      ((('package . _) . _) #t)
+      ((('load . _) . _) #t)
+      ((('manifest . _) . _) #t)
+      ((('profile . _) . _) #t)
+      ((('expression . _) . _) #t)
+      ((_ . rest) (options-contain-payload? rest))))
+
   (define interactive?
     (not (assoc-ref opts 'exec)))
 
@@ -370,7 +300,9 @@ Return the modified OPTS."
           disallow-implicit-load?
           (options-contain-payload? opts))
       opts
-      (match (find-file-in-parent-directories '("manifest.scm" "guix.scm"))
+      ;; goonix: a flake.scm is found like the other two, and comes first.
+      (match (find-file-in-parent-directories
+              '("flake.scm" "manifest.scm" "guix.scm"))
         (#f
          (warning (G_ "no packages specified; creating an empty environment~%"))
          opts)
@@ -379,6 +311,8 @@ Return the modified OPTS."
              (begin
                (info (G_ "loading environment from '~a'...~%") file)
                (match (basename file)
+                 ;; goonix: the default shell of the flake.
+                 ("flake.scm" (flake-default-shell-options file opts))
                  ("guix.scm" (alist-cons 'load `(package ,file) opts))
                  ("manifest.scm" (alist-cons 'manifest file opts))))
              (begin

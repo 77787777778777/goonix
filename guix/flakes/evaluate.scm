@@ -25,6 +25,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-34)
   #:export (%evaluation-cache evaluate-flake evaluate-flake-outputs flake-option-value
+            evaluate-flake-shell
             parse-option-value evaluator-starts))
 
 (define (parse-option-value option string)
@@ -94,8 +95,10 @@
 
 (define* (evaluate-request store directory kind name #:key (options '())
                            (system (%current-system)) target (pure? #t)
-                           imported-source overrides (path '()))
-  "Evaluate a locked tree in a fresh confined Guile and return output handles."
+                           imported-source overrides (path '()) shell)
+  "Evaluate a locked tree in a fresh confined Guile and return output handles.
+SHELL, when true, is an alist that asks for the environment of 'guix shell'
+instead of an output of KIND; see 'evaluate-flake-shell'."
   (let* ((directory (canonicalize-path directory))
          (flake (read-flake (string-append directory "/flake.scm")))
          (lock (if (file-exists? (string-append directory "/flake.lock"))
@@ -209,6 +212,7 @@
                        (options . ,(validated-options flake options))
                        (revision . ,(and (not imported-source)
                                          (tracked-tree-revision directory)))
+                       (shell . ,shell)
                        (input-sources . ,locked-trees)) host-out)
               (newline host-out) (force-output host-out)
               (let loop ((message (read host-in)))
@@ -236,6 +240,8 @@
                        (error "confined flake evaluator error" description))
                       (('output . fields) (set! result (cons message result))
                                         (loop (read host-in)))
+                      ;; An optional shell that the flake does not have.
+                      (('absent . fields) (loop (read host-in)))
                       (('done) #t)
                       (_ (error "invalid evaluator message" message)))))
               (close-port host-out) (close-port host-in)
@@ -250,7 +256,7 @@
   ;; within one command.  Impure evaluations are deliberately not cached.
   (make-hash-table))
 
-(define (flake-cache-key directory source kind name options system target)
+(define (flake-cache-key directory source kind name options system target shell)
   (let* ((manifest (call-with-input-file (string-append source "/flake.scm")
                      get-string-all))
          (lock-file (string-append source "/flake.lock"))
@@ -258,7 +264,8 @@
                     (call-with-input-file lock-file get-string-all)))
          (guix (search-path %load-path "guix/flakes/evaluator.scm"))
          (guix-source (and guix (call-with-input-file guix get-string-all))))
-    (list 1 manifest lock source kind name options system target guix-source)))
+    (list 1 manifest lock source kind name options system target shell
+          guix-source)))
 
 (define (flake-cache-files key)
   (let* ((digest (bytevector->base16-string
@@ -302,11 +309,12 @@
                      (_ #f)))
                  outputs)))))
 
-(define (evaluate-flake/cached store directory kind name source options system target overrides)
+(define* (evaluate-flake/cached store directory kind name source options system target overrides
+                                #:key shell)
   (let ((overrides (or overrides '())))
     (if (and (null? overrides)
              (string-prefix? (string-append (%store-prefix) "/") source))
-      (let* ((key (flake-cache-key directory source kind name options system target))
+      (let* ((key (flake-cache-key directory source kind name options system target shell))
              (memory (hash-ref %evaluation-cache key)))
         (if (and memory (every (lambda (output)
                                  (valid-path? store (cadddr output)))
@@ -318,28 +326,55 @@
                   (let ((outputs (evaluate-request store directory kind name
                                                   #:options options #:system system
                                                   #:target target #:pure? #t
-                                                  #:imported-source source)))
+                                                  #:imported-source source
+                                                  #:shell shell)))
                     (store-evaluation! store key outputs)
                     (hash-set! %evaluation-cache key outputs)
                     outputs)))))
       (evaluate-request store directory kind name #:options options
                         #:system system #:target target #:pure? #f
-                        #:overrides overrides))))
+                        #:overrides overrides #:shell shell))))
 
-(define (evaluate-flake/cache store directory kind name options system target pure? overrides)
+(define* (evaluate-flake/cache store directory kind name options system target pure? overrides
+                               #:key shell)
   (let* ((directory (canonicalize-path directory))
          (source (if (and pure?
                            (not (string-prefix? (string-append (%store-prefix) "/")
                                                 directory)))
                      (import-tracked-tree store directory)
                      directory)))
-    (evaluate-flake/cached store directory kind name source options system target overrides)))
+    (evaluate-flake/cached store directory kind name source options system target overrides
+                           #:shell shell)))
 
 (define* (evaluate-flake store directory kind name #:key (options '())
                          (system (%current-system)) target (pure? #t) overrides)
   (match (evaluate-flake/cache store directory kind name options system target pure? overrides)
     ((output) (read-derivation-from-file (canonicalize-path (cadddr output))))
     (_ (error "flake did not return one named output" kind name))))
+
+(define* (evaluate-flake-shell store directory name
+                               #:key development? optional? bootstrap?
+                               (options '()) (system (%current-system)))
+  "Evaluate in a container what 'guix shell' enters for NAME in the flake of
+DIRECTORY: the shell of that name, else the package of that name, or with
+DEVELOPMENT? the development environment of that package.  Return two
+values: the derivation of its profile and the alist of the environment
+variables it sets.  When there is none, return #f and the empty list if
+OPTIONAL?, and raise an error otherwise.  BOOTSTRAP? has the meaning of the
+'--bootstrap' option of 'guix shell'."
+  (match (evaluate-flake/cache store directory 'shells name options system
+                               #f #t #f
+                               #:shell `((development? . ,development?)
+                                         (optional? . ,optional?)
+                                         (bootstrap? . ,bootstrap?)))
+    ((('output _ _ path metadata))
+     (values (read-derivation-from-file (canonicalize-path path))
+             (or (assq-ref metadata 'environment) '())))
+    (()
+     (if optional?
+         (values #f '())
+         (error "flake has neither a shell nor a package of this name"
+                name)))))
 
 (define* (evaluate-flake-outputs store directory #:key (options '())
                                  (system (%current-system)) target (pure? #t) overrides)

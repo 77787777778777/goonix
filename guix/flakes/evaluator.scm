@@ -8,6 +8,8 @@
   #:use-module (guix gexp)
   #:use-module (guix monads)
   #:use-module (guix build utils)
+  #:use-module ((guix profiles)
+                #:select (profile-derivation %default-profile-hooks))
   #:use-module ((gnu system) #:select (operating-system? operating-system-derivation))
   #:use-module ((gnu system image) #:select (system-image))
   #:use-module ((gnu image) #:select (image?))
@@ -39,6 +41,62 @@
                                           (override-replacement item)))
                                   active)
         (lowered-output object name system target)))))
+
+(define (requested-shell outputs name development?)
+  "Return what 'guix shell' enters for NAME among OUTPUTS, or #f: the shell
+of that name, else the package of that name; with DEVELOPMENT?, the
+development environment of the package of that name."
+  (let ((shells (or (and=> (assq 'shells outputs) cdr) '()))
+        (packages (or (and=> (assq 'packages outputs) cdr) '())))
+    (if development?
+        (and=> (assq name packages)
+               (lambda (entry)
+                 (shell (inputs-from (list (cdr entry))))))
+        (and=> (or (assq name shells) (assq name packages)) cdr))))
+
+(define (lower-shell store object system overrides bootstrap?)
+  "Return the profile derivation of OBJECT, built the way 'guix shell' builds
+the profile of a manifest.  BOOTSTRAP? has the meaning of its '--bootstrap'."
+  (run-with-store store
+    (with-package-overrides (map (lambda (item)
+                                   (cons (override-original item)
+                                         (override-replacement item)))
+                                 overrides)
+      (profile-derivation (shell->manifest object system)
+                          #:system system
+                          #:allow-collisions? #t
+                          #:hooks (if bootstrap? '() %default-profile-hooks)
+                          #:locales? (not bootstrap?)))
+    #:guile-for-build
+    (if bootstrap?
+        (package-derivation store
+                            (@ (gnu packages bootstrap) %bootstrap-guile)
+                            system)
+        (%guile-for-build))
+    #:system system))
+
+(define (write-shell store outputs request system overrides)
+  "Answer a request for the environment of 'guix shell'."
+  (let* ((name (assoc-ref request 'name))
+         (options (assoc-ref request 'shell))
+         (object (requested-shell outputs name
+                                  (assoc-ref options 'development?))))
+    (cond (object
+           (write (list 'output 'shells name
+                        (derivation-file-name
+                         (lower-shell store object system overrides
+                                      (assoc-ref options 'bootstrap?)))
+                        `((shell . #t)
+                          (environment . ,(if (shell? object)
+                                              (shell-environment object)
+                                              '())))))
+           (newline) (force-output))
+          ((assoc-ref options 'optional?)
+           (write (list 'absent 'shells name))
+           (newline) (force-output))
+          (else
+           (error "flake has neither a shell nor a package of this name"
+                  name)))))
 
 (define (metadata store object system target overrides)
   (cond ((package? object)
@@ -107,28 +165,31 @@
     (let* ((outputs ((eval output-form module) context))
            (kind (assoc-ref request 'kind))
            (name (assoc-ref request 'name))
-           (groups (if (eq? kind '*) outputs
-                       (list (or (assq kind outputs)
-                                 (error "unknown flake output kind" kind)))))
            (overrides (append-map
                        (lambda (spec)
                          (if (eq? 'overrides (car spec))
                              (map cdr (cdr spec)) '()))
                        outputs)))
       (parameterize ((%current-system system) (%current-target-system target))
-        (for-each
-         (lambda (group)
-           (for-each
-            (lambda (entry)
-              (when (or (eq? kind '*) (eq? name (car entry)))
-                (let ((object (cdr entry)))
-                  (write (list 'output (car group) (car entry)
-                               (derivation-file-name
-                                (lower-value s object (symbol->string (car entry))
-                                             system target overrides))
-                               (metadata s object system target overrides)))
-                  (newline) (force-output))))
-            (cdr group)))
-         groups))
+        (if (assoc-ref request 'shell)
+            (write-shell s outputs request system overrides)
+            (for-each
+             (lambda (group)
+               (for-each
+                (lambda (entry)
+                  (when (or (eq? kind '*) (eq? name (car entry)))
+                    (let ((object (cdr entry)))
+                      (write (list 'output (car group) (car entry)
+                                   (derivation-file-name
+                                    (lower-value s object
+                                                 (symbol->string (car entry))
+                                                 system target overrides))
+                                   (metadata s object system target overrides)))
+                      (newline) (force-output))))
+                (cdr group)))
+             (if (eq? kind '*)
+                 outputs
+                 (list (or (assq kind outputs)
+                           (error "unknown flake output kind" kind)))))))
       (write '(done)) (newline) (force-output)
       (close-connection s))))

@@ -11,10 +11,13 @@
 
 (define-module (guix scripts flake)
   #:use-module (guix flakes)
-  #:autoload   (guix flakes evaluate) (evaluate-flake evaluate-flake-outputs)
+  #:autoload   (guix flakes evaluate) (evaluate-flake evaluate-flake-outputs
+                                       evaluate-flake-shell)
   #:autoload   (guix flakes checkout) (tracked-tree resolve-git-input
                                        tree-snapshot-directory)
-  #:autoload   (guix pure-eval) (import-tracked-tree import-source-set)
+  #:autoload   (guix pure-eval) (import-tracked-tree import-source-set
+                                 pure-eval-supported?)
+  #:use-module ((guix status) #:select (with-status-verbosity))
   #:use-module (guix store)
   #:use-module (guix derivations)
   #:use-module (guix packages)
@@ -45,7 +48,8 @@
             flake-acting-output
             flake-checked-output
             lower-flake-object
-            flake-shell-description))
+            resolve-flake-shell-reference
+            flake-default-shell-options))
 
 (define (show-help)
   (display (G_ "Usage: guix flake COMMAND [OPTION...] [DIRECTORY]
@@ -372,45 +376,94 @@ differs from the pure derivation ~a; refusing to act~%")
              (derivation-file-name pure)))
     object))
 
-(define (flake-shell-description store directory name opts)
-  "Return (MANIFEST . ENVIRONMENT) for the typed shell NAME in DIRECTORY.
-The shell is evaluated in the acting process so the record's package objects
-and environment survive the boundary; MANIFEST is built exactly as the
-confined evaluator's shell compiler builds it.  A shell is not host-changing,
-so no derivation gate is imposed here (that is reserved for reconfigure and
-deploy); the environment is launched through the ordinary 'guix shell'
-profile machinery."
-  (define system (or (assoc-ref opts 'system) (%current-system)))
-  (define (shell-manifest packages inputs-from)
-    ((@ (guix profiles) packages->manifest)
-     (append packages
-             (append-map (lambda (package)
-                           ((@ (guix packages) package-development-inputs)
-                            package system))
-                         inputs-from))))
-  (let ((object (flake-acting-output store directory 'shells name opts)))
-    (cond
-     ;; Typed shell record (guix flakes support).
-     ((and (struct? object)
-           (false-if-exception
-            ((@ (guix flakes support) shell?) object)))
-      (cons (shell-manifest ((@ (guix flakes support) shell-packages) object)
-                            ((@ (guix flakes support) shell-inputs-from) object))
-            ((@ (guix flakes support) shell-environment) object)))
-     ;; Legacy alist form produced by the current (shell ...) procedure.
-     ((and (pair? object) (eq? 'shell (car object)))
-      (let ((fields (cdr object)))
-        (cons (shell-manifest (or (and=> (assq 'packages fields) cadr) '())
-                              (or (and=> (assq 'inputs-from fields) cadr) '()))
-              (or (and=> (assq 'environment fields) cadr) '()))))
-     ;; A bare package used as a shell.
-     ((package? object)
-      (cons (shell-manifest (list object) '()) '()))
-     ;; A manifest used as a shell.
-     ((manifest? object)
-      (cons object '()))
-     (else (error "flake shell output is not a shell, package or manifest"
-                  object)))))
+(define (flake-shell-reference? spec)
+  "Whether SPEC, an argument of 'guix shell', names a flake: DIRECTORY#NAME,
+or a directory given as a path that holds a flake.scm."
+  (and (string? spec)
+       (or (flake-reference? spec)
+           (and (not (string-index spec #\#))
+                (or (member spec '("." ".."))
+                    (string-prefix? "./" spec)
+                    (string-prefix? "../" spec)
+                    (string-prefix? "/" spec))
+                (file-exists? (string-append spec "/flake.scm"))))))
+
+(define (flake-shell-options directory name opts development? optional?)
+  "Evaluate in a container what 'guix shell' enters for NAME in the flake of
+DIRECTORY, build its profile, and return the options that stand for it: the
+profile and the environment variables the shell sets.  Return #f when
+OPTIONAL? and the flake has nothing of that name.  The flake's code never
+runs in this process."
+  (unless (pure-eval-supported?)
+    (leave (G_ "a flake shell is evaluated in a container, which needs \
+unprivileged user namespaces~%")))
+  (with-status-verbosity (or (assoc-ref opts 'verbosity) 1)
+    (with-store store
+      (set-build-options-from-command-line store opts)
+      (let-values (((drv environment)
+                    (evaluate-flake-shell
+                     store directory name
+                     #:development? development?
+                     #:optional? optional?
+                     #:bootstrap? (assoc-ref opts 'bootstrap?)
+                     #:options (flake-options-from-opts opts)
+                     #:system (or (assoc-ref opts 'system)
+                                  (%current-system)))))
+        (and drv
+             (let ((dry-run? (assoc-ref opts 'dry-run?)))
+               (with-build-handler
+                   (build-notifier #:use-substitutes?
+                                   (assoc-ref opts 'substitutes?)
+                                   #:verbosity (assoc-ref opts 'verbosity)
+                                   #:dry-run? dry-run?)
+                 (build-derivations store (list drv)))
+               (when dry-run?
+                 (exit 0))
+               (cons (cons 'profile (derivation->output-path drv))
+                     (map (match-lambda
+                            ((variable . value)
+                             (cons 'environment-variables
+                                   (cons variable value))))
+                          environment))))))))
+
+(define (resolve-flake-shell-reference opts)
+  "If the packages named in OPTS, the options of 'guix shell', include a
+flake reference, return OPTS with that reference replaced by the profile of
+the shell it names.  With '-D' the reference names a package and stands for
+its development environment.  Return OPTS unchanged otherwise."
+  (define (payload? option)
+    (match option
+      (((or 'package 'load 'manifest 'profile 'expression) . _) #t)
+      (_ #f)))
+
+  (define (reference? option)
+    (match option
+      (('package _ (? flake-shell-reference?)) #t)
+      (_ #f)))
+
+  (match (filter reference? opts)
+    (() opts)
+    ((('package mode spec))
+     (unless (= 1 (count payload? opts))
+       (leave (G_ "'~a': a flake shell cannot be combined with other \
+packages, files or profiles~%")
+              spec))
+     (match (parse-flake-reference spec)
+       ((directory . name)
+        (append (flake-shell-options directory (or name 'default) opts
+                                     (eq? mode 'package) #f)
+                (remove reference? opts)))))
+    ((_ (_ _ spec) . _)
+     (leave (G_ "'~a': only one flake shell can be entered~%") spec))))
+
+(define (flake-default-shell-options file opts)
+  "Return OPTS, the options of 'guix shell', extended with the default shell
+of the flake that FILE, a flake.scm, defines.  This is what 'guix shell'
+without arguments enters."
+  (let ((directory (dirname (canonicalize-path file))))
+    (append (or (flake-shell-options directory 'default opts #f #t)
+                (leave (G_ "'~a' has no shell named 'default'~%") file))
+            opts)))
 
 ;;;
 ;;; Command entry point.

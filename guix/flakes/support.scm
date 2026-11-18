@@ -10,11 +10,13 @@
   #:use-module (guix gexp)
   #:use-module (guix monads)
   #:use-module (guix store)
+  #:use-module ((guix utils) #:select (%current-system))
   #:export (option system target input-source input-output
             self self-file self-revision source-set shell
             input-handle? input-handle-path input-handle-metadata
             handle->derivation
             shell? shell-packages shell-inputs-from shell-environment
+            shell->manifest
             override override? override-original override-replacement
             override-transform))
 
@@ -98,14 +100,20 @@
           (if (eq? object original) object (transform object))))
     (lower-object (replacement-object value) system #:target target)))
 
-(define-gexp-compiler (shell-compiler (object <shell>) system target)
-  (let* ((packages (append (shell-packages object)
-                           (append-map package-development-inputs
-                                       (shell-inputs-from object))))
-         (manifest (packages->manifest packages)))
-    (profile-derivation manifest #:system system #:target target)))
+(define* (shell->manifest object #:optional (system (%current-system)))
+  "Return the manifest of OBJECT: a shell, a manifest, or a package, which
+stands for the shell that holds this one package."
+  (match object
+    ((? shell? shell)
+     (concatenate-manifests
+      (cons (packages->manifest (shell-packages shell))
+            (map (lambda (package)
+                   (package->development-manifest package system))
+                 (shell-inputs-from shell)))))
+    ((? manifest? manifest) manifest)
+    ((? package? package) (packages->manifest (list package)))
+    (_ (error "not a shell, a manifest or a package" object))))
 
-(define (shell-manifest object)
-  (packages->manifest (append (shell-packages object)
-                              (append-map package-development-inputs
-                                          (shell-inputs-from object)))))
+(define-gexp-compiler (shell-compiler (object <shell>) system target)
+  (profile-derivation (shell->manifest object system)
+                      #:system system #:target target))
