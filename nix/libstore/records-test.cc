@@ -1,5 +1,6 @@
 // goonix: adversarial tests of record signing, selection and import.
 #include "records.hh"
+#include "ca.hh"
 #include "local-store.hh"
 #include "globals.hh"
 #include "util.hh"
@@ -121,10 +122,12 @@ int main(int argc, char ** argv)
     LocalStore store(false);
     store.initialiseGoonixRecords();
 
-    const string text = "Derive([(\"out\",\"" + settings.nixStore +
-        "/ttteoeueuuottuuotutetetooueeoutu-item\",\"\",\"\")],[],[]," +
+    /* The daemon recomputes output paths: the token path carries the
+       derivation's name and the environment names it. */
+    const Path token = tokenPath("out", "resolved");
+    const string text = "Derive([(\"out\",\"" + token + "\",\"\",\"\")],[],[]," +
         "\"x86_64-linux\",\"/bin/sh\",[],[(\"goonixAddressing\",\"content\"),(" +
-        "\"goonixResolved\",\"1\")])";
+        "\"goonixResolved\",\"1\"),(\"out\",\"" + token + "\")])";
     Path drv = store.addTextToStore("resolved.drv", text, PathSet());
     const string hash = printHash(hashString(htSHA256, text));
     store.recordBuild(drv, "out", drv, "local-test", false);
@@ -193,10 +196,11 @@ int main(int argc, char ** argv)
     {
         Path outA = store.addTextToStore("sel-a", "result-a", PathSet());
         Path outB = store.addTextToStore("sel-b", "result-b", PathSet());
-        const string selText = "Derive([(\"out\",\"" + settings.nixStore +
-            "/ttteoeueuuottuuotutetetooueeoutu-selection\",\"\",\"\")],[],[]," +
+        const Path selToken = tokenPath("out", "selection");
+        const string selText = "Derive([(\"out\",\"" + selToken +
+            "\",\"\",\"\")],[],[]," +
             "\"x86_64-linux\",\"/bin/sh\",[],[(\"goonixAddressing\",\"content\"),(" +
-            "\"goonixResolved\",\"1\")])";
+            "\"goonixResolved\",\"1\"),(\"out\",\"" + selToken + "\")])";
         Path selDrv = store.addTextToStore("selection.drv", selText, PathSet());
         const string selHash = printHash(hashString(htSHA256, selText));
         const Path original = settings.nixStore +

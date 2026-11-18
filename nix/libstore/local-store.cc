@@ -1007,10 +1007,14 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 // FIXME: inefficient; we already loaded the
                 // derivation in addValidPath().
                 Derivation drv = readDerivation(i.path);
-                // goonix: recompute every CA output path at registration.
-                if (drv.env.find("goonixAddressing") != drv.env.end() ||
-                    resolvedDerivation(drv))
+                // goonix: recompute every output path at registration.  The
+                // resolved mark means something only with a goonix addressing.
+                if (drv.env.find("goonixAddressing") != drv.env.end())
                     checkGoonixDerivationOutputs(i.path, drv);
+                else if (resolvedDerivation(drv))
+                    throw Error(std::format(
+                        "goonix: derivation `{0}' is marked resolved without an addressing",
+                        i.path));
                 else {
                     checkDerivationOutputs(i.path, drv);
                     // goonix: mixed policy, inputs are valid now so we can check.
