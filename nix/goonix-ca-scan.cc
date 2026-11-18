@@ -20,8 +20,17 @@
 using namespace nix;
 
 static const string reservedAlphabet = "eout";
-static const uint64_t maximumMember = 256ULL * 1024 * 1024;
 static const size_t overlapSize = 32;
+
+static string decoderError(const char * message)
+{
+    return message ? message : "unknown error";
+}
+
+struct GzipCloser {
+    void operator()(gzFile input) { if (input) gzclose(input); }
+};
+using Gzip = std::unique_ptr<gzFile_s, GzipCloser>;
 
 struct ArchiveCloser {
     void operator()(archive * reader) { archive_read_free(reader); }
@@ -59,10 +68,8 @@ struct Scanner {
     void consume(const Path & file, string & pending, const char * bytes,
         size_t length, uint64_t & total)
     {
-        total += length;
-        if (total > maximumMember)
-            fail(std::format("deep CA member `{0}' exceeds 256 MiB", file));
         pending.append(bytes, length);
+        total += length;
         inspect(file, pending, total - pending.size());
         /* A complete token is 32 bytes; an unknown reserved hash needs '-'
            too.  Retain exactly 32 bytes across reads. */
@@ -71,28 +78,26 @@ struct Scanner {
 
     void gzip(const Path & file)
     {
-        gzFile input = gzopen(file.c_str(), "rb");
+        Gzip input(gzopen(file.c_str(), "rb"));
         if (!input) fail(std::format("opening deep CA gzip `{}'", file));
-        try {
-            std::vector<char> buffer(128 * 1024);
-            string pending;
-            uint64_t total = 0;
-            while (true) {
-                int length = gzread(input, buffer.data(), buffer.size());
-                if (length < 0) {
-                    int code = Z_OK;
-                    string message = gzerror(input, &code);
-                    fail(std::format("decoding deep CA gzip `{0}': {1}", file, message));
-                }
-                if (!length) break;
-                consume(file, pending, buffer.data(), length, total);
+        std::vector<char> buffer(128 * 1024);
+        string pending;
+        uint64_t total = 0;
+        while (true) {
+            int length = gzread(input.get(), buffer.data(), buffer.size());
+            if (length < 0) {
+                int code = Z_OK;
+                string message = decoderError(gzerror(input.get(), &code));
+                std::cerr << "skipped\t" << file << "\t" << message << '\n';
+                return;
             }
-            if (gzclose(input) != Z_OK)
-                fail(std::format("closing deep CA gzip `{}'", file));
-        } catch (...) {
-            gzclose(input);
-            throw;
+            if (!length) break;
+            consume(file, pending, buffer.data(), length, total);
         }
+        /* The owner closes only after we release it: exactly one close. */
+        int result = gzclose(input.release());
+        if (result != Z_OK)
+            std::cerr << "skipped\t" << file << "\tclosing gzip: " << result << '\n';
     }
 
     void archive(const Path & file, bool xz, bool bzip2, bool zip)
@@ -103,9 +108,11 @@ struct Scanner {
         if (bzip2) archive_read_support_filter_bzip2(reader.get());
         if (zip) archive_read_support_format_zip(reader.get());
         if (!zip) archive_read_support_format_raw(reader.get());
-        if (archive_read_open_filename(reader.get(), file.c_str(), 128 * 1024) != ARCHIVE_OK)
-            fail(std::format("opening deep CA archive `{0}': {1}", file,
-                archive_error_string(reader.get())));
+        if (archive_read_open_filename(reader.get(), file.c_str(), 128 * 1024) != ARCHIVE_OK) {
+            std::cerr << "skipped\t" << file << "\t"
+                      << decoderError(archive_error_string(reader.get())) << '\n';
+            return;
+        }
         archive_entry * entry = nullptr;
         int result;
         while ((result = archive_read_next_header(reader.get(), &entry)) == ARCHIVE_OK) {
@@ -115,18 +122,21 @@ struct Scanner {
             uint64_t total = 0;
             while (true) {
                 ssize_t length = archive_read_data(reader.get(), buffer.data(), buffer.size());
-                if (length < 0)
-                    fail(std::format("decoding deep CA archive `{0}': {1}", file,
-                        archive_error_string(reader.get())));
+                if (length < 0) {
+                    std::cerr << "skipped\t" << file << "\t"
+                              << decoderError(archive_error_string(reader.get())) << '\n';
+                    return;
+                }
                 if (!length) break;
                 consume(file, pending, buffer.data(), length, total);
             }
         }
         if (result != ARCHIVE_EOF)
-            fail(std::format("reading deep CA archive `{0}': {1}", file,
-                archive_error_string(reader.get())));
+            std::cerr << "skipped\t" << file << "\t"
+                      << decoderError(archive_error_string(reader.get())) << '\n';
         if (archive_read_close(reader.get()) != ARCHIVE_OK)
-            fail(std::format("closing deep CA archive `{}'", file));
+            std::cerr << "skipped\t" << file << "\t"
+                      << decoderError(archive_error_string(reader.get())) << '\n';
     }
 
     void file(const Path & path)

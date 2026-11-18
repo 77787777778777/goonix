@@ -30,7 +30,7 @@ int main(int argc, char ** argv)
     try {
         checkDeepOutput(argv[2], StringSet{}, uid, gid);
     } catch (const Error & error) {
-        string expected = std::format("uid={} gid={} groups=", uid, gid);
+        string expected = std::format("uid={} gid={} groups='", uid, gid);
         string message = error.what();
         identity = message.find(expected) != string::npos;
         std::cout << "helper identity: " << message << '\n';

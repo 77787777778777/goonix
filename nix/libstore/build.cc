@@ -1513,6 +1513,15 @@ static void secureFilePerms(Path path, bool allowSpecialFiles = false)
   }
 }
 
+// goonix: kill leftover decoder processes on both normal and exceptional exit.
+class DeepScanUserCleanup
+{
+    UserLock * user;
+public:
+    DeepScanUserCleanup(UserLock * user) : user(user) { }
+    ~DeepScanUserCleanup() { if (user) user->kill(); }
+};
+
 void DerivationGoal::buildDone()
 {
     trace("build done");
@@ -3463,9 +3472,14 @@ void DerivationGoal::registerOutputs()
             StringSet deepTokens;
             for (auto & output : originalDrv.outputs)
                 deepTokens.insert(selfToken(output.first));
-            checkDeepOutput(finalisationPath, deepTokens,
-                buildUser.enabled() ? buildUser.getUID() : (uid_t) -1,
-                buildUser.enabled() ? buildUser.getGID() : (gid_t) -1);
+            {
+                DeepScanUserCleanup deepCleanup(
+                    settings.get("goonix-deep-scan", false) && buildUser.enabled()
+                        ? &buildUser : nullptr);
+                checkDeepOutput(finalisationPath, deepTokens,
+                    buildUser.enabled() ? buildUser.getUID() : (uid_t) -1,
+                    buildUser.enabled() ? buildUser.getGID() : (gid_t) -1);
+            }
             if (buildMode == bmCheck) {
                 /* --check builds again and compares content addresses.  A
                    different result is stored as a second record for the same

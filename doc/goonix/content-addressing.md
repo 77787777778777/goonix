@@ -131,10 +131,17 @@ groups and assumes the still-held build user's UID and GID.  Under a
 non-root daemon it runs as the daemon's own user: this is no reduction of
 privilege.  Its standard input is `/dev/null`, its environment is empty, and
 inherited descriptors are closed.  It has a one-hour whole-tree backstop and
-a 256 MiB decoded-member ceiling.  Exit 0 is clean,
-exit 1 reports `self-token` or `placeholder`, file and decoded offset, and
-exit 2 is an error.  Missing helpers, crashes, timeouts, malformed results
-and every nonzero status refuse the build.  The daemon and libstore do not
+no decoded-member size ceiling.  It runs outside the build's chroot and
+namespaces: the build user's identity is what protects the host from a
+decoder fault; under a non-root daemon there is no such protection.  Exit 0
+is clean, including files that cannot be decoded after a recognized archive
+signature: each such file is skipped with `skipped<TAB>FILE<TAB>REASON` on
+standard error after the bytes decoded so far have been scanned.  Exit 1
+reports `self-token` or `placeholder`, file and decoded offset.  Exit 2 is an
+error that prevents scanning, such as an unreadable input, unsupported file
+type, bad usage or allocation failure.  Missing helpers, crashes, timeouts,
+malformed results and exit 2 refuse the build.  The daemon logs skipped-file
+diagnostics at info level on a clean exit.  The daemon and libstore do not
 link libarchive; deep scanning is opt-in and there is no daemon-wide switch.
 Existing store items are never overwritten; a valid existing item must
 round-trip to the same hash.

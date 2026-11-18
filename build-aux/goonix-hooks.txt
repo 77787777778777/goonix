@@ -26,6 +26,6 @@ nix/libstore/store-api.hh 5 0
 nix/libstore/worker-protocol.hh 4 2
 nix/libutil/util.cc 18 1
 nix/libutil/util.hh 2 1
-config-daemon.ac 9 0
-nix/local.mk 26 0
+config-daemon.ac 7 0
+nix/local.mk 28 0
 nix/nix-daemon/nix-daemon.cc 39 0

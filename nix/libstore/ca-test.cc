@@ -729,6 +729,12 @@ static void checkInverseFragmentBoundary(const Path & root)
 
 static void checkDeepCompressedSelfToken(const Path & root)
 {
+    ::unsetenv("GOONIX_DEEP_SCAN_HELPER");
+    settings.set("goonix-deep-scan-helper", "");
+    Path installedHelper = deepScanHelperPath();
+    check(!installedHelper.empty() && installedHelper[0] == '/' &&
+        installedHelper.find('$') == string::npos,
+        std::format("installed helper path is expanded: {}", installedHelper));
     configureIsolatedStore(root);
     LocalStore store(false);
     createDirs(settings.nixStore);

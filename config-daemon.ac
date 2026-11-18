@@ -164,8 +164,6 @@ AC_CHECK_HEADERS([archive.h], [have_libarchive_header=yes], [have_libarchive_hea
 PKG_CHECK_MODULES([LIBARCHIVE], [libarchive], [have_libarchive=yes], [have_libarchive=no])
 if test "x$have_libarchive_header" != xyes; then have_libarchive=no; fi
 AM_CONDITIONAL([HAVE_LIBARCHIVE], [test "x$have_libarchive" = xyes])
-AC_DEFINE_UNQUOTED([GUIX_LIBEXECDIR], ["$libexecdir"],
-  [Directory for goonix's unprivileged helper programs.])
 
 AM_CONDITIONAL([HAVE_LIBBZ2], [test "x$HAVE_LIBBZ2" = "xyes"])
 AM_CONDITIONAL([BUILD_DAEMON], [test "x$guix_build_daemon" = "xyes"])

@@ -104,6 +104,8 @@ libstore_a_CPPFLAGS =				\
   -DNIX_BIN_DIR=\"$(bindir)\"			\
   -DDEFAULT_CHROOT_DIRS="\"\""
 
+libstore_a_CPPFLAGS += -DGOONIX_LIBEXEC_DIR=\"$(libexecdir)\" # goonix: expanded helper directory.
+
 libstore_a_CXXFLAGS = $(AM_CXXFLAGS)		\
   $(SQLITE3_CFLAGS)
 

@@ -18,13 +18,18 @@
 
 namespace nix {
 
+Path deepScanHelperPath()
+{
+    Path override = getEnv("GOONIX_DEEP_SCAN_HELPER",
+        settings.get("goonix-deep-scan-helper", string()));
+    return override.empty() ? string(GOONIX_LIBEXEC_DIR) + "/goonix-ca-scan" : override;
+}
+
 void checkDeepOutput(const Path & tree, const StringSet & tokens,
     uid_t buildUID, gid_t buildGID)
 {
     if (!settings.get("goonix-deep-scan", false)) return;
-    Path helper = getEnv("GOONIX_DEEP_SCAN_HELPER",
-        settings.get("goonix-deep-scan-helper",
-            string(GUIX_LIBEXECDIR) + "/goonix-ca-scan"));
+    Path helper = deepScanHelperPath();
     struct stat st;
     if (stat(helper.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || access(helper.c_str(), X_OK) != 0)
         throw BuildError(std::format("deep CA scan helper is unavailable: `{}'", helper));
@@ -65,7 +70,8 @@ void checkDeepOutput(const Path & tree, const StringSet & tokens,
 
         Strings args = {helper, tree};
         for (auto & token : tokens) args.push_back(token);
-        execve(helper.c_str(), stringsToCharPtrs(args).data(), nullptr);
+        char * emptyEnvironment[] = {nullptr};
+        execve(helper.c_str(), stringsToCharPtrs(args).data(), emptyEnvironment);
         _exit(errno == ENOENT ? 127 : 126);
     }, true, "goonix deep CA scan setup: ", false);
     child.setSeparatePG(true);
@@ -117,7 +123,10 @@ void checkDeepOutput(const Path & tree, const StringSet & tokens,
     if (!WIFEXITED(status))
         throw BuildError(std::format("deep CA scan helper crashed: {}", statusToString(status)));
     int code = WEXITSTATUS(status);
-    if (code == 0) return;
+    if (code == 0) {
+        if (!diagnostic.empty()) printMsg(lvlInfo, diagnostic);
+        return;
+    }
     if (code == 1) {
         auto first = diagnostic.find('\t');
         auto second = first == string::npos ? string::npos : diagnostic.find('\t', first + 1);
