@@ -356,6 +356,47 @@ static string replaceWhole(string input, const string & from, const string & to,
     return input;
 }
 
+/* goonix: rewrite in bounded chunks.  Retaining the previous token's tail
+   catches matches spanning a read boundary; no output-sized string is made. */
+static void rewriteRegularFile(const Path & path, const string & from,
+    const string & to, mode_t mode)
+{
+    if (chmod(path.c_str(), 0600))
+        throw SysError(std::format("making `{}' writable for CA rewrite", path));
+    Path temporary = path + ".goonix-rewrite";
+    if (pathExists(temporary))
+        throw BuildError(std::format("CA temporary file `{0}' already exists", temporary));
+    AutoDelete cleanup(temporary, false);
+    int input = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (input < 0) throw SysError(std::format("opening `{}' for CA rewrite", path));
+    AutoCloseFD inputFD = input;
+    int output = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (output < 0) throw SysError(std::format("creating `{}'", temporary));
+    AutoCloseFD outputFD = output;
+    std::vector<unsigned char> buffer(128 * 1024);
+    string pending;
+    while (true) {
+        ssize_t n = read(inputFD, buffer.data(), buffer.size());
+        if (n < 0) { if (errno == EINTR) continue;
+            throw SysError(std::format("reading `{}' for CA rewrite", path)); }
+        if (n == 0) break;
+        pending.append((const char *) buffer.data(), n);
+        size_t keep = from.size() - 1;
+        size_t process = pending.size() > keep ? pending.size() - keep : 0;
+        string rewritten = replaceWhole(pending.substr(0, process), from, to, path);
+        writeFull(outputFD, rewritten);
+        pending.erase(0, process);
+    }
+    writeFull(outputFD, replaceWhole(pending, from, to, path));
+    if (fchmod(outputFD, mode)) throw SysError(std::format("restoring `{}'", path));
+    if (futimens(outputFD, (const timespec[2]) {{0, UTIME_OMIT}, {1, 0}}))
+        throw SysError(std::format("restoring timestamp of `{}'", path));
+    outputFD.close();
+    if (rename(temporary.c_str(), path.c_str()))
+        throw SysError(std::format("installing rewritten `{}'", path));
+    cleanup.cancel();
+}
+
 static void checkReserved(const Path & path, const string & bytes)
 {
     /* The normal reference scanner only knows base32 hashes.  Reserved
@@ -370,6 +411,27 @@ static void checkReserved(const Path & path, const string & bytes)
     }
 }
 
+static void checkReservedFile(const Path & path)
+{
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) throw SysError(std::format("scanning `{}'", path));
+    AutoCloseFD input = fd;
+    std::vector<unsigned char> buffer(128 * 1024);
+    string pending;
+    while (true) {
+        ssize_t n = read(input, buffer.data(), buffer.size());
+        if (n < 0) { if (errno == EINTR) continue;
+            throw SysError(std::format("reading `{}' for CA scan", path)); }
+        if (n == 0) break;
+        pending.append((const char *) buffer.data(), n);
+        if (pending.size() > 32) {
+            checkReserved(path, pending);
+            pending.erase(0, pending.size() - 31);
+        }
+    }
+    checkReserved(path, pending);
+}
+
 static void checkReservedTree(const Path & path, unsigned depth = 0)
 {
     if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
@@ -380,7 +442,7 @@ static void checkReservedTree(const Path & path, unsigned depth = 0)
         for (auto & entry : readDirectory(path))
             checkReservedTree(path + "/" + entry.name, depth + 1);
     } else if (S_ISREG(st.st_mode)) {
-        checkReserved(path, readFile(path, true));
+        checkReservedFile(path);
     } else if (S_ISLNK(st.st_mode)) {
         checkReserved(path, readLink(path));
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
@@ -407,18 +469,8 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         }
         /* The parent may need renaming after its contents, not before. */
     } else if (S_ISREG(st.st_mode)) {
-        if (chmod(path.c_str(), 0600))
-            throw SysError(std::format("making `{}' writable for CA rewrite", path));
-        string data = readFile(path, true);
-        if (data.size() != (size_t) st.st_size)
-            throw BuildError(std::format("file `{}' changed while scanning CA output", path));
-        string rewritten = replaceWhole(data, from, to, path);
-        if (rewritten != data) writeFile(path, rewritten);
-        /* NAR has one executable bit, S_IXUSR.  Keep it on every pass:
-           the inverse mapping must hash exactly the same tree. */
-        if (chmod(path.c_str(), (st.st_mode & S_IFMT) |
-                  ((st.st_mode & S_IXUSR) ? 0555 : 0444)) != 0)
-            throw SysError(std::format("restoring permissions on `{}'", path));
+        rewriteRegularFile(path, from, to,
+            (st.st_mode & S_IFMT) | ((st.st_mode & S_IXUSR) ? 0555 : 0444));
     } else if (S_ISLNK(st.st_mode)) {
         string target = replaceWhole(readLink(path), from, to, path);
         if (target != readLink(path)) {

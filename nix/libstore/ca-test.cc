@@ -6,7 +6,10 @@
 #include <iostream>
 #include <format>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+
+#include <sys/resource.h>
 
 using namespace nix;
 
@@ -115,8 +118,39 @@ static void checkSymlinkModes(const Path & root)
     check((st.st_mode & 07777) == 0755, "nested symlink preserves parent mode");
 }
 
+static void checkStreamingFinalisation(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path output = tokenPath("out", "sparse-output");
+    int fd = open(output.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) throw SysError("creating sparse CA test output");
+    AutoCloseFD close = fd;
+    const uint64_t size = 128 * 1024 * 1024;
+    if (ftruncate(fd, size)) throw SysError("sizing sparse CA test output");
+    const string self = output;
+    if (pwrite(fd, self.data(), self.size(), size / 2) != (ssize_t) self.size())
+        throw SysError("writing sparse CA self-reference");
+    close.close();
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_AS, &limit)) throw SysError("reading address-space limit");
+    if (limit.rlim_cur > 96 * 1024 * 1024) limit.rlim_cur = 96 * 1024 * 1024;
+    if (setrlimit(RLIMIT_AS, &limit)) throw SysError("setting CA test memory limit");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, output, "out", "sparse-output",
+        PathSet{output}, references, narHash, narSize);
+    check(pathExists(final), "sparse output finalises within the memory limit");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--streaming") {
+        checkStreamingFinalisation(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--symlink-modes") {
         checkSymlinkModes(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
