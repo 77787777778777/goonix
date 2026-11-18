@@ -19,6 +19,7 @@ MODULES +=					\
 SCM_TESTS +=					\
   tests/ca.scm					\
   tests/ca-build.scm				\
+  tests/ca-rewrite.scm				\
   tests/ca-sharing.scm				\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
@@ -40,6 +41,7 @@ XFAIL_TESTS = build-aux/check-goonix-hooks.sh
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
   build-aux/goonix-upstream-base		\
+  tests/ca-vectors.json				\
   tests/fixtures/flake-actions-app.scm	\
   tests/fixtures/flake-actions-checks.scm	\
   tests/fixtures/flake-actions-gate.scm	\
@@ -61,6 +63,8 @@ if BUILD_DAEMON
 # 'guix' that runs from the build tree.
 check-local:
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test
+	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --tree-vectors
+	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --placeholder-vector
 	$(AM_V_at)$(top_builddir)/test-env $(SHELL) -e -c \
 	  'helper="$$GUIX_STATE_DIRECTORY/guix-helper"; \
 	   printf "#!%s\nexec %s guix \"\$$@\"\n" "$$SHELL" \

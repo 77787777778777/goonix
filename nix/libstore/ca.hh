@@ -60,6 +60,7 @@ Path resolvedAddressedPath(const string & output, const string & name,
 Path finaliseContentOutput(class LocalStore & store, const Path & tokenPath,
     const string & output, const string & name, const PathSet & allPaths,
     PathSet & references, Hash & narHash, uint64_t & narSize,
-    const std::map<Path, Path> & finalOutputs = {});
+    const std::map<Path, Path> & finalOutputs = {},
+    const Path & actualTokenPath = "");
 
 }

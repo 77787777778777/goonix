@@ -17,7 +17,8 @@
 namespace nix {
 
 static const string alphabet = "eout";
-static const string treeDomain = "goonix-tree-v1\0";
+static const string treeDomain("goonix-tree-v1\0", 15);
+static const string contentDomain("goonix-content-v1\0", 18);
 
 static string encodeReserved(const Hash & digest, bool token)
 {
@@ -201,6 +202,15 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
         blank.env[output.first] = "";
     }
     const string bytes = unparseDerivation(blank);
+    Derivation resolved = blank;
+    for (auto & output : resolved.outputs) {
+        if (!output.second.hash.empty()) continue;
+        string outputName = name + (output.first == "out" ? "" : "-" + output.first);
+        output.second.path = tokenPath(output.first, outputName);
+        resolved.env[output.first] = output.second.path;
+    }
+    resolved.env["goonixResolved"] = "1";
+    const string provisionalBytes = unparseDerivation(resolved);
     for (auto & output : drv.outputs) {
         bool recursive;
         HashType hashType;
@@ -218,7 +228,8 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
                     name + (output.first == "out" ? "" : "-" + output.first));
         } else if (addressingOf(drv) == Addressing::resolved) {
             expected = resolvedAddressedPath(output.first,
-                name + (output.first == "out" ? "" : "-" + output.first), bytes);
+                name + (output.first == "out" ? "" : "-" + output.first),
+                provisionalBytes);
         } else {
             /* Registration routes input-addressed derivations through the
                ordinary path check, and refuses a resolved mark without an
@@ -272,7 +283,7 @@ static Hash hashTree(const Path & path, unsigned depth)
         if (fd == -1) throw SysError(std::format("opening `{}' for CA hash", path));
         AutoCloseFD close = fd;
         std::vector<unsigned char> buffer(128 * 1024);
-        /* File bytes are streamed; their known length precedes the stream. */
+        /* The file's length and bytes are one framed field. */
         put64(header, st.st_size);
         HashSink sink(htSHA256);
         sink((const unsigned char *) header.data(), header.size());
@@ -313,8 +324,7 @@ Hash treeHash(const Path & path) { return hashTree(path, 0); }
 Path contentAddressedPath(const string & output, const string & name,
     const Hash & tree, const PathSet & references)
 {
-    string bytes = "goonix-content-v1\0";
-    put64(bytes, tree.hashSize);
+    string bytes = contentDomain;
     putBytes(bytes, tree.hash, tree.hashSize);
     put64(bytes, references.size());
     for (auto & reference : references) putBytes(bytes, reference);
@@ -616,17 +626,18 @@ static bool sameContent(const Path & path, const string & final,
 Path finaliseContentOutput(LocalStore & store, const Path & token,
     const string & output, const string & name, const PathSet & allPaths,
     PathSet & references, Hash & narHash, uint64_t & narSize,
-    const std::map<Path, Path> & finalOutputs)
+    const std::map<Path, Path> & finalOutputs, const Path & actualTokenPath)
 {
-    checkReservedTree(token);
+    const Path physical = actualTokenPath.empty() ? token : actualTokenPath;
+    checkReservedTree(physical);
     /* goonix: sibling tokens have the same fixed width as final hashes. */
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
-            rewriteTree(token, baseNameOf(sibling.first).substr(0, 32),
+            rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),
                 baseNameOf(sibling.second).substr(0, 32));
     HashResult initial;
-    PathSet initialReferences = scanForReferences(token, allPaths, initial);
-    Hash built = treeHash(token);
+    PathSet initialReferences = scanForReferences(physical, allPaths, initial);
+    Hash built = treeHash(physical);
     PathSet namingReferences = initialReferences;
     namingReferences.erase(token);
     Path final = contentAddressedPath(output, name, built, namingReferences);
@@ -646,7 +657,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (!same)
             throw BuildError(std::format(
                 "CA content address collision at `{0}': existing item differs", final));
-        deletePath(token);
+        deletePath(physical);
         HashResult existingNAR;
         references = scanForReferences(final, allPaths, existingNAR);
         auto result = hashPath(htSHA256, final);
@@ -655,11 +666,11 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         return final;
     }
 
-    rewriteTree(token, oldHash, newHash);
+    rewriteTree(physical, oldHash, newHash);
     /* Renaming self references necessarily changes this tree's hash.
        Verification is the inverse mapping performed below. */
-    if (rename(token.c_str(), final.c_str()))
-        throw SysError(std::format("moving CA output `{}' to `{}'", token, final));
+    if (rename(physical.c_str(), final.c_str()))
+        throw SysError(std::format("moving CA output `{}' to `{}'", physical, final));
     /* goonix: the inverse mapping is verified without touching the final tree. */
     bool good = sameContent(final, final, token, built, finalOutputs);
     if (!good) {
@@ -702,21 +713,26 @@ Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
         arg = substitute(arg);
     for (auto & entry : resolved.env) entry.second = substitute(entry.second);
     resolved.inputDrvs.clear();
-    const string provisional = unparseDerivation(resolved);
     for (auto & output : resolved.outputs) {
-        /* A fixed output keeps the path its stated hash already determines. */
+        /* First remove every unresolved placeholder.  Content outputs stay
+           at their token paths; resolved outputs are assigned below. */
         if (!output.second.hash.empty()) continue;
         string name = storePathToName(output.second.path);
-        if (addressingOf(unresolved) == Addressing::content)
-            output.second.path = tokenPath(output.first, name);
-        else
-            output.second.path = resolvedAddressedPath(output.first, name, provisional);
+        output.second.path = tokenPath(output.first, name);
+        resolved.env[output.first] = output.second.path;
+    }
+    resolved.env["goonixResolved"] = "1";
+    const string provisional = unparseDerivation(resolved);
+    for (auto & output : resolved.outputs) {
+        if (!output.second.hash.empty() ||
+            addressingOf(unresolved) != Addressing::resolved) continue;
+        string name = storePathToName(output.second.path);
+        output.second.path = resolvedAddressedPath(output.first, name, provisional);
     }
     /* Every output's environment entry names its resolved path, not just
        `out'; multi-output derivations must stay consistent. */
     for (auto & output : resolved.outputs)
         resolved.env[output.first] = output.second.path;
-    resolved.env["goonixResolved"] = "1";
     checkResolvedDerivation(resolved);
     return resolved;
 }

@@ -182,5 +182,14 @@
       (and (string=? lib (read-all (string-append out "/reference")))
            (member lib (references store out))))))
 
+(test-assert "resolved-addressed paths hash the final resolved derivation"
+  (let ((one (shell-drv "ca-resolved-cutoff" (write-output "same")
+                        #:addressing 'resolved #:env-vars '(("v" . "one"))))
+        (two (shell-drv "ca-resolved-cutoff" (write-output "same")
+                        #:addressing 'resolved #:env-vars '(("v" . "two")))))
+    (build-derivations store (list one two))
+    (and (string=? (realised one) (realised two))
+         (string=? "same" (read-all (realised one))))))
+
 (close-connection store)
 (test-end)

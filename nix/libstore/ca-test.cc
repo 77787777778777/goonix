@@ -238,8 +238,40 @@ static void checkPlaceholderVector()
         "placeholder bytes match the Scheme serializer");
 }
 
+static void checkTreeVectors()
+{
+    Path root = "/tmp/goonix-ca-vectors";
+    if (pathExists(root)) deletePath(root);
+    createDirs(root);
+    writeFile(root + "/empty", "");
+    chmod((root + "/empty").c_str(), 0444);
+    Hash empty = treeHash(root + "/empty");
+    check(printHash(empty) ==
+        "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2",
+        "empty file tree vector");
+    createSymlink("target", root + "/link");
+    check(printHash(treeHash(root + "/link")) ==
+        "5ef2f8b90d0ca186d4b49cc6bbf69533d7bfe13bdc86bd4e7a2ef354ffb6812c",
+        "symlink tree vector");
+    createDirs(root + "/dir");
+    writeFile(root + "/dir/empty", "");
+    chmod((root + "/dir/empty").c_str(), 0444);
+    check(printHash(treeHash(root + "/dir")) ==
+        "4d906c085e9d72c6732872daeafd12323257f240329e76da0e9550d1ec24a2dd",
+        "directory tree vector");
+    Path actualContent = contentAddressedPath("out", "hello", empty, {});
+    check(actualContent ==
+        "/gnu/store/kq0f52qvhdwr2a7a5ycvrra8b124sdw4-hello",
+        "content path vector");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 2 && string(argv[1]) == "--tree-vectors") {
+        settings.nixStore = "/gnu/store";
+        checkTreeVectors();
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 2 && string(argv[1]) == "--placeholder-vector") {
         checkPlaceholderVector();
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
