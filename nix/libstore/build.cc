@@ -3298,6 +3298,14 @@ void DerivationGoal::registerOutputs()
 
     // goonix: sibling tokens become their final output paths before naming.
     std::map<Path, Path> goonixFinalOutputs;
+    std::vector<std::pair<string, Path>> goonixFacts;
+    PathSet goonixStagedOutputs;
+    auto discardGoonixOutputs = [&] {
+        for (auto & output : goonixFinalOutputs)
+            if (goonixStagedOutputs.count(output.second) &&
+                pathExists(output.second))
+                deletePath(output.second);
+    };
 
     auto goonixOutputOrder = addressingOf(drv) == Addressing::content &&
         resolvedDerivation(drv)
@@ -3365,11 +3373,12 @@ void DerivationGoal::registerOutputs()
                 i.first, storePathToName(path), allPaths, info.references,
                 info.hash, info.narSize, goonixFinalOutputs, finalisationPath);
             goonixFinalOutputs[path] = final;
+            goonixStagedOutputs.insert(final);
+            worker.store.addTempRoot(final);
             info.path = final;
             info.deriver = drvPath;
             infos.push_back(info);
-            localStore.recordBuild(drvPath, i.first, final, "local", false);
-            localStore.chooseOutput(originalDrvPath, i.first, final);
+            goonixFacts.push_back({i.first, final});
             continue;
         }
         if (useChroot) {
@@ -3614,13 +3623,26 @@ void DerivationGoal::registerOutputs()
 
     if (curRound < nrRounds) {
         prevInfos = infos;
+        discardGoonixOutputs();
         return;
     }
 
     /* Register each output path as valid, and register the sets of
        paths referenced by each of them.  If there are cycles in the
        outputs, this will fail. */
-    worker.store.registerValidPaths(infos);
+    try {
+        worker.store.registerValidPaths(infos);
+        if (resolvedDerivation(drv)) {
+            auto & local = dynamic_cast<LocalStore &>(worker.store);
+            for (auto & fact : goonixFacts) {
+                local.recordBuild(drvPath, fact.first, fact.second, "local", false);
+                local.chooseOutput(originalDrvPath, fact.first, fact.second);
+            }
+        }
+    } catch (...) {
+        discardGoonixOutputs();
+        throw;
+    }
 }
 
 

@@ -192,6 +192,42 @@
       (and (string=? lib (read-all (string-append out "/reference")))
            (member lib (references store out))))))
 
+(test-assert "a failed sibling leaves no record or final tree, and can be retried"
+  (let* ((bad (shell-drv "ca-partial"
+                         "(call-with-output-file out (lambda (p) (display out p)))"
+                         #:outputs '("out" "missing")))
+         (store-directory (dirname (derivation-file-name bad)))
+         (resolved
+          (find (lambda (file)
+                  (string-contains (read-all file) "goonixResolved"))
+                (map (lambda (name) (string-append store-directory "/" name))
+                     (scandir store-directory
+                              (lambda (name)
+                                (and (string-suffix? "-ca-partial.drv" name)
+                                     (not (string-suffix? ".lock" name))))))))
+         (hash (sha256 (string->utf8 (read-all resolved))))
+         (output-files
+          (map (lambda (name) (string-append store-directory "/" name))
+               (scandir store-directory
+                        (lambda (name)
+                          (and (string-suffix? "-ca-partial" name)
+                               (not (string-suffix? ".drv" name))
+                               (not (string-suffix? ".lock" name))))))))
+    (and resolved
+         (guard (condition ((store-protocol-error? condition) #t))
+           (build-derivations store (list bad))
+           #f)
+         (null? (query-build-records store hash "out"))
+         (every (negate file-exists?) output-files)
+         (let ((good (shell-drv "ca-partial"
+                                "(call-with-output-file out (lambda (p) (display out p)))"
+                                #:outputs '("out" "lib")
+                                #:env-vars '(("retry" . "1")))))
+           (build-derivations store (list good))
+           (let ((out (realised good)))
+             (and (valid-path? store out)
+                  (string=? out (read-all out))))))))
+
 (test-assert "resolved-addressed paths hash the final resolved derivation"
   (let* ((one (shell-drv "ca-resolved-cutoff" (write-output "same")
                         #:addressing 'resolved #:env-vars '(("v" . "one"))))

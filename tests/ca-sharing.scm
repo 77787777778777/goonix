@@ -164,7 +164,10 @@
     (and (string=? out (read-all out))
          (string=? out (realised drv))
          (valid-path? store out)
-         (= 1 (length (build-records hash "out")))
+         ;; A check is a distinct fact (origin local-check), even when it
+         ;; reaches the same address.  Reproducibility means one result path.
+         (equal? (list out) (delete-duplicates (record-paths hash "out")))
+         (= 2 (length (build-records hash "out")))
          (verify-store store #:check-contents? #t #:repair? #f))))
 
 (test-assert "--check stores a second record for a non-reproducible result"
