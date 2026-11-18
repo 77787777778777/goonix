@@ -13,12 +13,13 @@ module Goonix.Build.Engine
   , BuildTrace (..)
   ) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, bracket, catch, finally, fromException, throwIO)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef)
+import Data.Time.Clock.POSIX (POSIXTime)
+import Control.Exception (SomeException, bracket, catch, finally, fromException, throwIO, try)
 import Control.Monad (foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -40,13 +41,15 @@ import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
-import System.Exit (ExitCode (ExitSuccess))
+import System.Exit (ExitCode (ExitSuccess, ExitFailure))
 import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
-import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited))
+import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
+import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
 import System.Posix.User (getRealGroupID, getRealUserID)
 import System.FilePath (takeDirectory)
+import System.IO.Error (isDoesNotExistError)
 import System.Posix.Types (CPid (..), Fd (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..))
@@ -198,7 +201,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   readHandle <- fdToHandle readFd
   guixProgram <- maybe "guix" C.unpack <$> getEnv "GUIX"
   let command = if "builtin:" `B.isPrefixOf` builder drv
-        then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs drv Map.! "out"))]
+        then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
   (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
     then spawnSandboxedBuilder store work drvPath actualDrv command env writeFd
@@ -207,14 +210,16 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       inherited <- if isBuiltin then getEnvironment else pure []
       let childEnvironment = if isBuiltin then inherited else env
       (_, _, _, process) <- createProcess command
-        { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
+        { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
       pid <- maybe 0 fromIntegral <$> getPid process
       pure (pid, waitForProcess process, Nothing, [])
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
+  lastOutput <- getPOSIXTime >>= newIORef
   drained <- newEmptyMVar
-  _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace `finally` putMVar drained ()
-  status <- withWritableStore (storeDirectory store) wait
+  _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace lastOutput `finally` putMVar drained ()
+  (status, timeoutReason) <- withWritableStore (storeDirectory store) $
+    waitForBuilder settings childPid wait lastOutput
   takeMVar drained
   hClose readHandle
   hClose logHandle
@@ -239,16 +244,19 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       forM_ sandboxRoot $ \root -> do
         Files.setFileMode root 0o755
         deleteTree root
-      buildFailed work
+      buildFailed work timeoutReason
   where
-    buildFailed work = do
-      traceFailed trace drvPath "builder failed"
-      when (mode == Normal && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
+    buildFailed work timeoutReason = do
+      let timedOut = timeoutReason /= Nothing
+          status = if timedOut then 101 else 1
+          reason = maybe "builder failed" ("failed: " ++) timeoutReason
+      traceFailed trace drvPath (if timedOut then "timeout" else "builder failed")
+      when (mode == Normal && not timedOut && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
         mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
       if keepFailed settings
         then pure ()
         else removeBuildDirectory work
-      throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed"))
+      throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " " ++ reason)) status)
 
 foreign import ccall unsafe "goonix_spawn_sandbox"
   c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
@@ -353,12 +361,41 @@ spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
       bytes <- B.readFile (C.unpack path)
       either (throwIO . storeError) pure (parseDerivation bytes)
 
+waitForBuilder :: Settings -> Int -> IO ExitCode -> IORef POSIXTime -> IO (ExitCode, Maybe String)
+waitForBuilder settings pid wait lastOutput = do
+  started <- getPOSIXTime
+  status <- newEmptyMVar
+  reason <- newIORef Nothing
+  _ <- forkIO (try wait >>= putMVar status)
+  let total = settingInt "build-timeout" 0 settings
+      silent = settingInt "build-max-silent-time" 0 settings
+      stop why = do
+        atomicWriteIORef reason (Just why)
+        signalProcessGroup sigKILL (fromIntegral pid) `catch` \exception ->
+          if isDoesNotExistError exception then pure () else throwIO exception
+      watch = do
+        threadDelay 100000
+        now <- getPOSIXTime
+        latest <- readIORef lastOutput
+        if total > 0 && now - started >= fromIntegral total
+          then stop "timeout"
+          else if silent > 0 && now - latest >= fromIntegral silent
+            then stop "silence timeout"
+            else watch
+  timer <- if total > 0 || silent > 0 then Just <$> forkIO watch else pure Nothing
+  result <- takeMVar status
+  mapM_ killThread timer
+  why <- readIORef reason
+  either (\(exception :: SomeException) -> throwIO exception)
+    (\code -> pure (if why /= Nothing then ExitFailure 1 else code, why)) result
+
 waitForSandbox :: Int -> IO ExitCode
 waitForSandbox pid = do
   status <- getProcessStatus True False (fromIntegral pid)
   case status of
     Just (Exited code) -> pure code
-    Just _ -> waitForSandbox pid
+    Just (Terminated _ _) -> pure (ExitFailure 1)
+    Just (Stopped _) -> waitForSandbox pid
     Nothing -> throwIO (storeError "cannot wait for sandbox helper")
 
 makeSandboxRoot :: Store -> IO RawFilePath
@@ -425,16 +462,17 @@ buildLogPath store drvPath = do
       basename = B.drop (B.length (storeDirectory store) + 1) drvPath
   pure (base <> "/drvs/" <> B.take 2 basename <> "/" <> B.drop 2 basename)
 
-copyLog :: Int -> Bool -> Handle -> Handle -> BuildTrace -> IO ()
-copyLog pid multiplexed input output trace = do
+copyLog :: Int -> Bool -> Handle -> Handle -> BuildTrace -> IORef POSIXTime -> IO ()
+copyLog pid multiplexed input output trace lastOutput = do
   bytes <- B.hGetSome input 32768
   unless (B.null bytes) $ do
+    getPOSIXTime >>= writeIORef lastOutput
     B.hPutStr output bytes
     let prefix = if multiplexed
           then "@ build-log " <> C.pack (show pid) <> " " <> C.pack (show (B.length bytes)) <> "\n"
           else B.empty
     traceOutput trace (prefix <> bytes)
-    copyLog pid multiplexed input output trace
+    copyLog pid multiplexed input output trace lastOutput
 
 builderEnvironment :: Store -> Settings -> RawFilePath -> Derivation -> IO [(String, String)]
 builderEnvironment store settings work drv = do
@@ -442,7 +480,7 @@ builderEnvironment store settings work drv = do
   let base = filter (\(key, _) -> key `elem` ["PATH", "HOME", "TMPDIR", "NIX_STORE", "NIX_STORE_DIR", "GUIX", "GUIX_UNINSTALLED", "GUIX_STATE_DIRECTORY", "GUIX_DATABASE_DIRECTORY", "GUIX_LOG_DIRECTORY", "GUILE_LOAD_PATH", "GUILE_LOAD_COMPILED_PATH", "GUIX_CONFIGURATION_DIRECTORY", "GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES", "GUIX_BINARY_SUBSTITUTE_URL", "XDG_CACHE_HOME"]) inherited
       custom = map (\(key, value) -> (C.unpack key, C.unpack value)) (Map.toList (environment drv))
       outputsEnv = [(C.unpack name, C.unpack (outputPath output)) | (name, output) <- Map.toList (outputs drv)]
-      buildEnv = [("NIX_STORE", C.unpack (storeDirectory store)), ("NIX_BUILD_TOP", C.unpack work), ("NIX_BUILD_CORES", show (settingInt "build-cores" 0 settings)), ("TMPDIR", C.unpack work), ("TEMP", C.unpack work), ("TMP", C.unpack work), ("out", C.unpack (outputPath (outputs drv Map.! "out")))]
+      buildEnv = [("NIX_STORE", C.unpack (storeDirectory store)), ("NIX_BUILD_TOP", C.unpack work), ("NIX_BUILD_CORES", show (settingInt "build-cores" 0 settings)), ("TMPDIR", C.unpack work), ("TEMP", C.unpack work), ("TMP", C.unpack work), ("TEMPDIR", C.unpack work), ("PWD", C.unpack work)]
   pure (base ++ custom ++ outputsEnv ++ buildEnv)
 
 registerBuiltOutputs :: Store -> ByteString -> Derivation -> IO ()
@@ -469,7 +507,7 @@ verifyFixedOutput output path = do
   expected <- case decodeBase16 (outputHash output) of
     Right digest | B.length digest == digestLength algorithm -> pure digest
     _ -> throwIO (storeError ("invalid " ++ C.unpack (C.map toUpperAscii (algorithmName algorithm)) ++ " hash"))
-  hash <- if outputHashAlgo output == "r:sha256"
+  hash <- if "r:" `B.isPrefixOf` outputHashAlgo output
     then hashNar path
     else hashFile algorithm path
   when (hashDigest hash /= expected) $
@@ -496,8 +534,10 @@ prepareReferenceGraphs store work drv =
       where
         go [] = pure ()
         go (name:path:rest) = do
-          closure <- referenceClosure store path
-          entries <- forM closure $ \item -> do
+          let root = topLevelStorePath store path
+          initial <- referenceClosure store root
+          withOutputs <- foldM includeDerivationOutputs initial initial
+          entries <- forM withOutputs $ \item -> do
             info <- queryPathInfo store item
             pure (item <> "\n\n" <> C.pack (show (length (infoReferences info))) <> "\n"
                   <> B.intercalate "\n" (infoReferences info)
@@ -505,6 +545,13 @@ prepareReferenceGraphs store work drv =
           B.writeFile (C.unpack (work <> "/" <> name)) (B.concat entries)
           go rest
         go _ = throwIO (storeError "odd number of tokens in exportReferencesGraph")
+        includeDerivationOutputs result item
+          | not (".drv" `B.isSuffixOf` item) = pure result
+          | otherwise = do
+              bytes <- B.readFile (C.unpack item)
+              parsed <- either (throwIO . storeError) pure (parseDerivation bytes)
+              expanded <- mapM (referenceClosure store . outputPath) (Map.elems (outputs parsed))
+              pure (Set.toAscList (Set.fromList (result ++ concat expanded)))
 
 referenceClosure :: Store -> RawFilePath -> IO [RawFilePath]
 referenceClosure store root = go Set.empty [root]

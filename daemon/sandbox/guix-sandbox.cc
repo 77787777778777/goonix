@@ -744,12 +744,39 @@ void execAction(Plan & plan)
     sysError("executing " + plan.program);
 }
 
+pid_t pidNamespaceChild = -1;
+
+void forwardTermination(int)
+{
+    if (pidNamespaceChild > 0) {
+        kill(pidNamespaceChild, SIGKILL);
+        kill(-pidNamespaceChild, SIGKILL);
+    }
+}
+
 void enterPidNamespace(Plan & plan)
 {
     if (!plan.extended) return;
+    /* Install the handler before forking: the child is the builder's PID 1
+       and must also terminate when the daemon cancels the helper. */
+    struct sigaction terminate { };
+    terminate.sa_handler = forwardTermination;
+    sigemptyset(&terminate.sa_mask);
+    if (sigaction(SIGTERM, &terminate, nullptr) == -1 ||
+        sigaction(SIGINT, &terminate, nullptr) == -1 ||
+        sigaction(SIGHUP, &terminate, nullptr) == -1)
+        sysError("installing sandbox termination handlers");
     const pid_t child = fork();
     if (child == -1) sysError("entering PID namespace");
-    if (child == 0) return;
+    if (child == 0) {
+        /* The helper is the daemon's direct child; if it is killed, do not
+           leave the builder running as PID 1 in the new PID namespace. */
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+            sysError("setting builder parent-death signal");
+        return;
+    }
+    /* Forward cancellation to the builder's process group as well. */
+    pidNamespaceChild = child;
     int status = 0;
     pid_t result;
     do { result = waitpid(child, &status, 0); } while (result == -1 && errno == EINTR);

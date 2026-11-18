@@ -15,6 +15,7 @@ int goonix_spawn_sandbox(const char *program, const char *plan,
   if (pid < 0) return -1;
   if (pid == 0) {
     /* Do not run Haskell between fork and exec.  Only this tiny C shim runs. */
+    if (setpgid(0, 0) < 0) _exit(127);
     if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
       _exit(127);
     if (log_fd > STDERR_FILENO) close(log_fd);

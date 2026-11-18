@@ -210,15 +210,10 @@ derivationOutputPathsWithHash store drvPath h drv
 
 parseHashInfo :: DerivationOutput -> Either String (Bool, HashAlgorithm, ByteString)
 parseHashInfo out = do
-  (algorithm, recursive) <- case outputHashAlgo out of
-    "md5" -> Right (MD5, False)
-    "sha1" -> Right (SHA1, False)
-    "sha256" -> Right (SHA256, False)
-    "sha512" -> Right (SHA512, False)
-    "r:md5" -> Right (MD5, True)
-    "r:sha1" -> Right (SHA1, True)
-    "r:sha256" -> Right (SHA256, True)
-    "r:sha512" -> Right (SHA512, True)
-    _ -> Left "unknown derivation output hash algorithm"
+  let encoded = outputHashAlgo out
+      recursive = "r:" `B.isPrefixOf` encoded
+  algorithm <- case algorithmFromName (if recursive then B.drop 2 encoded else encoded) of
+    Right value -> Right value
+    Left _ -> Left "unknown derivation output hash algorithm"
   digest <- decodeBase16 (outputHash out)
   pure (recursive, algorithm, digest)
