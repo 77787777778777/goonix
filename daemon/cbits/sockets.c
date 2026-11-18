@@ -25,10 +25,16 @@ int goonix_listen_unix(const char *path) {
   address.sun_family = AF_UNIX;
   memcpy(address.sun_path, path, length + 1);
   unlink(path);
-  mode_t old = umask(0111);
-  int result = bind(fd, (struct sockaddr *)&address, sizeof address);
-  umask(old);
-  if (result < 0 || listen(fd, 5) < 0) { int saved = errno; close(fd); errno = saved; return -1; }
+  if (bind(fd, (struct sockaddr *)&address, sizeof address) < 0 || listen(fd, 5) < 0 ||
+      /* umask is process-wide: do not race directory creation in other
+         connection threads.  Set the socket's mode after binding instead. */
+      fchmodat(AT_FDCWD, path, 0666, 0) < 0) {
+    int saved = errno;
+    close(fd);
+    unlink(path);
+    errno = saved;
+    return -1;
+  }
   return fd;
 }
 

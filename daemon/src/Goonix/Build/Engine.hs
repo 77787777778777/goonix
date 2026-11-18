@@ -42,7 +42,7 @@ import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import System.Exit (ExitCode (ExitSuccess, ExitFailure))
-import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
+import System.IO (Handle, hClose)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
@@ -52,9 +52,9 @@ import System.FilePath (takeDirectory)
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Types (CPid (..), Fd (..))
 import Foreign.C.String (CString, withCString)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
 import System.Environment (getEnvironment)
@@ -111,7 +111,15 @@ buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -
 buildDerivation config rootFd store settings trace mode drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
-  unless valid $ throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' is not valid"))
+  unless valid $ case config of
+    Just serverConfig | mode == Normal -> do
+      -- As in DerivationGoal::init, a missing derivation may itself be
+      -- substitutable.  Failure to find it is reported by the caller.
+      _ <- trySubstitute serverConfig rootFd store settings trace drvPath
+      pure ()
+    _ -> pure ()
+  stillValid <- isValidPath store drvPath
+  unless stillValid $ throwIO (storeError ("cannot build missing derivation `" ++ C.unpack drvPath ++ "'"))
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
   forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace Normal input
@@ -193,9 +201,9 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   work <- makeBuildDirectory store
   prepareReferenceGraphs store work drv
   env <- builderEnvironment store settings work actualDrv
-  logPath <- buildLogPath store drvPath
+  logPath <- buildLogPath settings store drvPath
   mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
-  logHandle <- openBinaryFile (C.unpack logPath) WriteMode
+  logHandle <- openLog settings logPath
   (readFd, writeFd) <- createPipe
   writeHandle <- fdToHandle writeFd
   readHandle <- fdToHandle readFd
@@ -222,7 +230,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
     waitForBuilder settings childPid wait lastOutput
   takeMVar drained
   hClose readHandle
-  hClose logHandle
+  closeLog logHandle
   case status of
     ExitSuccess -> do
       forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
@@ -241,7 +249,8 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       case registration of
         Left (exception :: SomeException) -> do
           forM_ redirected $ \path -> deleteTree path
-          buildFailed work (Just (show exception))
+          let (message, status) = registrationFailure exception
+          buildFailed work (Just (message, status))
         Right () -> pure ()
       removeBuildDirectory work
       traceSucceeded trace drvPath
@@ -249,12 +258,21 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       forM_ sandboxRoot $ \root -> do
         Files.setFileMode root 0o755
         deleteTree root
-      buildFailed work timeoutReason
+      buildFailed work ((, 101) <$> timeoutReason)
   where
+    -- Output registration can fail after a successful builder.  It is not a
+    -- timeout, and its StoreError status must survive rather than becoming
+    -- the timeout status 101 (which would also disable the failure cache).
+    registrationFailure exception =
+      case fromException exception of
+        Just (StoreError message status) -> (C.unpack message, status)
+        Nothing -> (show exception, 1)
     buildFailed work timeoutReason = do
-      let timedOut = timeoutReason /= Nothing
-          status = if timedOut then 101 else 1
-          reason = maybe "builder failed" ("failed: " ++) timeoutReason
+      let (failure, status) = case timeoutReason of
+            Just reason -> reason
+            Nothing -> ("builder failed", 1)
+          timedOut = status == 101
+          reason = "failed: " ++ failure
       traceFailed trace drvPath (if timedOut then "timeout" else "builder failed")
       when (mode == Normal && not timedOut && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
         mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
@@ -458,21 +476,59 @@ checkBuiltOutputs store drvPath replacements retain = forM_ replacements $ \(ori
           unless retain $ deleteTree temporary
           throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' may not be deterministic: output `" ++ C.unpack original ++ "' differs"))
 
-buildLogPath :: Store -> ByteString -> IO RawFilePath
-buildLogPath store drvPath = do
+buildLogPath :: Settings -> Store -> ByteString -> IO RawFilePath
+buildLogPath settings store drvPath = do
   configured <- getEnv "GUIX_LOG_DIRECTORY"
   let base = case configured of
         Just path -> path
         Nothing -> maybe "/tmp" (<> "/log/guix") (storeStateDirectory store)
       basename = B.drop (B.length (storeDirectory store) + 1) drvPath
-  pure (base <> "/drvs/" <> B.take 2 basename <> "/" <> B.drop 2 basename)
+      suffix = case setting "build-log-compression" "gzip" settings of
+        "none" -> ""
+        "bzip2" -> ".bz2"
+        _ -> ".gz"
+  pure (base <> "/drvs/" <> B.take 2 basename <> "/" <> B.drop 2 basename <> suffix)
 
-copyLog :: Int -> Bool -> Handle -> Handle -> BuildTrace -> IORef POSIXTime -> IO ()
+data LogWriter = LogWriter CInt (Ptr ())
+
+foreign import ccall unsafe "goonix_open_log"
+  c_open_log :: CString -> CInt -> IO (Ptr ())
+foreign import ccall safe "goonix_write_log"
+  c_write_log :: Ptr () -> CInt -> Ptr a -> CSize -> IO CInt
+foreign import ccall safe "goonix_close_log"
+  c_close_log :: Ptr () -> CInt -> IO CInt
+
+openLog :: Settings -> RawFilePath -> IO LogWriter
+openLog settings path = do
+  let kind = logKind settings
+  writer <- B.useAsCString path (\path' -> c_open_log path' kind)
+  if writer == nullPtr
+    then throwIO (storeError ("cannot open build log `" ++ C.unpack path ++ "'"))
+    else pure (LogWriter kind writer)
+
+logKind :: Settings -> CInt
+logKind settings = case setting "build-log-compression" "gzip" settings of
+  "none" -> 0
+  "bzip2" -> 2
+  _ -> 1
+
+writeLog :: LogWriter -> ByteString -> IO ()
+writeLog (LogWriter kind writer) bytes = do
+  result <- B.useAsCStringLen bytes $ \(pointer, length') ->
+    c_write_log writer kind (castPtr pointer) (fromIntegral length')
+  when (result < 0) (throwIO (storeError "cannot write build log"))
+
+closeLog :: LogWriter -> IO ()
+closeLog (LogWriter kind writer) = do
+  result <- c_close_log writer kind
+  when (result < 0) (throwIO (storeError "cannot close build log"))
+
+copyLog :: Int -> Bool -> Handle -> LogWriter -> BuildTrace -> IORef POSIXTime -> IO ()
 copyLog pid multiplexed input output trace lastOutput = do
   bytes <- B.hGetSome input 32768
   unless (B.null bytes) $ do
     getPOSIXTime >>= writeIORef lastOutput
-    B.hPutStr output bytes
+    writeLog output bytes
     let prefix = if multiplexed
           then "@ build-log " <> C.pack (show pid) <> " " <> C.pack (show (B.length bytes)) <> "\n"
           else B.empty
@@ -481,12 +537,18 @@ copyLog pid multiplexed input output trace lastOutput = do
 
 builderEnvironment :: Store -> Settings -> RawFilePath -> Derivation -> IO [(String, String)]
 builderEnvironment store settings work drv = do
-  inherited <- getEnvironment
-  let base = filter (\(key, _) -> key `elem` ["PATH", "HOME", "TMPDIR", "NIX_STORE", "NIX_STORE_DIR", "GUIX", "GUIX_UNINSTALLED", "GUIX_STATE_DIRECTORY", "GUIX_DATABASE_DIRECTORY", "GUIX_LOG_DIRECTORY", "GUILE_LOAD_PATH", "GUILE_LOAD_COMPILED_PATH", "GUIX_CONFIGURATION_DIRECTORY", "GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES", "GUIX_BINARY_SUBSTITUTE_URL", "XDG_CACHE_HOME"]) inherited
+  let base = [("PATH", "/path-not-set"), ("HOME", "/homeless-shelter"),
+              ("NIX_STORE", C.unpack (storeDirectory store)),
+              ("NIX_BUILD_CORES", show (settingInt "build-cores" 0 settings))]
       custom = map (\(key, value) -> (C.unpack key, C.unpack value)) (Map.toList (environment drv))
-      outputsEnv = [(C.unpack name, C.unpack (outputPath output)) | (name, output) <- Map.toList (outputs drv)]
-      buildEnv = [("NIX_STORE", C.unpack (storeDirectory store)), ("NIX_BUILD_TOP", C.unpack work), ("NIX_BUILD_CORES", show (settingInt "build-cores" 0 settings)), ("TMPDIR", C.unpack work), ("TEMP", C.unpack work), ("TMP", C.unpack work), ("TEMPDIR", C.unpack work), ("PWD", C.unpack work)]
-  pure (base ++ custom ++ outputsEnv ++ buildEnv)
+      buildEnv = [("NIX_BUILD_TOP", C.unpack work), ("TMPDIR", C.unpack work),
+                  ("TEMP", C.unpack work), ("TMP", C.unpack work),
+                  ("TEMPDIR", C.unpack work), ("PWD", C.unpack work)]
+  leaked <- if isFixedOutput drv
+    then mapM (\name -> (C.unpack name,) . maybe "" C.unpack <$> getEnv name)
+         (C.words (Map.findWithDefault "" "impureEnvVars" (environment drv)))
+    else pure []
+  pure (Map.toList (Map.fromList (base ++ custom ++ leaked ++ buildEnv)))
 
 registerBuiltOutputs :: Store -> ByteString -> Derivation -> IO ()
 registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \output -> do

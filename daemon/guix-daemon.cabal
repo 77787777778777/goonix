@@ -34,8 +34,8 @@ library
         Goonix.Store.Archive
         Goonix.Build.Engine
         Goonix.Build.Scheduler
-    c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c
-    extra-libraries: gcrypt sqlite3
+    c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c cbits/logs.c
+    extra-libraries: gcrypt sqlite3 z bz2
     build-depends:
         base >=4.20 && <5,
         bytestring >=0.12,

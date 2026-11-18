@@ -20,7 +20,8 @@ DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
   -XGHC2024 -XStrictData -package process -package directory \
   -i$(top_srcdir)/daemon/src \
   -i$(top_builddir)/daemon/src $(LIBGCRYPT_CPPFLAGS) \
-  $(LIBGCRYPT_LDFLAGS) $(LIBGCRYPT_LIBS) $(SQLITE3_CFLAGS) $(SQLITE3_LIBS)
+  $(LIBGCRYPT_LDFLAGS) $(LIBGCRYPT_LIBS) $(SQLITE3_CFLAGS) $(SQLITE3_LIBS) \
+  -lz -lbz2
 
 # All Haskell modules are prerequisites through the generated dependency file.
 -include daemon/.depends.mk
@@ -36,6 +37,7 @@ guix-daemon: daemon/src/Goonix/Config.hs daemon/.depends.mk
 	  $(top_srcdir)/daemon/cbits/sockets.c \
   $(top_srcdir)/daemon/cbits/files.c \
   $(top_srcdir)/daemon/cbits/helpers.c \
+  $(top_srcdir)/daemon/cbits/logs.c \
 	  $(top_srcdir)/daemon/app/Main.hs; mv $@.tmp $@
 
 install-exec-local: guix-daemon
