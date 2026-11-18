@@ -228,9 +228,12 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
                 expected = makePlaceholder(bytes, output.first,
                     name + (output.first == "out" ? "" : "-" + output.first));
         } else if (addressingOf(drv) == Addressing::resolved) {
-            expected = resolvedAddressedPath(output.first,
-                name + (output.first == "out" ? "" : "-" + output.first),
-                provisionalBytes);
+            expected = resolvedDerivation(drv)
+                ? resolvedAddressedPath(output.first,
+                    name + (output.first == "out" ? "" : "-" + output.first),
+                    provisionalBytes)
+                : makePlaceholder(bytes, output.first,
+                    name + (output.first == "out" ? "" : "-" + output.first));
         } else {
             /* Registration routes input-addressed derivations through the
                ordinary path check, and refuses a resolved mark without an
@@ -244,7 +247,7 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
                 "goonix: output `{0}' has incorrect path `{1}', expected `{2}'",
                 output.first, output.second.path, expected));
         Path expectedEnvironment = expected;
-        if (addressingOf(drv) == Addressing::content && !resolvedDerivation(drv))
+        if (goonixAddressed(drv) && !resolvedDerivation(drv))
             expectedEnvironment = tokenPath(output.first,
                 name + (output.first == "out" ? "" : "-" + output.first));
         auto env = drv.env.find(output.first);
@@ -601,9 +604,8 @@ static string inverseTree(const Path & path, const string & final,
     if (S_ISDIR(st.st_mode)) {
         encoding.push_back(3);
         auto entries = readDirectory(path);
-        std::sort(entries.begin(), entries.end(), [](const DirEntry & a, const DirEntry & b) {
-            return std::lexicographical_compare(a.name.begin(), a.name.end(),
-                b.name.begin(), b.name.end(), [](unsigned char x, unsigned char y) { return x < y; });
+        std::sort(entries.begin(), entries.end(), [&](const DirEntry & a, const DirEntry & b) {
+            return inverse(a.name) < inverse(b.name);
         });
         put64(encoding, entries.size());
         for (auto & entry : entries) {

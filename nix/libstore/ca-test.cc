@@ -265,8 +265,36 @@ static void checkTreeVectors()
         "content path vector");
 }
 
+static void checkStagedToken(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "ca-relocation");
+    Path staged = settings.nixStore + "/.goonix-tmp-test";
+    createDirs(staged);
+    writeFile(staged + "/reference", token);
+    createSymlink(baseNameOf(token), staged + "/link");
+    createDirs(staged + "/" + baseNameOf(token));
+    writeFile(staged + "/executable", "#!/bin/sh\n");
+    chmod((staged + "/executable").c_str(), 0555);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, token, "out", "ca-relocation",
+        PathSet{token}, references, narHash, narSize, {}, staged);
+    check(readFile(final + "/reference") == final,
+        "staged physical path retains the logical self token");
+    check(readLink(final + "/link") == baseNameOf(final),
+        "staged symlink is rewritten against the logical token");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--staged") {
+        checkStagedToken(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 2 && string(argv[1]) == "--tree-vectors") {
         settings.nixStore = "/gnu/store";
         checkTreeVectors();
