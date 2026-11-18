@@ -16,7 +16,10 @@
 #include <poll.h>
 
 using namespace nix;
-namespace nix { void checkRewriteForTest(const Path & path, const string & from, const string & to); }
+namespace nix {
+void checkRewriteForTest(const Path & path, const string & from, const string & to);
+void checkDeepArchiveForTest(const Path & path, const string & token, const string & format);
+}
 
 static unsigned failures = 0;
 
@@ -724,6 +727,57 @@ static void checkInverseFragmentBoundary(const Path & root)
         "inverse fragment split across a read boundary is refused");
 }
 
+static void checkDeepCompressedSelfToken(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    chmod(settings.nixStore.c_str(), 0755);
+    Path directory = tokenPath("out", "deep-scan");
+    createDirs(directory);
+    string token = baseNameOf(directory).substr(0, 32);
+    Path archive = root + "/member.gz";
+    writeFile(archive, readFile("tests/fixtures/ca-self-token.gz"));
+    writeFile(directory + "/member.gz", readFile(archive));
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    settings.set("goonix-deep-scan", "false");
+    Path final = finaliseContentOutput(store, directory, "out", "deep-scan",
+        PathSet{directory}, references, narHash, narSize);
+    check(!final.empty() && pathExists(final), "ordinary finalisation accepts a compressed self token");
+    deletePath(final);
+
+    directory = tokenPath("out", "deep-scan");
+    createDirs(directory);
+    writeFile(directory + "/member.gz", readFile(archive));
+    references.clear();
+    settings.set("goonix-deep-scan", "true");
+    bool rejected = false;
+    try {
+        finaliseContentOutput(store, directory, "out", "deep-scan",
+            PathSet{directory}, references, narHash, narSize);
+    } catch (const Error & error) {
+        string message = error.what();
+        rejected = message.find("member.gz") != string::npos &&
+            message.find("byte 7") != string::npos;
+    }
+    check(rejected, "deep scan rejects compressed token with member offset");
+
+    for (auto format : {"xz", "bzip2", "zip"}) {
+        Path input = string("tests/fixtures/ca-self-token.") +
+            (string(format) == "bzip2" ? "bz2" : format);
+        bool refused = false;
+        try { checkDeepArchiveForTest(input, token, format); }
+        catch (const Error & error) {
+            string message = error.what();
+            refused = message.find("decompressed") != string::npos &&
+                message.find("byte 7") != string::npos;
+        }
+        check(refused, string("deep scan rejects ") + format + " token at decoded offset");
+    }
+}
+
 int main(int argc, char ** argv)
 {
     if (argc == 3 && string(argv[1]) == "--opaque-utf") {
@@ -736,6 +790,10 @@ int main(int argc, char ** argv)
     }
     if (argc == 3 && string(argv[1]) == "--fragment-boundary") {
         checkOpaqueFragmentBoundary(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--deep-scan") {
+        checkDeepCompressedSelfToken(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--sibling-order") {

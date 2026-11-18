@@ -87,6 +87,7 @@ libstore_headers =				\
 
 libstore_a_CPPFLAGS =				\
   $(libutil_a_CPPFLAGS)				\
+  $(LIBARCHIVE_CFLAGS)				\
   -I$(top_srcdir)/%D%/libstore			\
   -I$(top_builddir)/%D%/libstore		\
   -DNIX_STORE_DIR=\"$(storedir)\"		\
@@ -103,8 +104,8 @@ bin_PROGRAMS = guix-daemon
 noinst_PROGRAMS = nix/ca-test nix/records-test
 
 nix_ca_test_SOURCES = %D%/libstore/ca-test.cc
-nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
-nix_ca_test_LDADD = libstore.a libutil.a -lz $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
+nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS) $(LIBARCHIVE_CFLAGS)
+nix_ca_test_LDADD = libstore.a libutil.a -lz $(LIBARCHIVE_LIBS) $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
 nix_records_test_SOURCES = %D%/libstore/records-test.cc
 nix_records_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
 nix_records_test_LDADD = $(nix_ca_test_LDADD)
@@ -126,7 +127,7 @@ guix_daemon_LDFLAGS = 				\
   $(LIBGCRYPT_LDFLAGS)
 
 guix_daemon_LDADD =				\
-  libstore.a libutil.a -lz		\
+  libstore.a libutil.a -lz $(LIBARCHIVE_LIBS)	\
   $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
 
 guix_daemon_headers =				\

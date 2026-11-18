@@ -116,8 +116,15 @@ final store hash (same length), rename entries depth-first, rename the
 root, then map the final hash back to its token in memory and recompute the
 tree hash.  Any mismatch, split-token fragment of at least eight characters
 outside a whole occurrence, UTF-16/UTF-32 token, or reserved placeholder is
-an output rejection naming the file and byte offset.  Deep compressed
-scanning is a tool/farm operation, not a default daemon operation.
+an output rejection naming the file and byte offset.  Ordinary finalisation
+permits a self token hidden in a gzip member.  The client can request the
+CA-1 policy with `set-build-options` keyword `deep-scan?`; it sends the
+per-connection `goonix-deep-scan` setting.  The daemon then streams each
+regular file's gzip, xz, bzip2 or ZIP member, retaining overlap across
+decoded chunks, and rejects the output's 32-character self token with its
+decompressed byte offset.
+It refuses a member expanding beyond 256 MiB.  Deep scanning is opt-in;
+there is no daemon-wide command-line switch.
 Existing store items are never overwritten; a valid existing item must
 round-trip to the same hash.
 

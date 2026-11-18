@@ -81,6 +81,8 @@
                  (object->string bytes) ")) #:binary #t)"))
 
 (define (read-all file) (call-with-input-file file get-string-all))
+(define (read-binary file)
+  (call-with-input-file file get-bytevector-all #:binary #t))
 (define (realised drv) (realised-output-path store drv "out"))
 
 (define (fresh-name prefix)
@@ -314,6 +316,36 @@
          (string=? out (realised drv))
          (valid-path? store out)
          (verify-store store #:check-contents? #t #:repair? #f))))
+
+(test-group "CA-1: compressed self tokens and the deep-scan setting"
+  (for-each
+   (lambda (format)
+     (let* ((bytes (read-binary (string-append "tests/fixtures/ca-self-token." format)))
+            (name (fresh-name (string-append "ca-deep-" format))))
+       (test-assert (string-append "ordinary finalisation accepts " format " self token")
+         (let ((drv (shell-drv name (write-output-bytes bytes))))
+           (build-derivations store (list drv))
+           (valid-path? store (realised drv))))
+       (test-equal (string-append "deep scan rejects " format " token at decoded offset")
+         "unresolved goonix self token in decompressed"
+         (let* ((drv (shell-drv (fresh-name (string-append "ca-deep-reject-" format))
+                                (write-output-bytes bytes)))
+                (connection (open-connection-for-tests)))
+           (dynamic-wind
+             (lambda () #t)
+             (lambda ()
+               (let ((log (open-output-string)))
+                 (set-build-options connection #:deep-scan? #t)
+                 (guard (condition ((store-protocol-error? condition)
+                                    (let ((text (get-output-string log)))
+                                      (and (string-contains text "unresolved goonix self token in decompressed")
+                                           (string-contains text "byte 7")
+                                           "unresolved goonix self token in decompressed"))))
+                   (parameterize ((current-build-output-port log))
+                     (build-derivations connection (list drv)))
+                   #f)))
+             (lambda () (close-connection connection)))))))
+   '("gz" "xz" "bz2" "zip")))
 
 (test-group "opaque self-reference encodings are refused"
   (let ((token (self-token "out")))

@@ -763,6 +763,7 @@ definitions."
 
                             build-cores
                             (use-substitutes? #t)
+                            (deep-scan? #f)
 
                             ;; Client-provided substitute URLs.  If it is #f,
                             ;; the daemon's settings are used.  Otherwise, it
@@ -794,7 +795,8 @@ definitions."
                #:print-build-trace print-build-trace
                #:use-substitutes? use-substitutes?
                #:settings
-               `( ;; This option is honored by 'guix substitute' et al.
+               `(("goonix-deep-scan" . ,(if deep-scan? "true" "false"))
+                 ;; This option is honored by 'guix substitute' et al.
                  ,@(if print-build-trace
                        `(("print-extended-build-trace"
                           . ,(if print-extended-build-trace? "1" "0")))

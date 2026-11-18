@@ -54,7 +54,11 @@ EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
   build-aux/goonix-upstream-base		\
   tests/ca-vectors.json				\
-  tests/fixtures/flake-shells.scm
+  tests/fixtures/flake-shells.scm			\
+  tests/fixtures/ca-self-token.gz			\
+  tests/fixtures/ca-self-token.xz			\
+  tests/fixtures/ca-self-token.bz2			\
+  tests/fixtures/ca-self-token.zip
 
 if CAN_RUN_TESTS
 if BUILD_DAEMON
@@ -71,6 +75,7 @@ goonix_ca_store_checks =			\
   final-root					\
   siblings					\
   existing-item					\
+  deep-scan					\
   streaming					\
   symlink-modes					\
   path-validation
