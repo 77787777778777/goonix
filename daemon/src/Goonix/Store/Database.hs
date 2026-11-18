@@ -9,8 +9,13 @@ module Goonix.Store.Database
   , Statement
   , Value (..)
   , openReadOnly
+  , openReadWrite
+  , initializeSchema
   , closeDatabase
   , withReadOnly
+  , withReadWrite
+  , execute
+  , withTransaction
   , prepare
   , closeStatement
   , withStatement
@@ -21,11 +26,13 @@ module Goonix.Store.Database
   , databaseError
   ) where
 
-import Control.Exception (bracket, bracketOnError, throwIO)
+import Control.Exception (bracket, bracketOnError, onException, throwIO)
+import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.Int (Int64)
 import Data.Word (Word64)
+import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C.String (CString, peekCString, withCString)
 import Foreign.C.Types (CInt (..), CLLong (..), CUChar (..))
 import Foreign.Marshal.Alloc (free, mallocBytes)
@@ -72,15 +79,48 @@ foreign import ccall unsafe "sqlite3_column_bytes"
   c_column_bytes :: Ptr () -> CInt -> IO CInt
 foreign import ccall unsafe "sqlite3_busy_timeout"
   c_busy_timeout :: Ptr () -> CInt -> IO CInt
+foreign import ccall unsafe "sqlite3_complete"
+  c_complete :: CString -> IO CInt
 
 -- SQLITE_TRANSIENT makes SQLite copy bound byte strings before this returns.
 transient :: FunPtr (Ptr () -> IO ())
 transient = castPtrToFunPtr (intPtrToPtr (-1))
 
 openReadOnly :: FilePath -> IO Database
-openReadOnly path = do
+openReadOnly = openDatabase 0x1
+
+initializeSchema :: Database -> FilePath -> IO ()
+initializeSchema db schemaPath = do
+  rows <- queryValues db "select name from sqlite_master where type='table' and name='ValidPaths';" []
+  when (null rows) $ do
+    sql <- B.readFile schemaPath
+    let statements = completeStatements sql
+    mapM_ (\statement -> unless (B.null (B.dropWhile (<= 32) statement)) (execute db statement [])) statements
+
+completeStatements :: ByteString -> [ByteString]
+completeStatements input = go input B.empty []
+  where
+    go rest current acc
+      | B.null rest = reverse (if B.null current then acc else current:acc)
+      | otherwise =
+          let (line, remainder) = B.break (== 59) rest
+              current' = current <> line
+          in if B.null remainder
+               then reverse (current':acc)
+               else do
+                 let candidate = current' <> ";"
+                 if completeSql candidate
+                   then go (B.drop 1 remainder) B.empty (candidate:acc)
+                   else go (B.drop 1 remainder) candidate acc
+    completeSql bytes = unsafePerformIO (B.useAsCString bytes c_complete) /= 0
+
+openReadWrite :: FilePath -> IO Database
+openReadWrite = openDatabase 0x6
+
+openDatabase :: CInt -> FilePath -> IO Database
+openDatabase flags path = do
   database <- mallocBytes 8
-  result <- withCString path $ \name -> c_open name database 0x1 nullPtr
+  result <- withCString path $ \name -> c_open name database flags nullPtr
   handle <- peek database
   free database
   if result /= 0 || handle == nullPtr
@@ -99,6 +139,20 @@ closeDatabase (Database handle) = do
 
 withReadOnly :: FilePath -> (Database -> IO a) -> IO a
 withReadOnly path = bracket (openReadOnly path) closeDatabase
+
+withReadWrite :: FilePath -> (Database -> IO a) -> IO a
+withReadWrite path = bracket (openReadWrite path) closeDatabase
+
+execute :: Database -> ByteString -> [Value] -> IO ()
+execute database sql values = withStatement database sql $ \statement -> do
+  _ <- query database statement values
+  pure ()
+
+withTransaction :: Database -> IO a -> IO a
+withTransaction database action = do
+  execute database "begin;" []
+  (action >>= \result -> execute database "commit;" [] >> pure result)
+    `onException` execute database "rollback;" []
 
 prepare :: Database -> ByteString -> IO Statement
 prepare database@(Database handle) sql =

@@ -34,6 +34,8 @@ guix-daemon: daemon/src/Goonix/Config.hs daemon/.depends.mk
 	$(AM_V_GEN)$(GHC) --make $(DAEMON_GHC_FLAGS) \
 	  -outputdir daemon/ghc-build -o $@.tmp \
 	  $(top_srcdir)/daemon/cbits/sockets.c \
+  $(top_srcdir)/daemon/cbits/files.c \
+  $(top_srcdir)/daemon/cbits/helpers.c \
 	  $(top_srcdir)/daemon/app/Main.hs; mv $@.tmp $@
 
 install-exec-local: guix-daemon
@@ -66,7 +68,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Database.hs daemon/src/Goonix/Store/ReadOnly.hs \
   daemon/src/Goonix/Store/Settings.hs daemon/src/Goonix/Store/Server.hs \
   daemon/src/Goonix/Store/Config.hs daemon/src/Goonix/Store/Socket.hs \
-  daemon/src/Goonix/Store/Substitute.hs daemon/cbits/sockets.c \
+  daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Scheduler.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/proxy/Main.hs \
@@ -74,6 +76,11 @@ EXTRA_DIST += \
   daemon/test/wire-proxy/inventory.scm daemon/test/check-build-flags.scm \
   daemon/test/formats/Main.hs daemon/test/properties/Main.hs \
   daemon/test/readonly/RawClient.hs daemon/test/readonly/Activate.hs \
+  daemon/test/differential/prepare-write-fixture.sh \
+  daemon/test/differential/write.sh \
+  daemon/test/differential/write-probe.scm \
+  daemon/test/differential/archive-probe.scm \
+  daemon/test/differential/build.sh \
   daemon/test/differential/prepare-readonly-fixture.sh \
   daemon/test/differential/read-only.sh daemon/test/differential/transports.sh \
   daemon/test/differential/guix-readonly.sh \

@@ -36,11 +36,13 @@ import qualified Data.ByteString.Char8 as C
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.List (sort)
+import System.FilePath (takeDirectory)
 import System.IO.Error (catchIOError)
 import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import Data.Word (Word32, Word64)
+import Goonix.Store.Files (mkdirParents)
 import Goonix.Store.Base32 (decodeBase16)
 import Goonix.Store.Database
 import Goonix.Store.Hash
@@ -83,17 +85,20 @@ assertStorePath :: Store -> ByteString -> IO ByteString
 assertStorePath store path = either (throwIO . storeError) pure (storePath store path)
 
 openStore :: ByteString -> FilePath -> IO Store
-openStore directory databasePath = bracketOnError (openReadOnly databasePath) closeDatabase $ \db -> do
-  let prepare' = prepare db
-  Store directory databasePath Nothing db
-    <$> prepare' "select id, hash, registrationTime, deriver, narSize from ValidPaths where path = ?;"
-    <*> prepare' "select path from ValidPaths"
-    <*> prepare' "select path from Refs join ValidPaths on reference = id where referrer = ?;"
-    <*> prepare' "select path from Refs join ValidPaths on referrer = id where reference = (select id from ValidPaths where path = ?);"
-    <*> prepare' "select v.path from DerivationOutputs d join ValidPaths v on d.drv = v.id where d.path = ?;"
-    <*> prepare' "select id, path from DerivationOutputs where drv = ?;"
-    <*> prepare' "select path from ValidPaths where path >= ? limit 1;"
-    <*> prepare' "select path from FailedPaths;"
+openStore directory databasePath = do
+  mkdirParents (C.pack (takeDirectory databasePath))
+  bracketOnError (openReadWrite databasePath) closeDatabase $ \db -> do
+    initializeSchema db "guix/store/schema.sql"
+    let prepare' = prepare db
+    Store directory databasePath Nothing db
+      <$> prepare' "select id, hash, registrationTime, deriver, narSize from ValidPaths where path = ?;"
+      <*> prepare' "select path from ValidPaths"
+      <*> prepare' "select path from Refs join ValidPaths on reference = id where referrer = ?;"
+      <*> prepare' "select path from Refs join ValidPaths on referrer = id where reference = (select id from ValidPaths where path = ?);"
+      <*> prepare' "select v.path from DerivationOutputs d join ValidPaths v on d.drv = v.id where d.path = ?;"
+      <*> prepare' "select id, path from DerivationOutputs where drv = ?;"
+      <*> prepare' "select path from ValidPaths where path >= ? limit 1;"
+      <*> prepare' "select path from FailedPaths;"
 
 closeStore :: Store -> IO ()
 closeStore store = do

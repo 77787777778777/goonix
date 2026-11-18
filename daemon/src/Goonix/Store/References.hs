@@ -45,13 +45,19 @@ scanChunks chunks table (initialTail, initialFound) =
       in (carry', found')
 
 candidateTable :: [RawFilePath] -> Map.Map ByteString [RawFilePath]
-candidateTable = Map.fromListWith (++) . map (\path -> (referenceHash path, [path]))
+candidateTable = Map.fromListWith (++) . concatMap candidate
+  where
+    candidate path = case referenceHash path of
+      "" -> []
+      hash -> [(hash, [path])]
 
 referenceHash :: RawFilePath -> ByteString
 referenceHash path =
   let name = snd (C.breakEnd (== '/') path)
       hash = B.takeWhile (/= 45) name
-  in if B.length hash /= 32 then error ("bad reference: " ++ C.unpack path) else hash
+  in if B.length hash /= 32 || not (B.all (`B.elem` base32Alphabet) hash)
+    then B.empty
+    else hash
 
 search :: ByteString -> Map.Map ByteString [RawFilePath] -> Set.Set RawFilePath -> Set.Set RawFilePath
 search bytes table initial = go 0 initial
