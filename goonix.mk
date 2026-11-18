@@ -21,6 +21,7 @@ MODULES +=					\
 SCM_TESTS +=					\
   tests/ca.scm					\
   tests/ca-build.scm				\
+  tests/ca-existing-item.scm			\
   tests/ca-rewrite.scm				\
   tests/ca-sharing.scm				\
   tests/flakes.scm				\
