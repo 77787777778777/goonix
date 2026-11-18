@@ -4,8 +4,10 @@
              (guix ca)
              (gnu packages bootstrap)
              (guix derivations)
+             (srfi srfi-1)
              (srfi srfi-34)
              (srfi srfi-64)
+             (ice-9 threads)
              (ice-9 textual-ports))
 
 (test-begin "ca-existing-item")
@@ -82,6 +84,35 @@
              (begin (build-fails? drv) #t)
              (intact? item)))
       (lambda () (set-build-options store #:rounds 1)))))
+
+(test-assert "verify-store preserves items registered by another connection"
+  (let* ((done? #f)
+         (verify-connection (open-connection-for-tests))
+         (verifier
+          (call-with-new-thread
+           (lambda ()
+             (let loop ((rounds 0))
+               (if done?
+                   rounds
+                   (begin
+                     (verify-store verify-connection)
+                     (loop (+ rounds 1))))))))
+         (tag (number->string (random 1000000000
+                                    (random-state-from-platform)))))
+    (sleep 1)
+    (let ((paths
+           (map (lambda (index)
+                  (add-text-to-store
+                   store
+                   (string-append "verify-race-" tag "-"
+                                  (number->string index))
+                   (string-append tag " " (number->string index))))
+                (iota 3000))))
+      (set! done? #t)
+      (let ((rounds (join-thread verifier)))
+        (close-connection verify-connection)
+        (and (positive? rounds)
+             (every (lambda (path) (valid-path? store path)) paths))))))
 
 (close-connection store)
 (test-end)

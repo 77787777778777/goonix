@@ -18,7 +18,7 @@ nix/libstore/build.cc 198 6
 nix/libstore/derivations.cc 14 3
 nix/libstore/derivations.hh 1 0
 nix/libstore/gc.cc 21 0
-nix/libstore/local-store.cc 281 3
+nix/libstore/local-store.cc 284 4
 nix/libstore/local-store.hh 43 0
 nix/libstore/store-api.cc 14 0
 nix/libstore/store-api.hh 5 0

@@ -1843,7 +1843,9 @@ void LocalStore::verifyPath(const Path & path, const PathSet & store,
         return;
     }
 
-    if (store.find(baseNameOf(path)) == store.end()) {
+    // goonix: STORE was listed before the valid paths were read, so an item
+    // registered in between is valid and absent from it; ask the file system.
+    if (store.find(baseNameOf(path)) == store.end() && !pathExists(path)) {
         /* Check any referrers first.  If we can invalidate them
            first, then we can invalidate this path as well. */
         bool canInvalidate = true;
