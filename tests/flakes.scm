@@ -445,6 +445,6 @@
               (equal? (invoke-git dependency "rev-parse" "HEAD")
                       (locked-input-commit input))
               (equal? (flake-lock->sexp lock-data)
-                      (flake-lock->sexp isolated)))))))))
+                      (flake-lock->sexp isolated))))))))
 
 (test-end)
