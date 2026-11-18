@@ -357,6 +357,9 @@ for the corresponding packages."
   (define system
     (assoc-ref opts 'system))
 
+  ;; goonix: a flake shell resolved by 'guix shell' carries its own manifest.
+  (define flake-shell-manifest (assoc-ref opts 'flake-shell-manifest))
+
   (define (manifest-entry=? e1 e2)
     (and (eq? (manifest-entry-item e1) (manifest-entry-item e2))
          (string=? (manifest-entry-output e1)
@@ -397,7 +400,12 @@ for the corresponding packages."
 
   (manifest
    (delete-duplicates
-    (append-map (match-lambda
+    (append
+     ;; goonix: entries of a resolved flake shell come first.
+     (if flake-shell-manifest
+         (manifest-entries flake-shell-manifest)
+         '())
+     (append-map (match-lambda
                   (('package 'ad-hoc-package (? string? spec))
                    (if (flake-reference? spec)
                        (list (flake-entry spec))
@@ -445,7 +453,7 @@ could not add current Guix to the profile~%"))
                                      (search-paths
                                       (package-native-search-paths guix))))))))
                   (_ '()))
-                opts)
+                opts))
     manifest-entry=?)))
 
 (define (manifest->derivation manifest system bootstrap?)
@@ -1237,7 +1245,10 @@ command-line option processing with 'parse-command-line'."
                            (list %default-shell))))
          (mappings   (pick-all opts 'file-system-mapping))
          (white-list (pick-all opts 'inherit-regexp))
-         (environment-variables  (pick-all opts 'environment-variables)))
+         (environment-variables
+          ;; goonix: a resolved flake shell contributes its declared variables.
+          (append (or (assoc-ref opts 'flake-shell-environment) '())
+                  (pick-all opts 'environment-variables))))
 
     (define store-needed?
       ;; Whether connecting to the daemon is needed.

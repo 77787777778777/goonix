@@ -105,6 +105,7 @@ MODULES =					\
   guix/flakes/evaluator.scm		\
   guix/flakes/support.scm			\
   guix/scripts/flake.scm			\
+  guix/scripts/run.scm			\
   guix/combinators.scm				\
   guix/memoization.scm				\
   guix/utils.scm				\
@@ -554,6 +555,7 @@ SCM_TESTS =					\
   tests/ca-sharing.scm				\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
+  tests/flake-actions.scm			\
   tests/pure-eval.scm				\
   tests/accounts.scm				\
   tests/base16.scm				\

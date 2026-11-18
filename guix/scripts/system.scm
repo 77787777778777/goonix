@@ -92,6 +92,11 @@
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
   #:autoload   (guix pure-eval) (load-file-purely) ;goonix: contained files
+  #:autoload   (guix scripts flake) (flake-reference? ;goonix: flake refs
+                                     parse-flake-reference
+                                     flake-output-derivation
+                                     flake-acting-output
+                                     flake-checked-output)
   #:export (guix-system
             read-operating-system
 
@@ -1328,6 +1333,20 @@ resulting from command-line parsing."
                             (G_ "both file and expression cannot be specified~%")))
                           (expr
                            (read/eval expr))
+                          ;; goonix: a flake reference resolves to a systems
+                          ;; (or images) output.  Host-changing actions gate
+                          ;; the acting object against the pure derivation.
+                          ((and file (flake-reference? file))
+                           (let* ((ref (parse-flake-reference file))
+                                  (directory (car ref))
+                                  (name (or (cdr ref) 'default))
+                                  (kind (if (eq? action 'image) 'images 'systems)))
+                             (with-store store
+                               (if (memq action '(reconfigure init))
+                                   (flake-checked-output store directory kind
+                                                         name opts)
+                                   (flake-acting-output store directory kind
+                                                        name opts)))))
                           (file
                            (load* file %user-modules
                                   #:on-error (assoc-ref opts 'on-error)))

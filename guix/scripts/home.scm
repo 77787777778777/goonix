@@ -71,6 +71,10 @@
                                       shepherd-service-node-type)
   #:autoload   (guix scripts home edit) (guix-home-edit)
   #:autoload   (guix scripts home import) (import-manifest)
+  #:autoload   (guix scripts flake) (flake-reference? ;goonix: flake refs
+                                     parse-flake-reference
+                                     flake-acting-output
+                                     flake-checked-output)
   #:use-module ((guix status) #:select (with-status-verbosity))
   #:use-module ((guix build utils) #:select (mkdir-p switch-symlinks))
   #:use-module (guix gexp)
@@ -541,6 +545,17 @@ resulting from command-line parsing."
                (G_ "both file and expression cannot be specified~%")))
              (expr
               (read/eval expr))
+             ;; goonix: a flake reference resolves to a homes output.
+             ;; Host-changing reconfigure gates the acting object against
+             ;; the pure derivation.
+             ((and file (flake-reference? file))
+              (let* ((ref (parse-flake-reference file))
+                     (directory (car ref))
+                     (name (or (cdr ref) 'default)))
+                (with-store store
+                  (if (eq? action 'reconfigure)
+                      (flake-checked-output store directory 'homes name opts)
+                      (flake-acting-output store directory 'homes name opts)))))
              (file
               (load* file %user-modules
                      #:on-error (assoc-ref opts 'on-error)))

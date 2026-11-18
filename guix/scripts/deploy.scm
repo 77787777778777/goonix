@@ -32,9 +32,16 @@
   #:use-module (guix discovery)
   #:use-module (guix scripts)
   #:use-module (guix scripts build)
+  #:autoload   (guix scripts flake) (flake-reference? ;goonix: flake refs
+                                     parse-flake-reference
+                                     flake-output-derivation
+                                     flake-acting-output
+                                     lower-flake-object)
   #:use-module (guix store)
+  #:use-module (guix derivations)
   #:use-module (guix gexp)
   #:use-module (guix ui)
+  #:use-module ((guix utils) #:select (%current-system))
   #:use-module ((guix status) #:select (with-status-verbosity))
   #:use-module (guix diagnostics)
   #:use-module (guix i18n)
@@ -123,6 +130,39 @@ Perform the deployment specified by FILE.\n"))
          (modules (append '((gnu) (gnu machine))
                           environment-modules)))
     (load* file modules)))
+
+;; goonix: resolve a flake reference to a 'machines' output and gate each
+;; machine's operating system against a purely evaluated 'systems' output of
+;; the same name.  The confined evaluator cannot lower a <machine> record, so
+;; the pure side is the machine's OS exposed as a systems output.
+(define (flake-machines store file opts)
+  "Return the list of machines declared by the flake reference FILE, refusing
+any machine whose acting operating-system derivation differs from the pure
+derivation of the corresponding systems output."
+  (let* ((ref (parse-flake-reference file))
+         (directory (car ref))
+         (name (or (cdr ref) 'default))
+         (system (or (assoc-ref opts 'system) (%current-system)))
+         (target (assoc-ref opts 'target))
+         (value (flake-acting-output store directory 'machines name opts))
+         (machines (if (list? value) value (list value))))
+    (for-each
+     (lambda (machine)
+       (unless (machine? machine)
+         (leave (G_ "flake output '~a' is not a machine~%") name))
+       (let* ((os ((@@ (gnu machine) %machine-operating-system) machine))
+              (pure (flake-output-derivation store directory 'systems name opts))
+              (acting (lower-flake-object store os (symbol->string name)
+                                          system target)))
+         (unless (string=? (derivation-file-name pure)
+                           (derivation-file-name acting))
+           (leave (G_ "machine '~a' is impure: the acting derivation ~a \
+differs from the pure derivation ~a; refusing to deploy~%")
+                  (machine-display-name machine)
+                  (derivation-file-name acting)
+                  (derivation-file-name pure)))))
+     machines)
+    machines))
 
 (define* (show-what-to-deploy machines #:key (dry-run? #f) (roll-back? #f))
   "Show the list of machines in MACHINES to deploy or roll back."
@@ -302,7 +342,10 @@ otherwise."
                                      #:argument-handler handle-argument))
            (file (assq-ref opts 'file))
            (expression (assoc-ref opts 'expression))
-           (machines (or (and file (load-source-file file))
+           ;; goonix: a flake reference is resolved to machines inside the
+           ;; store context below (it needs a daemon connection).
+           (flake-file (and file (flake-reference? file) file))
+           (machines (or (and file (not flake-file) (load-source-file file))
                          (and expression (read/eval expression))))
            (dry-run? (assoc-ref opts 'dry-run?))
            (roll-back? (assq-ref opts 'roll-back?))
@@ -320,6 +363,11 @@ otherwise."
       (with-status-verbosity (assoc-ref opts 'verbosity)
         (with-store store
           (set-build-options-from-command-line store opts)
+          ;; goonix: resolve a flake reference to gated machines now that a
+          ;; store connection is available.
+          (let ((machines (if flake-file
+                              (flake-machines store flake-file opts)
+                              machines)))
           (with-build-handler (build-notifier #:use-substitutes?
                                               (assoc-ref opts 'substitutes?)
                                               #:verbosity
@@ -349,4 +397,4 @@ otherwise."
                                                       roll-back-machine*
                                                       deploy-machine*)
                                                   store <>)
-                                             machines)))))))))))
+                                             machines))))))))))))
