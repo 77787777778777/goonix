@@ -279,7 +279,8 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
                 "goonix: output `{0}' has incorrect path `{1}', expected `{2}'",
                 output.first, output.second.path, expected));
         Path expectedEnvironment = expected;
-        if (goonixAddressed(drv) && !resolvedDerivation(drv))
+        if (goonixAddressed(drv) && !resolvedDerivation(drv) &&
+            output.second.hash.empty())
             expectedEnvironment = tokenPath(output.first,
                 name + (output.first == "out" ? "" : "-" + output.first));
         auto env = drv.env.find(output.first);
@@ -677,7 +678,6 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     for (auto & sibling : finalOutputs)
         referencePaths.insert(sibling.second);
     checkReservedTree(physical, 0, baseNameOf(token));
-    /* goonix: sibling tokens have the same fixed width as final hashes. */
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
             rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),
@@ -688,6 +688,10 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     PathSet namingReferences = initialReferences;
     namingReferences.erase(token);
     Path final = contentAddressedPath(output, name, built, namingReferences);
+    /* Root before any existence check or scan.  A collector holding the
+       temporary-roots lock must finish before we reuse or publish this path. */
+    store.addTempRoot(final);
+    referencePaths.insert(final);
     string oldHash = baseNameOf(token).substr(0, 32);
     string newHash = baseNameOf(final).substr(0, 32);
 

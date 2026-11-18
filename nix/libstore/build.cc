@@ -979,6 +979,10 @@ void DerivationGoal::haveDerivation()
             if (addressingOf(drv) == Addressing::content &&
                 (buildMode != bmNormal || !allRealised))
                 for (auto & output : drv.outputs) {
+                    /* A fixed output keeps its declared final path.  It is
+                       checked by the ordinary fixed-output machinery, not
+                       built as a tree-addressed self token. */
+                    if (!output.second.hash.empty()) continue;
                     output.second.path = tokenPath(output.first,
                         storePathToName(originalDrv.outputs.at(output.first).path));
                     drv.env[output.first] = output.second.path;
@@ -1331,6 +1335,30 @@ void DerivationGoal::tryToBuild()
        omitted, but that would be less efficient.)  Note that since we
        now hold the locks on the output paths, no other process can
        build this derivation, so no further checks are necessary. */
+    /* A token path is never valid.  Once its output lock is held, consult
+       the resolved derivation's facts again: another goal may have built
+       and chosen this result while this goal was waiting. */
+    if (buildMode == bmNormal && resolvedDerivation(drv) &&
+        addressingOf(drv) != Addressing::input) {
+        auto & local = dynamic_cast<LocalStore &>(worker.store);
+        const string resolvedHash = printHash(hashString(htSHA256,
+            unparseDerivation(drv)));
+        bool allRealised = true;
+        for (auto & output : drv.outputs) {
+            Path selected = local.selectGoonixOutput(originalDrvPath,
+                output.first, resolvedHash, "", false);
+            if (selected.empty())
+                allRealised = false;
+            else
+                worker.store.addTempRoot(selected);
+        }
+        if (allRealised) {
+            outputLocks.setDeletion(true);
+            outputLocks.unlock();
+            done(BuildResult::AlreadyValid);
+            return;
+        }
+    }
     validPaths = checkPathValidity(true, buildMode == bmRepair);
     if (buildMode != bmCheck && validPaths.size() == drv.outputs.size()) {
         debug(std::format("skipping build of derivation `{}', someone beat us to it", drvPath));
@@ -3275,6 +3303,58 @@ PathSet parseReferenceSpecifiers(const Derivation & drv, string attr)
 }
 
 
+/* goonix: enforce the upstream reference policy on a final content tree.
+   Output names in the policy refer to token paths in DRV; compare them with
+   the final paths chosen during finalisation, not with those tokens. */
+static void checkGoonixReferences(StoreAPI & store, const Derivation & drv,
+    const Path & path, const Path & token,
+    const std::map<Path, Path> & finalOutputs, const PathSet & references)
+{
+    auto checkRefs = [&](const string & attrName, bool allowed, bool recursive) {
+        if (drv.env.find(attrName) == drv.env.end()) return;
+        PathSet spec;
+        for (auto & item : tokenizeString<Paths>(get(drv.env, attrName))) {
+            if (isStorePath(item))
+                spec.insert(item);
+            else {
+                auto output = drv.outputs.find(item);
+                if (output == drv.outputs.end())
+                    throw BuildError(std::format(
+                        "derivation contains an invalid reference specifier `{}'", item));
+                if (output->second.path == token)
+                    spec.insert(path);
+                else {
+                    auto final = finalOutputs.find(output->second.path);
+                    spec.insert(final == finalOutputs.end()
+                        ? output->second.path : final->second);
+                }
+            }
+        }
+        PathSet used;
+        if (recursive) {
+            for (auto & reference : references)
+                if (path != reference && token != reference)
+                    computeFSClosure(store, reference, used);
+        } else used = references;
+        for (auto & reference : used) {
+            if (allowed) {
+                if (!spec.count(reference))
+                    throw BuildError(std::format(
+                        "output (`{}') is not allowed to refer to path `{}'",
+                        path, reference));
+            } else if (spec.count(reference))
+                throw BuildError(std::format(
+                    "output (`{}') is not allowed to refer to path `{}'",
+                    path, reference));
+        }
+    };
+    checkRefs("allowedReferences", true, false);
+    checkRefs("allowedRequisites", true, true);
+    checkRefs("disallowedReferences", false, false);
+    checkRefs("disallowedRequisites", false, true);
+}
+
+
 void DerivationGoal::registerOutputs()
 {
     /* When using a build hook, the build hook can register the output
@@ -3296,6 +3376,16 @@ void DerivationGoal::registerOutputs()
 
     Path checkSuffix = "-check";
 
+    // goonix: a fixed output has a path already checked by the ordinary
+    // fixed-output machinery.  A mixed token/fixed output set has no safe
+    // single finalisation model and is rejected instead of skipping hashes.
+    if (addressingOf(drv) == Addressing::content)
+        for (auto & output : drv.outputs)
+            if (!output.second.hash.empty() &&
+                (drv.outputs.size() != 1 || output.first != "out"))
+                throw BuildError(
+                    "a content-addressed derivation with a fixed output must have only `out'");
+
     // goonix: sibling tokens become their final output paths before naming.
     std::map<Path, Path> goonixFinalOutputs;
     std::vector<std::pair<string, Path>> goonixFacts;
@@ -3307,6 +3397,17 @@ void DerivationGoal::registerOutputs()
                 pathExists(output.second))
                 deletePath(output.second);
     };
+
+    if (addressingOf(drv) == Addressing::content && resolvedDerivation(drv))
+        for (auto & output : drv.outputs) {
+            const Path & path = output.second.path;
+            if (missingPaths.find(path) == missingPaths.end() ||
+                !output.second.hash.empty()) continue;
+            const Path actualPath = useChroot ? chrootRootDir + path : path;
+            if (!pathExists(actualPath))
+                throw BuildError(std::format(
+                    "builder for `{}' failed to produce output path `{}'", drvPath, path));
+        }
 
     auto goonixOutputOrder = addressingOf(drv) == Addressing::content &&
         resolvedDerivation(drv)
@@ -3329,7 +3430,8 @@ void DerivationGoal::registerOutputs()
         if (missingPaths.find(path) == missingPaths.end()) continue;
 
         Path actualPath = useChroot ? chrootRootDir + path : path;
-        if (addressingOf(drv) == Addressing::content && resolvedDerivation(drv)) {
+        if (addressingOf(drv) == Addressing::content && resolvedDerivation(drv) &&
+            i.second.hash.empty()) {
             // goonix: canonicalise before hashing; final path is tree-derived.
             canonicalisePathMetaData(actualPath,
                 buildUser.enabled() ? buildUser.getUID() : -1, inodesSeen);
@@ -3380,6 +3482,8 @@ void DerivationGoal::registerOutputs()
             worker.store.addTempRoot(final);
             info.path = final;
             info.deriver = drvPath;
+            checkGoonixReferences(worker.store, drv, final, path,
+                goonixFinalOutputs, info.references);
             infos.push_back(info);
             goonixFacts.push_back({i.first, final});
             continue;

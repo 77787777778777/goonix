@@ -9,6 +9,7 @@
              (ice-9 ftw)
              (ice-9 threads)
              (srfi srfi-1)
+             (srfi srfi-26)
              (srfi srfi-34)
              (srfi srfi-64)
              (ice-9 textual-ports)
@@ -75,6 +76,21 @@
 
 (define (read-all file) (call-with-input-file file get-string-all))
 (define (realised drv) (realised-output-path store drv "out"))
+
+(define (failed-build-log drv)
+  ;; The final protocol error is generic.  The daemon's specific build
+  ;; diagnostic is in its output, even at the default test verbosity.
+  ;; Hold the port explicitly: call-with-output-string would return the
+  ;; captured text even when the body returns #f after a successful build.
+  (let ((log (open-output-string)))
+    (guard (condition ((store-protocol-error? condition)
+                       (get-output-string log)))
+      (parameterize ((current-build-output-port log))
+        (build-derivations store (list drv)))
+      #f)))
+
+(define (build-fails-with? drv text)
+  (and=> (failed-build-log drv) (cut string-contains <> text)))
 
 (define (matching-store-files suffix)
   (map (lambda (name) (string-append (%store-prefix) "/" name))
@@ -241,15 +257,16 @@
   (and (partial-failure-is-clean?)
        (partial-retry-is-valid?)))
 
+(test-assert "a successful build has no failure log"
+  (let ((drv (derivation store "ca-success-log" bash
+                         '("-c" "printf 'failed to produce output' >&2; printf ok > \"$out\"")
+                         #:sources (list bash) #:addressing 'content)))
+    (not (failed-build-log drv))))
+
 (test-assert "a missing CA output is an ordinary build failure"
   (let ((drv (derivation store "ca-missing" bash '("-c" "exit 0")
                          #:sources (list bash) #:addressing 'content)))
-    (and (guard (condition ((store-protocol-error? condition)
-                           (string-contains
-                            (store-protocol-error-message condition)
-                            "failed to produce output")))
-      (build-derivations store (list drv))
-      #f)
+    (and (build-fails-with? drv "failed to produce output")
          (string? (derivation-file-name drv)))))
 
 (test-assert "a CA output obeys its self-reference policy"
@@ -257,12 +274,7 @@
                          '("-c" "printf %s \"$out\" > \"$out\"")
                          #:sources (list bash) #:addressing 'content
                          #:disallowed-references '("out"))))
-    (guard (condition ((store-protocol-error? condition)
-                       (string-contains
-                        (store-protocol-error-message condition)
-                        "not allowed to refer")))
-      (build-derivations store (list drv))
-      #f)))
+    (build-fails-with? drv "not allowed to refer")))
 
 (test-assert "a CA output obeys disallowed input references"
   (let ((drv (derivation store "ca-disallowed-input" bash
@@ -270,12 +282,7 @@
                          #:sources (list bash) #:addressing 'content
                          #:env-vars (list (cons "input" bash))
                          #:disallowed-references (list bash))))
-    (guard (condition ((store-protocol-error? condition)
-                       (string-contains
-                        (store-protocol-error-message condition)
-                        "not allowed to refer")))
-      (build-derivations store (list drv))
-      #f)))
+    (build-fails-with? drv "not allowed to refer")))
 
 (test-assert "a malformed CA derivation is refused without dropping the connection"
   (let ((text (string-append
@@ -293,35 +300,48 @@
            (string=? "ok" (read-all (realised ordinary)))))))
 
 (test-assert "two goals for one resolved derivation build only once"
-  (call-with-temporary-output-file
-   (lambda (counter port)
-     (display "0\n" port)
-     (force-output port)
-     (let* ((builder (add-text-to-store
-                      store "ca-concurrent-builder.sh"
-                      "n=$(cat \"$COUNTER\"); echo $((n + 1)) > \"$COUNTER\"; printf %s \"$out\" > \"$out\""))
-            (drv (derivation store "ca-concurrent" bash
-                             (list builder)
-                             #:sources (list bash builder)
-                             #:addressing 'content
-                             #:env-vars (list (cons "COUNTER" counter)))))
-       ;; Both requests carry the same unresolved derivation, so both goals
-       ;; resolve to the same R and must share the single recorded result.
-       (let* ((one (open-connection-for-tests))
-              (two (open-connection-for-tests))
-              (request (lambda (connection)
-                         (lambda ()
-                           (dynamic-wind
-                             (const #t)
-                             (lambda ()
-                               (build-derivations connection (list drv))
-                               (realised-output-path connection drv "out"))
-                             (lambda () (close-connection connection))))))
-              (first (begin-thread (request one)))
-              (second (begin-thread (request two))))
-         (and (string=? "1" (string-trim-right (read-all counter)))
-              (string=? (join-thread first)
-                        (join-thread second))))))))
+  (let ((drv (shell-drv "ca-concurrent" (write-output "same"))))
+    ;; Both requests carry the same unresolved derivation, so both goals
+    ;; resolve to the same R and must share the single recorded result.
+    ;; Count the daemon's build events, not a file hidden from the builder.
+    (let* ((one (open-connection-for-tests))
+           (two (open-connection-for-tests))
+           (one-log (open-output-string))
+           (two-log (open-output-string))
+           (request
+            (lambda (connection log)
+              (lambda ()
+                (dynamic-wind
+                  (const #t)
+                  (lambda ()
+                    (catch #t
+                      (lambda ()
+                        (parameterize ((current-build-output-port log))
+                          (build-derivations connection (list drv))
+                          (realised-output-path connection drv "out")))
+                      (lambda (key . args)
+                        (list 'failed key args (get-output-string log)))))
+                  (lambda () (close-connection connection))))))
+           (first (call-with-new-thread (request one one-log)))
+           (second (call-with-new-thread (request two two-log)))
+           (one-result (join-thread first))
+           (two-result (join-thread second))
+           (valid-results?
+            (and (string? one-result) (string? two-result))))
+      (unless valid-results?
+        (format (current-error-port) "concurrent request results: ~s ~s\n"
+                one-result two-result))
+      (and valid-results?
+           (let* ((resolved (path-info-deriver
+                             (query-path-info store one-result)))
+                  (started (string-append "@ build-started " resolved " "))
+                  (logs (string-append (get-output-string one-log)
+                                       (get-output-string two-log)))
+                  (starts (filter (lambda (line)
+                                    (string-prefix? started line))
+                                  (string-split logs #\newline))))
+             (and (string=? one-result two-result)
+                  (= 1 (length starts))))))))
 
 (test-assert "a fixed output in a CA derivation obeys its declared hash"
   (let ((drv (derivation store "ca-fixed-hash" bash
@@ -329,12 +349,7 @@
                          #:sources (list bash) #:addressing 'content
                          #:hash (sha256 (string->utf8 "wrong"))
                          #:hash-algo 'sha256)))
-    (guard (condition ((store-protocol-error? condition)
-                       (string-contains
-                        (store-protocol-error-message condition)
-                        "hash mismatch")))
-      (build-derivations store (list drv))
-      #f)))
+    (build-fails-with? drv "hash mismatch")))
 
 (test-assert "a fixed output in a CA derivation accepts its declared hash"
   (let ((drv (derivation store "ca-fixed-valid" bash

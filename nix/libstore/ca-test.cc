@@ -1,5 +1,6 @@
 // goonix: test vectors for tokens, placeholders and reserved paths.
 #include "ca.hh"
+#include "references.hh"
 #include "local-store.hh"
 #include "globals.hh"
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 
 #include <sys/resource.h>
+#include <poll.h>
 
 using namespace nix;
 namespace nix { void checkRewriteForTest(const Path & path, const string & from, const string & to); }
@@ -272,6 +274,87 @@ static void checkSiblingOutputReferences(const Path & root)
         "sibling output is registered as a reference");
 }
 
+static void checkFinalRootBeforeExistence(const Path & root)
+{
+    configureIsolatedStore(root);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "root-before-existence");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    HashResult ignored;
+    PathSet initialReferences = scanForReferences(token, PathSet{token}, ignored);
+    initialReferences.erase(token);
+    Path final = contentAddressedPath("out", "root-before-existence",
+        treeHash(token), initialReferences);
+    Pipe ready, proceed;
+    ready.create();
+    proceed.create();
+    pid_t pid = fork();
+    if (pid == -1) throw SysError("forking CA rooting test");
+    if (pid == 0) {
+        try {
+            ready.readSide.close();
+            proceed.writeSide.close();
+            /* The store and its roots file belong to this child, not to the
+               parent acting as the collector. This avoids inherited POSIX
+               lock ownership. */
+            LocalStore store(false);
+            store.addTempRoot(token);
+            Path roots = settings.nixStateDir + "/temproots/" +
+                std::to_string(getpid());
+            writeFull(ready.writeSide, roots + "\n");
+            char byte;
+            if (read(proceed.readSide, &byte, 1) != 1)
+                throw Error("rooting test did not receive proceed signal");
+            PathSet references;
+            Hash narHash;
+            uint64_t narSize = 0;
+            Path result = finaliseContentOutput(store, token, "out",
+                "root-before-existence", PathSet{token}, references,
+                narHash, narSize);
+            check(result == final, "rooting fixture selected expected final path");
+            check(references.count(final) == 1,
+                "rooting fixture includes its final self reference");
+            _exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+        } catch (const std::exception & e) {
+            try { std::cerr << "rooting child: " << e.what() << '\n'; } catch (...) { }
+            _exit(EXIT_FAILURE);
+        }
+    }
+    Pid child = pid;
+    ready.writeSide.close();
+    proceed.readSide.close();
+    Path roots = readLine(ready.readSide);
+    check(!roots.empty(), "rooting child created its temporary roots file");
+    AutoCloseFD lock = openLockFile(roots, false);
+    if (!lockFile(lock, ltRead, true)) throw Error("locking collector roots");
+    writeFull(proceed.writeSide, "go\n");
+    pollfd completion = {ready.readSide.borrow(), POLLIN | POLLHUP, 0};
+    int readyResult = poll(&completion, 1, 1000);
+    string contents = readFile(roots, true);
+    bool rooted = false;
+    size_t at = 0;
+    while (at < contents.size()) {
+        size_t end = contents.find('\0', at);
+        if (end == string::npos) break;
+        if (contents.substr(at, end - at) == final) rooted = true;
+        at = end + 1;
+    }
+    check(readyResult == 0 && pathExists(token),
+        "finalisation waits for the temporary-roots read lock");
+    /* A collector holds this lock while taking its snapshot. addTempRoot
+       excludes it before the final path can be checked, moved or reused. */
+    check(!rooted,
+        "final path cannot enter the store while the collector snapshot is blocked");
+    lockFile(lock, ltNone, true);
+    check(child.wait(true) == 0, "rooting child completes after collector lock releases");
+    contents = readFile(roots, true);
+    check(contents.find(final + '\0') != string::npos,
+        "final path is rooted before the finaliser can complete");
+    check(readFile(final + "/reference") == final,
+        "rooted final tree is intact after the lock handoff");
+}
+
 static void checkPlaceholderVector()
 {
     Derivation drv;
@@ -418,6 +501,10 @@ int main(int argc, char ** argv)
     }
     if (argc == 3 && string(argv[1]) == "--leftover") {
         checkInvalidLeftoverIsReplaced(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--final-root") {
+        checkFinalRootBeforeExistence(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--siblings") {
