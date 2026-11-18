@@ -1,0 +1,65 @@
+cabal-version:      3.4
+name:               guix-daemon-hs
+version:            0.1.0.0
+synopsis:           Compatible build daemon for goonix
+license:            GPL-3.0-or-later
+build-type:         Simple
+
+common warnings
+    default-language: GHC2024
+    default-extensions: StrictData
+    ghc-options: -Wall -Wcompat -Widentities -Wredundant-constraints
+
+library
+    import: warnings
+    hs-source-dirs: src
+    exposed-modules:
+        Goonix.Store.Wire
+    build-depends:
+        base >=4.20 && <5,
+        bytestring >=0.12,
+        containers >=0.7,
+        unix >=2.8
+
+executable guix-daemon
+    import: warnings
+    hs-source-dirs: app
+    main-is: Main.hs
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        unix,
+        guix-daemon-hs
+
+executable goonix-wire-proxy
+    import: warnings
+    hs-source-dirs: proxy
+    main-is: Main.hs
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        network,
+        unix,
+        stm >=2.5 && <2.6,
+        guix-daemon-hs
+
+test-suite wire-proxy
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/wire-proxy
+    main-is: Main.hs
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        process,
+        network,
+        unix,
+        guix-daemon-hs

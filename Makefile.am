@@ -984,7 +984,11 @@ include doc/local.mk
 
 if BUILD_DAEMON
 
+# goonix: both daemons share the existing C++ dependency and helper setup.
+include daemon/local.mk
+if !BUILD_HASKELL_DAEMON
 include nix/local.mk
+endif !BUILD_HASKELL_DAEMON
 
 endif BUILD_DAEMON
 
