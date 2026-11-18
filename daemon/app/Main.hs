@@ -6,9 +6,14 @@ module Main (main) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
+import Foreign.C.String (CString)
+import Foreign.C.Types (CInt (..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek)
 import qualified Goonix.Config as Config
 import Goonix.Store.Config
 import Goonix.Store.Server
@@ -72,6 +77,8 @@ main = do
                               , configStateDirectory = state
                               , configGuixProgram = maybe (C.pack (Config.binaryDirectory ++ "/guix")) id guix
                               }
+                        when (settingBool "build-discover" False (configDefaultSettings config)) $
+                          startDiscovery (configGuixProgram config)
                         activated <- activationSockets
                         case activated of
                             [] -> case listenOptions options of
@@ -79,6 +86,18 @@ main = do
                                 [socket] -> serveSocket config socket
                                 sockets -> serveManyPaths config sockets
                             listeners -> serveMany config listeners
+
+foreign import ccall unsafe "goonix_spawn_discover"
+  c_spawn_discover :: CString -> Ptr CInt -> IO CInt
+
+startDiscovery :: B.ByteString -> IO ()
+startDiscovery program = do
+  result <- B.useAsCString program $ \program' -> alloca $ \pidPointer -> do
+    status <- c_spawn_discover program' pidPointer
+    if status < 0 then pure (-1) else fromIntegral <$> peek pidPointer
+  when (result < (0 :: Int)) $ ioError (userError "cannot spawn guix discover")
+  -- The C++ daemon does not wait for the discovery process.
+  pure ()
 
 serveMany :: ServerConfig -> [Socket] -> IO ()
 serveMany config listeners = do

@@ -7,6 +7,7 @@ module Goonix.Store.Files
   ( restoreNar
   , canonicaliseTree
   , withPathLock
+  , withGCLock
   , withTempRootFile
   , tryExclusiveLock
   , appendTempRoot
@@ -99,6 +100,18 @@ withPathLock path action = do
     release (Fd fd) = do
       result <- withCStringBytes lockPath (c_unlock_delete fd)
       when (result < 0) (errnoIO "cannot release store path lock")
+
+withGCLock :: RawFilePath -> IO a -> IO a
+withGCLock path action = do
+  mkdirParents (parent path)
+  bracket acquire closeFd (const action)
+  where
+    acquire = do
+      fd <- withCStringBytes path (\p -> c_lock_shared p 1)
+      if fd < 0 then errnoIO "cannot acquire global GC lock"
+        else do
+          checkIO "cannot upgrade global GC lock" (c_lock_upgrade fd 1)
+          pure (Fd fd)
 
 withTempRootFile :: RawFilePath -> (Fd -> IO a) -> IO a
 withTempRootFile path action = do

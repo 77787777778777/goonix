@@ -15,6 +15,7 @@ module Goonix.Store.Database
   , withReadOnly
   , withReadWrite
   , execute
+  , DatabaseBusy (..)
   , withTransaction
   , prepare
   , closeStatement
@@ -26,10 +27,11 @@ module Goonix.Store.Database
   , databaseError
   ) where
 
-import Control.Exception (bracket, bracketOnError, onException, throwIO)
+import Control.Exception (Exception, bracket, bracketOnError, onException, throwIO)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
 import Data.Int (Int64)
 import Data.Word (Word64)
 import System.IO.Unsafe (unsafePerformIO)
@@ -40,7 +42,10 @@ import Foreign.Ptr (FunPtr, Ptr, castPtr, castPtrToFunPtr, intPtrToPtr, nullPtr)
 import Foreign.Storable (peek)
 
 newtype Database = Database (Ptr ())
-newtype Statement = Statement (Ptr ())
+data Statement = Statement ByteString (Ptr ())
+
+data DatabaseBusy = DatabaseBusy !String deriving (Show)
+instance Exception DatabaseBusy
 
 data Value = Integer !Int64 | Bytes !ByteString | Null
   deriving (Eq, Ord, Show)
@@ -130,7 +135,10 @@ openDatabase flags path = do
       throwIO (userError message)
     else do
       check (Database handle) =<< c_busy_timeout handle 60000
-      pure (Database handle)
+      let db = Database handle
+      execute db "pragma foreign_keys = on;" []
+      execute db "pragma main.journal_mode = wal;" []
+      pure db
 
 closeDatabase :: Database -> IO ()
 closeDatabase (Database handle) = do
@@ -161,11 +169,11 @@ prepare database@(Database handle) sql =
       c_prepare handle text (fromIntegral len) statement nullPtr
     pointer <- peek statement
     if result /= 0 || pointer == nullPtr
-      then databaseError database >>= throwIO . userError
-      else pure (Statement pointer)
+      then databaseError database >>= \message -> throwIO (userError ("SQLite prepare `" ++ C.unpack sql ++ "': " ++ message))
+      else pure (Statement sql pointer)
 
 closeStatement :: Statement -> IO ()
-closeStatement (Statement statement) = do
+closeStatement (Statement _ statement) = do
   _ <- c_finalize statement
   pure ()
 
@@ -189,15 +197,16 @@ query database statement values = do
   bindValues database statement values
   rows statement []
   where
-    rows (Statement handle) acc = do
+    rows (Statement sql handle) acc = do
       result <- c_step handle
       case result of
         100 -> do
           count <- c_column_count handle
           row <- mapM (column handle) [0 .. count - 1]
-          rows (Statement handle) (row:acc)
+          rows (Statement sql handle) (row:acc)
         101 -> pure (reverse acc)
-        _ -> databaseError database >>= throwIO . userError
+        _ | result == 5 || result == 6 -> throwIO (DatabaseBusy ("SQLite step `" ++ C.unpack sql ++ "': database is busy"))
+          | otherwise -> databaseError database >>= \message -> throwIO (userError ("SQLite step `" ++ C.unpack sql ++ "': " ++ message))
 
 column :: Ptr () -> CInt -> IO Value
 column statement index = do
@@ -226,7 +235,7 @@ queryRows database sql values = do
     bytes (Integer value) = error ("integer SQLite value where bytes expected: " ++ show value)
 
 statementPtr :: Statement -> Ptr ()
-statementPtr (Statement pointer) = pointer
+statementPtr (Statement _ pointer) = pointer
 
 check :: Database -> CInt -> IO ()
 check database result

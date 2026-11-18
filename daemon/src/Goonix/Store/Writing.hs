@@ -12,8 +12,9 @@ module Goonix.Store.Writing
   , clearFailedPaths
   ) where
 
-import Control.Exception (finally, throwIO)
+import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_, unless, when)
+import Control.Concurrent (threadDelay)
 import Data.Char (toUpper)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -94,7 +95,7 @@ canonicaliseAndHash store path = do
 registerPath :: Store -> ByteString -> Hash -> Word64 -> [ByteString] -> ByteString -> IO ()
 registerPath store path (Hash algorithm digest) size references deriver = do
   when (algorithm /= SHA256) (throwIO (storeError "store registration requires SHA-256"))
-  withTransaction (database store) $ do
+  retryRegistration $ withTransaction (database store) $ do
     existing <- queryValues (database store) "select id from ValidPaths where path = ?;" [Bytes path]
     case existing of
       [] -> do
@@ -128,6 +129,17 @@ registerPath store path (Hash algorithm digest) size references deriver = do
             execute (database store) "insert or replace into DerivationOutputs(drv,id,path) values (?,?,?);"
               [Integer identifier, Bytes name, Bytes (outputPath output)]
       _ -> throwIO (storeError "registered path has no database id")
+
+retryRegistration :: IO a -> IO a
+retryRegistration action = go (0 :: Int)
+  where
+    go attempt = do
+      result <- try action
+      case result of
+        Right value -> pure value
+        Left (exception :: DatabaseBusy)
+          | attempt < 200 -> threadDelay (1000 + attempt * 100) >> go (attempt + 1)
+          | otherwise -> throwIO exception
 
 addIndirectRoot :: Store -> ByteString -> IO ()
 addIndirectRoot store link = do

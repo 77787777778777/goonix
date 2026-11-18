@@ -26,6 +26,9 @@ module Goonix.Build.Sandbox
   , sandboxFlagProc
   , sandboxFlagDevpts
   , sandboxFlagLockMounts
+  , sandboxFlagSlirpNetwork
+  , sandboxFlagIsolateHostLoopback
+  , sandboxFlagIpv6Network
   ) where
 
 import Data.ByteString (ByteString)
@@ -61,6 +64,8 @@ data SandboxPlan = SandboxPlan
   , planDomainname :: !ByteString
   , planMounts :: ![BindMount]
   , planSeccomp :: ![(Word32, Word32, Word32, Word32)]
+  , planSlirpProgram :: !ByteString
+  , planSlirpSeccomp :: ![(Word32, Word32, Word32, Word32)]
   } deriving (Eq, Show)
 
 sandboxFlagSetIds, sandboxFlagSetSid, sandboxFlagCloseFds,
@@ -69,7 +74,9 @@ sandboxFlagSetIds, sandboxFlagSetSid, sandboxFlagCloseFds,
   sandboxFlagUserNamespace, sandboxFlagMountNamespace,
   sandboxFlagNetworkNamespace, sandboxFlagPidNamespace,
   sandboxFlagIpcNamespace, sandboxFlagUtsNamespace, sandboxFlagChroot,
-  sandboxFlagProc, sandboxFlagDevpts, sandboxFlagLockMounts :: Word64
+  sandboxFlagProc, sandboxFlagDevpts, sandboxFlagLockMounts,
+  sandboxFlagSlirpNetwork, sandboxFlagIsolateHostLoopback,
+  sandboxFlagIpv6Network :: Word64
 sandboxFlagSetIds = 1
 sandboxFlagSetSid = 2
 sandboxFlagCloseFds = 4
@@ -88,6 +95,9 @@ sandboxFlagChroot = 262144
 sandboxFlagProc = 524288
 sandboxFlagDevpts = 1048576
 sandboxFlagLockMounts = 2097152
+sandboxFlagSlirpNetwork = 4194304
+sandboxFlagIsolateHostLoopback = 8388608
+sandboxFlagIpv6Network = 16777216
 
 encodeSandboxPlan :: SandboxPlan -> ByteString
 encodeSandboxPlan plan = B.concat
@@ -107,6 +117,8 @@ encodeSandboxPlan plan = B.concat
   , string (planRoot plan), string (planStoreDirectory plan), string (planHostname plan), string (planDomainname plan)
   , list mount (planMounts plan)
   , list seccomp (planSeccomp plan)
+  , string (planSlirpProgram plan)
+  , list seccomp (planSlirpSeccomp plan)
   ]
   where
     pair (name, value) = string name <> string value

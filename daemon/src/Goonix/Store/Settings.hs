@@ -62,7 +62,7 @@ applySetOptions minor fields initial = do
   (fallbackValue, rest3) <- takeField rest2
   (verbosityValue, rest4) <- takeField rest3
   (afterOldJobs, rest5) <- if minor < 0x61 then takeFields 2 rest4 else Right ([], rest4)
-  (_buildHook, rest6) <- if minor >= 2 then takeField rest5 else Right ("0", rest5)
+  (buildHook, rest6) <- if minor >= 2 then takeField rest5 else Right ("0", rest5)
   (buildVerbosityValue, rest7) <- if minor >= 4 then takeField rest6 else Right ("0", rest6)
   (logTypeValue, rest8) <- if minor >= 4 then takeField rest7 else Right ("0", rest7)
   (traceValue, rest9) <- if minor >= 4 then takeField rest8 else Right ("0", rest8)
@@ -82,7 +82,10 @@ applySetOptions minor fields initial = do
       settings3 = if minor >= 6 && minor < 0x61 then setSetting "build-cores" cores settings2 else settings2
       settings4 = if minor >= 10 && settingBool "build-use-substitutes" True settings3
         then setSetting "build-use-substitutes" (if useSubstitutes == zero then "false" else "true") settings3 else settings3
-  pure (foldl applyPair settings4 pairs)
+      settings5 = if minor >= 2
+        then setSetting "build-use-build-hook" (if buildHook == zero then "false" else "true") settings4
+        else settings4
+  pure (foldl applyPair settings5 pairs)
   where
     zero = B.replicate 8 0
     intValue = littleInt

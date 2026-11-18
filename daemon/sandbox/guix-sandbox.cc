@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <exception>
 #include <fcntl.h>
 #include <grp.h>
@@ -52,6 +53,12 @@
 #include <linux/seccomp.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <net/route.h>
+#include <linux/if_tun.h>
+#include <linux/ipv6.h>
+#include <linux/audit.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -89,11 +96,15 @@ constexpr uint64_t chrootFlag = 262144;
 constexpr uint64_t procFlag = 524288;
 constexpr uint64_t devptsFlag = 1048576;
 constexpr uint64_t lockMountsFlag = 2097152;
+constexpr uint64_t slirpNetworkFlag = 4194304;
+constexpr uint64_t isolateHostLoopbackFlag = 8388608;
+constexpr uint64_t ipv6NetworkFlag = 16777216;
 constexpr uint64_t namespaceFlags = sandboxFlag | mountNamespaceFlag |
     networkNamespaceFlag | pidNamespaceFlag | ipcNamespaceFlag | utsNamespaceFlag;
 constexpr uint64_t sandboxFlags = namespaceFlags | chrootFlag | procFlag |
     devptsFlag | lockMountsFlag;
-constexpr uint64_t knownExtendedFlags = sandboxFlags;
+constexpr uint64_t knownExtendedFlags = sandboxFlags | slirpNetworkFlag |
+    isolateHostLoopbackFlag | ipv6NetworkFlag;
 
 class Error : public std::runtime_error {
 public:
@@ -137,6 +148,8 @@ struct Plan {
     Bytes domainname = "(none)";
     std::vector<std::tuple<Bytes, Bytes, bool>> mounts;
     std::vector<struct sock_filter> seccomp;
+    Bytes slirpProgram;
+    std::vector<struct sock_filter> slirpSeccomp;
     size_t phase = 0;
 
     bool has(uint32_t flag) const { return (flags & flag) != 0; }
@@ -411,6 +424,18 @@ Plan parseFields(const Bytes & input)
                 uint16_t(code), uint8_t(jt), uint8_t(jf), k });
         }
     }
+    plan.slirpProgram = reader.string();
+    const uint32_t slirpFilters = reader.count(reader.u32());
+    for (uint32_t i = 0; i < slirpFilters; ++i) {
+        const uint32_t code = reader.u32();
+        const uint32_t jt = reader.u32();
+        const uint32_t jf = reader.u32();
+        const uint32_t k = reader.u32();
+        if (code > UINT16_MAX || jt > UINT8_MAX || jf > UINT8_MAX)
+            throw Error("slirp seccomp instruction is out of range");
+        plan.slirpSeccomp.push_back(sock_filter {
+            uint16_t(code), uint8_t(jt), uint8_t(jf), k });
+    }
     reader.finish();
     return plan;
 }
@@ -440,6 +465,210 @@ void mkdirParents(const Bytes & path)
         if (mkdir(parent.c_str(), 0755) == -1 && errno != EEXIST)
             sysError("creating directory " + parent);
     }
+}
+
+std::vector<char *> stringPointers(std::vector<Bytes> & strings);
+void mountIntoSandbox(const Plan & plan, const Bytes & source,
+                      const Bytes & target, bool readOnly);
+
+/* Fixed-output networking follows setupTap and spawnSlirp4netns in
+   nix/libstore/build.cc.  The descriptor never crosses exec: only the
+   slirp child receives it, in the original network namespace. */
+pid_t slirpProcess = -1;
+
+void sendFd(int socketFd, int fd)
+{
+    unsigned char byte = 0;
+    struct iovec iov { &byte, 1 };
+    char control[CMSG_SPACE(sizeof(fd))] = {};
+    struct msghdr message = {};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    auto header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(fd));
+    memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+    if (sendmsg(socketFd, &message, 0) != 1) sysError("sending tap descriptor");
+}
+
+void writeNetworkFile(const Bytes & path, const Bytes & contents)
+{
+    writeFile(path, contents);
+}
+
+void setupTap(int socketFd, bool ipv6)
+{
+    Fd tap(open("/dev/net/tun", O_RDWR | O_CLOEXEC));
+    if (tap.get() == -1) sysError("opening /dev/net/tun");
+    struct ifreq request = {};
+    request.ifr_flags = IFF_TAP | IFF_NO_PI;
+    std::strncpy(request.ifr_name, "tap0", IFNAMSIZ - 1);
+    if (ioctl(tap.get(), TUNSETIFF, &request) < 0) sysError("TUNSETIFF");
+    writeNetworkFile("/proc/sys/net/ipv6/conf/tap0/accept_dad", "0");
+    writeNetworkFile("/proc/sys/net/ipv6/conf/tap0/accept_ra", "0");
+    Fd socket4(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    Fd socket6(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    if (socket4.get() < 0 || socket6.get() < 0) sysError("creating network control socket");
+    if (ioctl(socket4.get(), SIOCGIFINDEX, &request) < 0) sysError("getting tap0 index");
+    const int index = request.ifr_ifindex;
+    request.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (ioctl(socket4.get(), SIOCSIFFLAGS, &request) < 0) sysError("bringing up tap0");
+    request.ifr_mtu = 1500;
+    if (ioctl(socket4.get(), SIOCSIFMTU, &request) < 0) sysError("setting tap0 MTU");
+    auto address = reinterpret_cast<struct sockaddr_in *>(&request.ifr_addr);
+    address->sin_family = AF_INET;
+    if (inet_pton(AF_INET, "10.0.2.100", &address->sin_addr) != 1) throw Error("invalid tap0 address");
+    if (ioctl(socket4.get(), SIOCSIFADDR, &request) < 0) sysError("setting tap0 address");
+    struct in6_ifreq address6 = {};
+    address6.ifr6_prefixlen = 64;
+    address6.ifr6_ifindex = index;
+    if (ipv6) {
+        inet_pton(AF_INET6, "fd00::80", &address6.ifr6_addr);
+        if (ioctl(socket6.get(), SIOCSIFADDR, &address6) < 0) sysError("setting tap0 IPv6 address");
+    }
+    inet_pton(AF_INET6, "fe80::80", &address6.ifr6_addr);
+    if (ioctl(socket6.get(), SIOCSIFADDR, &address6) < 0) sysError("setting tap0 link-local address");
+    inet_pton(AF_INET, "255.255.255.0", &address->sin_addr);
+    if (ioctl(socket4.get(), SIOCSIFNETMASK, &request) < 0) sysError("setting tap0 netmask");
+    struct rtentry route = {};
+    address = reinterpret_cast<struct sockaddr_in *>(&route.rt_gateway);
+    address->sin_family = AF_INET;
+    inet_pton(AF_INET, "10.0.2.2", &address->sin_addr);
+    address = reinterpret_cast<struct sockaddr_in *>(&route.rt_dst);
+    address->sin_family = AF_INET;
+    address = reinterpret_cast<struct sockaddr_in *>(&route.rt_genmask);
+    address->sin_family = AF_INET;
+    route.rt_flags = RTF_UP | RTF_GATEWAY;
+    route.rt_dev = const_cast<char *>("tap0");
+    if (ioctl(socket4.get(), SIOCADDRT, &route) < 0) sysError("setting tap0 default route");
+    struct in6_rtmsg route6 = {};
+    inet_pton(AF_INET6, "fd00::2", &route6.rtmsg_gateway);
+    if (ipv6) route6.rtmsg_flags = RTF_UP | RTF_GATEWAY;
+    else {
+        inet_pton(AF_INET6, "fd00::2", &route6.rtmsg_dst);
+        route6.rtmsg_dst_len = 128;
+        route6.rtmsg_flags = RTF_UP;
+    }
+    route6.rtmsg_ifindex = index;
+    route6.rtmsg_metric = 1;
+    if (ioctl(socket6.get(), SIOCADDRT, &route6) < 0) sysError("setting tap0 IPv6 route");
+    sendFd(socketFd, tap.get());
+    char ready;
+    ssize_t result;
+    do { result = read(socketFd, &ready, 1); } while (result < 0 && errno == EINTR);
+    if (result != 1 || ready != '1') throw Error("slirp4netns did not become ready");
+    struct stat routeLocalnet;
+    if (stat("/proc/sys/net/ipv4/conf/all/route_localnet", &routeLocalnet) == -1) return;
+    writeNetworkFile("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
+}
+
+void stopSlirp()
+{
+    if (slirpProcess <= 0) return;
+    kill(slirpProcess, SIGKILL);
+    kill(-slirpProcess, SIGKILL);
+    int status;
+    while (waitpid(slirpProcess, &status, 0) < 0 && errno == EINTR) { }
+    slirpProcess = -1;
+}
+
+void slirpChild(Plan & plan, int tap, int readyFd)
+{
+    /* The slirp child has its own process group and PID namespace.  Its
+       mounts are private; a read-only tmpfs root prevents self-overwrite. */
+    const Bytes oldRoot = plan.root;
+    plan.root += "/slirp";
+    if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) == -1)
+        sysError("creating slirp namespaces");
+    const pid_t child = fork();
+    if (child == -1) sysError("entering slirp PID namespace");
+    if (child > 0) {
+        int status;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+    }
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1)
+        sysError("making slirp mounts private");
+    if (mount("tmpfs", oldRoot.c_str(), "tmpfs", 0, "mode=0755") == -1 ||
+        mkdir(plan.root.c_str(), 0755) == -1 ||
+        mount(plan.root.c_str(), plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1 ||
+        mount(nullptr, plan.root.c_str(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr) == -1)
+        sysError("preparing slirp filesystem root");
+    DIR *directory = opendir("/");
+    if (!directory) sysError("reading host root for slirp");
+    while (auto entry = readdir(directory)) {
+        const Bytes name = entry->d_name;
+        if (name == "." || name == ".." || name == "etc" || name == "run") continue;
+        mountIntoSandbox(plan, "/" + name, "/" + name, true);
+    }
+    closedir(directory);
+    const Bytes executableDirectory = plan.slirpProgram.substr(0, plan.slirpProgram.rfind('/'));
+    mountIntoSandbox(plan, executableDirectory, executableDirectory, true);
+    for (const Bytes & file : { Bytes("/etc/hosts"), Bytes("/etc/resolv.conf") }) {
+        char resolved[PATH_MAX];
+        if (realpath(file.c_str(), resolved))
+            mountIntoSandbox(plan, resolved, file, true);
+    }
+    if (mkdir((plan.root + "/run").c_str(), 0700) == -1) sysError("creating slirp /run");
+    if (mkdir((plan.root + "/proc").c_str(), 0755) == -1 ||
+        mount("proc", (plan.root + "/proc").c_str(), "proc", 0, nullptr) == -1 ||
+        chdir(plan.root.c_str()) == -1 || mkdir("real-root", 0700) == -1 ||
+        syscall(SYS_pivot_root, ".", "real-root") == -1 || chroot(".") == -1 ||
+        umount2("real-root", MNT_DETACH) == -1 || rmdir("real-root") == -1)
+        sysError("preparing slirp root");
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) == -1 ||
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) sysError("dropping slirp privileges");
+    if (plan.slirpSeccomp.empty() || plan.slirpSeccomp.size() > USHRT_MAX)
+        throw Error("invalid slirp seccomp filter");
+    struct sock_fprog filter { static_cast<unsigned short>(plan.slirpSeccomp.size()), plan.slirpSeccomp.data() };
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter) == -1) sysError("installing slirp seccomp filter");
+    std::vector<Bytes> arguments { "slirp4netns", "--netns-type=tapfd", "--enable-sandbox", "--enable-ipv6",
+        "--ready-fd=" + std::to_string(readyFd) };
+    if (plan.has(isolateHostLoopbackFlag)) arguments.push_back("--disable-host-loopback");
+    arguments.push_back(std::to_string(tap));
+    auto argv = stringPointers(arguments);
+    execv(plan.slirpProgram.c_str(), argv.data());
+    sysError("executing slirp4netns");
+}
+
+void setupSlirp(Plan & plan)
+{
+    if (!plan.has(slirpNetworkFlag)) return;
+    if (plan.slirpProgram.empty() || plan.slirpProgram.front() != '/')
+        throw Error("slirp program is not absolute");
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
+        sysError("creating slirp setup socket");
+    Fd parent(sockets[0]), child(sockets[1]);
+    slirpProcess = fork();
+    if (slirpProcess == -1) sysError("creating slirp process");
+    if (slirpProcess == 0) {
+        parent.reset();
+        if (setpgid(0, 0) == -1) _exit(1);
+        int tap;
+        char byte;
+        char control[CMSG_SPACE(sizeof(tap))] = {};
+        struct iovec iov { &byte, 1 };
+        struct msghdr message = {};
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control;
+        message.msg_controllen = sizeof(control);
+        if (recvmsg(child.get(), &message, 0) != 1) _exit(1);
+        auto header = CMSG_FIRSTHDR(&message);
+        if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) _exit(1);
+        memcpy(&tap, CMSG_DATA(header), sizeof(tap));
+        try { slirpChild(plan, tap, child.get()); }
+        catch (const std::exception & error) { writeFull(STDERR_FILENO, Bytes("slirp: ") + error.what() + "\n"); }
+        _exit(1);
+    }
+    child.reset();
+    setupTap(parent.get(), plan.has(ipv6NetworkFlag));
+    /* setupTap waits for the readiness byte.  Its descriptor is then closed
+       here and cannot be inherited by the builder. */
 }
 
 void mountIntoSandbox(const Plan & plan, const Bytes & source,
@@ -748,6 +977,7 @@ pid_t pidNamespaceChild = -1;
 
 void forwardTermination(int)
 {
+    stopSlirp();
     if (pidNamespaceChild > 0) {
         kill(pidNamespaceChild, SIGKILL);
         kill(-pidNamespaceChild, SIGKILL);
@@ -781,6 +1011,7 @@ void enterPidNamespace(Plan & plan)
     pid_t result;
     do { result = waitpid(child, &status, 0); } while (result == -1 && errno == EINTR);
     if (result == -1) sysError("waiting for sandbox child");
+    stopSlirp();
     if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
     if (WIFSIGNALED(status)) {
         signal(WTERMSIG(status), SIG_DFL);
@@ -792,6 +1023,7 @@ void enterPidNamespace(Plan & plan)
 const std::vector<Phase> phases = {
     { "unshareAndInitUserns", [](Plan & p) { if (p.has(newUserNsFlag)) unshareAndInitUserns(p); } },
     { "setupNamespaces", setupNamespaces },
+    { "setupSlirp", setupSlirp },
     { "enterPidNamespace", enterPidNamespace },
     { "enterSandbox", enterSandbox },
     { "usernsSetIDs", usernsSetIdsAction },
@@ -813,6 +1045,7 @@ const std::vector<Phase> phases = {
         for (plan.phase = 0; plan.phase < phases.size(); ++plan.phase)
             phases[plan.phase].action(plan);
     } catch (const std::exception & error) {
+        stopSlirp();
         try {
             Bytes message = "guix-sandbox: child setup";
             if (plan.phase < phases.size())

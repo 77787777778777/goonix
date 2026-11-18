@@ -25,22 +25,23 @@ import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
-import Goonix.Store.Database (Value (Bytes), execute)
+import Goonix.Store.Database (Value (Bytes))
 import Goonix.Store.Base32 (encodeBase16)
 import Goonix.Store.Config (ServerConfig (..), defaultConfig)
 import Goonix.Store.ReadOnly
 import Goonix.Store.Settings
 import Goonix.Store.Socket
-import Goonix.Store.Substitute
+import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitutePath)
 import Goonix.Store.Archive (exportPath, importPathsFrom)
 import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, ensureStorePath)
-import Goonix.Store.Hash (algorithmFromName, hashDigest)
+import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
+import Goonix.Store.Base32 (decodeBase32)
 import Goonix.Store.Wire
 import Goonix.Store.Writing
+import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import System.Posix.Env.ByteString (getEnv)
-import Goonix.Store.Files (withTempRootFile, appendTempRoot, deleteTree, mkdirParents, directoryEntries, tryExclusiveLock, catchMissing, deduplicateTree)
-import Goonix.Store.Nar (hashNar)
+import Goonix.Store.Files (withTempRootFile, withGCLock, appendTempRoot, deleteTree, mkdirParents, directoryEntries, tryExclusiveLock, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
 import qualified System.Posix.Files.ByteString as Files
 import System.Posix.User (getUserEntryForID, userName)
@@ -245,14 +246,18 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       _obsolete3 <- readIntSocket client
       pure ()
     when (ignoreLiveness == 1) (throwIO (storeError "you are not allowed to ignore liveness"))
-    (deleted, freed) <- if action == 3
-      then deleteSpecificPaths store paths minFreed
+    settings <- readIORef settingsRef
+    (deleted, freed) <- withGCLock (rootPath <> "/gc.lock") $ if action == 3
+      then do
+        live <- livePaths rootPath rootFd store
+        Collector.deleteSpecificPaths settings live paths minFreed store
       else do
         live <- livePaths rootPath rootFd store
         allPaths <- queryAllValidPaths store
         case action of
           0 -> pure (live, 0)
           1 -> pure (filter (`notElem` live) allPaths, 0)
+          2 -> Collector.collectPaths settings live minFreed store
           _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
@@ -322,7 +327,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     when (repair && not (trusted settings)) (throwIO (storeError "you are not privileged to repair paths"))
     paths <- queryAllValidPaths store
-    errors <- verifyStorePaths store checkContents paths
+    errors <- Collector.verifyStorePaths checkContents repair (repairStorePath config rootFd store settings) store paths
     writeFrame client stderrLast
     writeSocket client (encodeBool errors)
   80 -> do
@@ -347,22 +352,6 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       writeFrame client stderrLast
       writeSocket client reply
 
-verifyStorePaths :: Store -> Bool -> [ByteString] -> IO Bool
-verifyStorePaths store checkContents paths = or <$> mapM verify paths
-  where
-    verify path = do
-      exists <- Files.fileExist path
-      if not exists then pure True else do
-        references <- queryReferences store path
-        missingReferences <- or <$> mapM (fmap not . isValidPath store) references
-        changed <- if checkContents
-          then do
-            expected <- queryPathHash store path
-            actual <- hashDigest <$> hashNar path
-            pure (expected /= actual)
-          else pure False
-        pure (missingReferences || changed)
-
 buildTrace :: Settings -> Socket -> BuildTrace
 buildTrace settings client = BuildTrace
   { traceStarted = \drv platform log pid -> emit ("@ build-started " <> drv <> " - " <> platform <> " " <> log <> " " <> C.pack (show pid))
@@ -372,6 +361,44 @@ buildTrace settings client = BuildTrace
   }
   where
     emit message = when (printBuildTrace settings) $ writeSocket client (encodeInt stderrNext <> encodeString message)
+
+repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> ByteString -> IO Bool
+repairStorePath config rootFd store settings path = do
+  substituted <- trySubstituteForRepair config rootFd store settings path
+  if substituted then pure True else do
+    deriver <- queryDeriver store path
+    valid <- if B.null deriver then pure False else isValidPath store deriver
+    if valid
+      then do
+        -- registerPath updates the existing valid entry after repair.
+        buildThingsWithConfig config rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) [deriver] Repair
+        exists <- (Files.getSymbolicLinkStatus path >> pure True) `catchMissing` pure False
+        registered <- isValidPath store path
+        pure (exists && registered)
+      else throwIO (storeError ("cannot repair path `" ++ C.unpack path ++ "'"))
+  where
+    trySubstituteForRepair config rootFd store settings path = do
+      -- Repair must not use the ordinary valid-path shortcut: the object may
+      -- be registered but absent or modified.  Re-fetch and register it.
+      if not (settingBool "build-use-substitutes" False settings) then pure False else do
+        infos <- substitutableInfos config settings [path]
+        case infos of
+          [] -> pure False
+          ((_, deriver, references, _, _):_) -> do
+            present <- mapM (isValidPath store) references
+            if not (and present) then pure False else do
+              appendTempRoot rootFd path
+              result <- substitutePath config settings path path
+              case result of
+                Left _ -> pure False
+                Right (printedHash, size) -> do
+                  digest <- case C.break (== ':') printedHash of
+                    ("sha256", encoded) -> either (throwIO . storeError) pure (decodeBase32 (B.drop 1 encoded))
+                    _ -> throwIO (storeError "unsupported substitute hash")
+                  (actualHash, actualSize) <- canonicaliseAndHash store path
+                  if hashDigest actualHash /= digest
+                    then deleteTree path >> pure False
+                    else registerPath store path actualHash actualSize references deriver >> pure True
 
 readSetOptions :: Socket -> Word32 -> IO [ByteString]
 readSetOptions client clientVersion = do
@@ -525,24 +552,6 @@ livePaths currentPath _rootFd store = do
           if not valid then go seen rest else do
             references <- queryReferences store path
             go (Set.insert path seen) (references ++ rest)
-
-deleteSpecificPaths :: Store -> [ByteString] -> Word64 -> IO ([ByteString], Word64)
-deleteSpecificPaths store paths minFreed = do
-  mapM_ (assertStorePath store) paths
-  let go acc freed remaining
-        | freed >= minFreed = pure (reverse acc, freed)
-        | otherwise = case remaining of
-            [] -> pure (reverse acc, freed)
-            path:rest -> do
-              valid <- isValidPath store path
-              if not valid then go acc freed rest else do
-                status <- Files.getSymbolicLinkStatus path
-                let size = fromIntegral (Files.fileSize status)
-                deleteTree path
-                execute (database store) "DELETE FROM Refs WHERE referrer IN (SELECT id FROM ValidPaths WHERE path = ?)" [Bytes path]
-                execute (database store) "DELETE FROM ValidPaths WHERE path = ?" [Bytes path]
-                go (path:acc) (freed + size) rest
-  go [] 0 paths
 
 readStorePathsSocket :: Socket -> IO [ByteString]
 readStorePathsSocket = readStringsSocket

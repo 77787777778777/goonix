@@ -14,11 +14,11 @@ module Goonix.Build.Engine
   ) where
 
 import Control.Concurrent (forkIO, threadDelay, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef)
 import Data.Time.Clock.POSIX (POSIXTime)
-import Control.Exception (SomeException, bracket, catch, finally, fromException, throwIO, try)
-import Control.Monad (foldM, forM, forM_, replicateM_, unless, void, when)
+import Control.Exception (SomeException, bracket, bracketOnError, catch, finally, fromException, throwIO, try)
+import Control.Monad ((>=>), foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.ByteString (ByteString)
@@ -35,29 +35,32 @@ import Goonix.Store.Path (storePathToName)
 import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
 import Goonix.Store.Settings
-import Goonix.Store.Config (ServerConfig)
+import Goonix.Store.Config (ServerConfig, configGuixProgram)
 import Goonix.Store.Substitute (substitutableInfos, substitutePath)
 import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import System.Exit (ExitCode (ExitSuccess, ExitFailure))
-import System.IO (Handle, hClose)
+import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
 import System.Posix.User (getRealGroupID, getRealUserID)
 import System.FilePath (takeDirectory)
+import System.Directory (findExecutable)
 import System.IO.Error (isDoesNotExistError)
-import System.Posix.Types (CPid (..), Fd (..))
+import System.Posix.Types (Fd (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
-import System.Environment (getEnvironment)
+import Goonix.Build.Offload
+import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Posix.Env.ByteString (getEnv)
 
 data BuildMode = Normal | Repair | Check deriving (Eq, Show)
@@ -70,13 +73,21 @@ data BuildTrace = BuildTrace
 
 buildThingsWithTrace :: Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
 buildThingsWithTrace rootFd store settings trace things mode =
-  buildThingsInternal Nothing rootFd store settings trace things mode
+  buildThingsInternal Nothing rootFd store settings trace Nothing things mode
 
 buildThingsWithConfig :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
-buildThingsWithConfig config = buildThingsInternal (Just config)
+buildThingsWithConfig config rootFd store settings trace things mode = do
+  program <- if settingBool "build-use-build-hook" True settings then offloadProgram config else pure Nothing
+  pool <- forM program $ \path -> do
+    hook <- newIORef Nothing
+    pure (hook, path)
+  bracket (pure pool) (mapM_ (readIORef . fst >=> mapM_ stopHook)) $ \hooks ->
+    buildThingsInternal (Just config) rootFd store settings trace hooks things mode
 
-buildThingsInternal :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
-buildThingsInternal config rootFd store settings trace things mode = do
+type HookPool = (IORef (Maybe Hook), ByteString)
+
+buildThingsInternal :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> [ByteString] -> BuildMode -> IO ()
+buildThingsInternal config rootFd store settings trace hook things mode = do
   failure <- newIORef Nothing
   forM_ things $ \thing ->
     catch (buildOne thing) $ \(exception :: SomeException) ->
@@ -90,7 +101,7 @@ buildThingsInternal config rootFd store settings trace things mode = do
   readIORef failure >>= mapM_ throwIO
   where
     buildOne thing
-      | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace mode thing
+      | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace hook mode thing
       | B.isInfixOf "!" thing = do
           let (drv, _) = B.break (== 33) thing
           buildOne drv
@@ -107,8 +118,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> IO ()
-buildDerivation config rootFd store settings trace mode drvPath = do
+buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> IO ()
+buildDerivation config rootFd store settings trace hook mode drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -122,7 +133,7 @@ buildDerivation config rootFd store settings trace mode drvPath = do
   unless stillValid $ throwIO (storeError ("cannot build missing derivation `" ++ C.unpack drvPath ++ "'"))
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
-  forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace Normal input
+  forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace hook Normal input
   forM_ (Set.toList (inputSrcs drv)) $ \input -> do
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
@@ -137,11 +148,120 @@ buildDerivation config rootFd store settings trace mode drvPath = do
     Just serverConfig | mode /= Check && not ready && settingBool "build-use-substitutes" False settings ->
       or <$> mapM (trySubstitute serverConfig rootFd store settings trace . outputPath) (Map.elems (outputs drv))
     _ -> pure False
-  when (mode == Repair || mode == Check || not (ready || substituted)) $ do
-    runBuilder rootFd store settings trace mode drvPath drv
-    when (mode == Normal) $ replicateM_ (max 0 (settingInt "build-repeat" 0 settings)) $
-      runBuilder rootFd store settings trace Check drvPath drv
-  pure ()
+  when (mode == Repair || mode == Check || not (ready || substituted)) $
+    buildWithHook rootFd store settings trace hook mode drvPath drv
+
+buildWithHook :: Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> Derivation -> IO ()
+buildWithHook rootFd store settings trace pool mode drvPath drv = do
+  let localBuild = do
+        runBuilder rootFd store settings trace mode drvPath drv
+        when (mode == Normal) $ replicateM_ (max 0 (settingInt "build-repeat" 0 settings)) $
+          runBuilder rootFd store settings trace Check drvPath drv
+      withOutputLocks action =
+        foldr (\path inner -> withPathLock path inner) action (map outputPath (Map.elems (outputs drv)))
+      tryBuild Nothing = runBuilder rootFd store settings trace mode drvPath drv
+      tryBuild (Just currentPool)
+        | mode /= Normal || willBuildLocally settings drv = localBuild
+        | otherwise = withOutputLocks $ bracketOnError (acquireHook settings currentPool)
+            (\hook -> releaseHook currentPool hook >> stopHook hook) $ \hook ->
+            offer currentPool hook
+      offer currentPool hook = do
+        ready <- allOutputsValid store drv
+        if ready then releaseHook currentPool hook else do
+          -- C++ holds the output locks while offering the job to the hook.
+          reply <- requestOffload hook (traceOutput trace) True (platform drv) drvPath
+            (C.words (Map.findWithDefault "" "requiredSystemFeatures" (environment drv)))
+          case reply of
+            HookDecline -> releaseHook currentPool hook >> localBuild
+            HookPostpone -> do
+              -- waitForAWhile: keep the same live hook for the next offer.
+              threadDelay 5000000
+              offer currentPool hook
+            HookAccept -> do
+              -- An accepted hook owns the build.  In particular, a helper
+              -- failure is not a request to retry locally.
+              inputRoots <- Set.toList <$> foldM (derivationInputs store) Set.empty [drv]
+              inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
+              let outputPaths = map outputPath (Map.elems (outputs drv))
+              logPath <- buildLogPath settings store drvPath
+              mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
+              traceStarted trace drvPath (platform drv) logPath (fromIntegral (hookPid hook))
+              acceptOffload hook inputs outputPaths
+              bracket (openLog settings logPath) closeLog $ \logHandle -> do
+                outputLock <- newMVar ()
+                let emit bytes = withMVar outputLock $ \_ -> writeLog logHandle bytes >> traceOutput trace bytes
+                status <- finishOffload hook emit
+                releaseHook currentPool hook
+                valid <- and <$> mapM (isValidPath store) outputPaths
+                case (status, valid) of
+                  (HelperExited 0, True) -> traceSucceeded trace drvPath
+                  _ -> offloadFailed settings store trace drvPath drv status
+  tryBuild pool
+
+acquireHook :: Settings -> HookPool -> IO Hook
+acquireHook settings (state, program) = do
+  existing <- readIORef state
+  case existing of
+    Just hook -> do
+      writeIORef state Nothing
+      pure hook
+    Nothing -> startHelper settings program
+
+releaseHook :: HookPool -> Hook -> IO ()
+releaseHook (state, _) = writeIORef state . Just
+
+willBuildLocally :: Settings -> Derivation -> Bool
+willBuildLocally settings drv =
+  Map.findWithDefault "" "preferLocalBuild" (environment drv) == "1" &&
+    (platform drv == system || (platform drv == "i686-linux" && system == "x86_64-linux") ||
+      (platform drv == "armhf-linux" && system == "aarch64-linux"))
+  where system = setting "system" "x86_64-linux" settings
+
+offloadProgram :: ServerConfig -> IO (Maybe ByteString)
+offloadProgram config = do
+  configured <- getEnv "GUIX"
+  override <- getEnv "GOONIX_OFFLOAD_PROGRAM"
+  pure $ Just $ case override of
+    Just path -> path
+    Nothing -> maybe (configGuixProgram config) id configured
+
+startHelper :: Settings -> ByteString -> IO Hook
+startHelper settings = \program -> startOffloadHook program (setting "system" "x86_64-linux" settings)
+  (settingInt "build-max-silent-time" 3600 settings) (printBuildTrace settings) (settingInt "build-timeout" 86400 settings)
+
+offloadFailed :: Settings -> Store -> BuildTrace -> ByteString -> Derivation -> HelperStatus -> IO a
+offloadFailed settings store trace drvPath drv status = do
+  let statusCode = case status of
+        HelperExited code | code `elem` [100, 101] -> fromIntegral code
+        _ -> 1
+      reason = case status of
+        HelperExited 0 -> "failed to produce all outputs"
+        HelperExited code -> "failed with exit code " ++ show code
+        HelperSignalled signal -> "failed due to signal " ++ show signal
+        HelperAbnormal -> "died abnormally"
+      failure = "offload helper for `" ++ C.unpack drvPath ++ "' " ++ reason
+  case status of
+    HelperExited 101 -> traceFailed trace drvPath "timeout"
+    HelperExited 100 -> traceFailed trace drvPath failure
+    HelperExited 0 -> traceFailed trace drvPath failure
+    _ -> pure ()
+  when (statusCode == 100 && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
+    mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
+  throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " failed: " ++ failure)) statusCode)
+
+derivationInputs :: Store -> Set.Set ByteString -> Derivation -> IO (Set.Set ByteString)
+derivationInputs store seen current = do
+  let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
+        (if "builtin:" `B.isPrefixOf` builder current
+          then inputSrcs current
+          else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
+  dependencies <- mapM readStoreDerivation (filter (`Set.notMember` seen) (Map.keys (inputDrvs current)))
+  let dependencyOutputs = Set.fromList [outputPath output | dependency <- dependencies, output <- Map.elems (outputs dependency)]
+  foldM (derivationInputs store) (Set.union seen (Set.union direct dependencyOutputs)) dependencies
+  where
+    readStoreDerivation path = do
+      bytes <- B.readFile (C.unpack path)
+      either (throwIO . storeError) pure (parseDerivation bytes)
 
 trySubstitute :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO Bool
 trySubstitute config rootFd store settings trace path = do
@@ -212,7 +332,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
   (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
-    then spawnSandboxedBuilder store work drvPath actualDrv command env writeFd
+    then spawnSandboxedBuilder settings store work drvPath actualDrv command env writeFd
     else do
       -- As in builtins.cc, the downloader inherits the daemon's environment.
       inherited <- if isBuiltin then getEnvironment else pure []
@@ -316,14 +436,21 @@ copyTree source destination = do
         B.writeFile (C.unpack destination) bytes
         Files.setFileMode destination (Files.fileMode status)
 
-spawnSandboxedBuilder :: Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
-spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
+spawnSandboxedBuilder :: Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
+spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = do
   helper <- maybe (storeDirectory store <> "/../guix-sandbox") id <$> getEnv "GUIX_SANDBOX"
   root <- makeSandboxRoot store
   mkdirParents (root <> "/tmp")
   Files.setFileMode (root <> "/tmp") 0o1777
   uid <- fromIntegral <$> getRealUserID
   gid <- fromIntegral <$> getRealGroupID
+  network <- fixedOutputNetwork settings drv
+  let (networkFlags, slirpProgram, slirpFilter) = case network of
+        Nothing -> (0, "", [])
+        Just (program, ipv6, isolate) ->
+          (sandboxFlagSlirpNetwork .|. (if ipv6 then sandboxFlagIpv6Network else 0) .|.
+            (if isolate then sandboxFlagIsolateHostLoopback else 0),
+            C.pack program, slirpSeccompFilter nativeArchitecture)
   inputs <- foldM derivationInputs Set.empty [drv]
   let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
@@ -347,7 +474,7 @@ spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
           sandboxFlagUtsNamespace .|. sandboxFlagChroot .|. sandboxFlagProc .|. sandboxFlagDevpts .|.
           sandboxFlagLockMounts .|. sandboxFlagSetSid .|. sandboxFlagCloseFds .|.
           sandboxFlagChdir .|. sandboxFlagStdinFile .|. sandboxFlagClearGroups .|.
-          sandboxFlagNoNewPrivs
+          sandboxFlagNoNewPrivs .|. networkFlags
         , planProgram = program, planArguments = arguments, planEnvironment = environment'
         , planWorkingDirectory = sandboxWork, planStdinFile = "/dev/null"
         , planUid = 30001, planGid = 30000, planStdinFd = maxBound, planLogFd = maxBound
@@ -357,6 +484,7 @@ spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
         , planRoot = root, planStoreDirectory = storeDirectory store, planHostname = "localhost", planDomainname = "(none)"
         , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ devices
         , planSeccomp = []
+        , planSlirpProgram = slirpProgram, planSlirpSeccomp = slirpFilter
         }
       planPath = root <> ".plan"
   mkdirParents (root <> "/etc")
@@ -364,6 +492,18 @@ spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
     "nixbld:x:30001:30000:Nix build user:/:/noshell\nnobody:x:65534:65534:Nobody:/:/noshell\n"
   B.writeFile (C.unpack (root <> "/etc/group")) "nixbld:!:30000:\n"
   B.writeFile (C.unpack (root <> "/etc/hosts")) "127.0.0.1 localhost\n::1 localhost\n"
+  when (isFixedOutput drv) $ do
+    forM_ ["/etc/services", "/etc/nsswitch.conf"] (copyEtcFile root)
+    case network of
+      Nothing -> forM_ ["/etc/hosts", "/etc/resolv.conf"] (copyEtcFile root)
+      Just (_, _, isolate) -> do
+        B.writeFile (C.unpack (root <> "/etc/resolv.conf")) "nameserver 10.0.2.3\n"
+        if isolate
+          then copyEtcFile root "/etc/hosts"
+          else do
+            hosts <- B.readFile "/etc/hosts" `catch` \(_ :: SomeException) -> pure "127.0.0.1 localhost\n::1 localhost\n"
+            B.writeFile (C.unpack (root <> "/etc/hosts"))
+              (replaceBytes "::1" "fd00::2" (replaceBytes "127.0.0.1" "10.0.2.2" hosts))
   B.writeFile (C.unpack planPath) (encodeSandboxPlan plan)
   withCString (C.unpack helper) $ \program' -> withCString (C.unpack planPath) $ \path' -> alloca $ \pidPointer -> do
     result <- c_spawn_sandbox program' path' logFd pidPointer
@@ -383,6 +523,34 @@ spawnSandboxedBuilder store work drvPath drv command env (Fd logFd) = do
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
       either (throwIO . storeError) pure (parseDerivation bytes)
+
+copyEtcFile :: RawFilePath -> RawFilePath -> IO ()
+copyEtcFile root path =
+  (B.readFile (C.unpack path) >>= \contents -> B.writeFile (C.unpack (root <> path)) contents)
+    `catch` \(_ :: SomeException) -> pure ()
+
+fixedOutputNetwork :: Settings -> Derivation -> IO (Maybe (FilePath, Bool, Bool))
+fixedOutputNetwork settings drv
+  | not (isFixedOutput drv) = pure Nothing
+  | otherwise = do
+      configured <- lookupEnv "GUIX_SLIRP4NETNS"
+      program <- case configured of
+        Just path | not (null path) -> pure (Just path)
+        _ -> findExecutable "slirp4netns"
+      tun <- Files.fileExist "/dev/net/tun"
+      case (program, tun) of
+        (Just path, True) -> do
+          ipv6 <- hasGlobalIpv6
+          pure (Just (path, ipv6, settingBool "build-isolate-host-loopback" False settings))
+        _ -> do
+          hPutStrLn stderr "guix-daemon: fixed-output network access disabled (slirp4netns or /dev/net/tun unavailable)"
+          pure Nothing
+  where
+    hasGlobalIpv6 = do
+      contents <- B.readFile "/proc/net/if_inet6" `catch` \(_ :: SomeException) -> pure ""
+      pure (any (\line -> case C.words line of
+        (_:_:_:scope:_) -> scope == "00" || scope == "40"
+        _ -> False) (C.lines contents))
 
 waitForBuilder :: Settings -> Int -> IO ExitCode -> IORef POSIXTime -> IO (ExitCode, Maybe String)
 waitForBuilder settings pid wait lastOutput = do

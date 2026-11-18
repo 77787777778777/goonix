@@ -1,6 +1,8 @@
 /* goonix: descriptor wiring for exec-only helper processes. */
 #define _GNU_SOURCE
 #include <spawn.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -65,6 +67,73 @@ int goonix_spawn_helper(const char *program, const char *argument,
   free(option);
   free(child_environment);
   posix_spawn_file_actions_destroy(&actions);
+  if (result != 0) { errno = result; return -1; }
+  *pid_out = (int)pid;
+  return 0;
+}
+
+int goonix_spawn_offload(const char *program, int input_fd, int output_fd,
+                         int builder_fd, const char *system, const char *silent,
+                         const char *trace, const char *timeout, int *pid_out)
+{
+  /* Do not run C library code between fork and exec in the threaded RTS.
+     posix_spawn performs the descriptor setup and changes directory for us. */
+  posix_spawn_file_actions_t actions;
+  posix_spawnattr_t attributes;
+  int result = posix_spawn_file_actions_init(&actions);
+  if (result != 0) { errno = result; return -1; }
+  if ((result = posix_spawn_file_actions_adddup2(&actions, input_fd, STDIN_FILENO)) != 0 ||
+      (result = posix_spawn_file_actions_adddup2(&actions, output_fd, STDOUT_FILENO)) != 0 ||
+      (result = posix_spawn_file_actions_adddup2(&actions, output_fd, STDERR_FILENO)) != 0 ||
+      (result = posix_spawn_file_actions_adddup2(&actions, builder_fd, 4)) != 0 ||
+      (result = posix_spawn_file_actions_addclose(&actions, input_fd)) != 0 ||
+      (result = posix_spawn_file_actions_addclose(&actions, output_fd)) != 0 ||
+      (result = posix_spawn_file_actions_addclose(&actions, builder_fd)) != 0 ||
+      (result = posix_spawn_file_actions_addchdir_np(&actions, "/")) != 0) {
+    posix_spawn_file_actions_destroy(&actions);
+    errno = result;
+    return -1;
+  }
+  result = posix_spawnattr_init(&attributes);
+  if (result != 0) {
+    posix_spawn_file_actions_destroy(&actions);
+    errno = result;
+    return -1;
+  }
+  if ((result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP)) != 0 ||
+      (result = posix_spawnattr_setpgroup(&attributes, 0)) != 0) {
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    errno = result;
+    return -1;
+  }
+  char *const argv[] = {(char *)program, (char *)"offload", (char *)system,
+    (char *)silent, (char *)trace, (char *)timeout, NULL};
+  pid_t pid;
+  result = posix_spawn(&pid, program, &actions, &attributes, argv, environ);
+  posix_spawnattr_destroy(&attributes);
+  posix_spawn_file_actions_destroy(&actions);
+  if (result != 0) { errno = result; return -1; }
+  *pid_out = (int)pid;
+  return 0;
+}
+
+int goonix_spawn_discover(const char *program, int *pid_out)
+{
+  /* --discover is a fire-and-forget helper started before serving clients. */
+  posix_spawnattr_t attributes;
+  int result = posix_spawnattr_init(&attributes);
+  if (result != 0) { errno = result; return -1; }
+  if ((result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP)) != 0 ||
+      (result = posix_spawnattr_setpgroup(&attributes, 0)) != 0) {
+    posix_spawnattr_destroy(&attributes);
+    errno = result;
+    return -1;
+  }
+  char *const argv[] = {(char *)program, (char *)"discover", NULL};
+  pid_t pid;
+  result = posix_spawn(&pid, program, NULL, &attributes, argv, environ);
+  posix_spawnattr_destroy(&attributes);
   if (result != 0) { errno = result; return -1; }
   *pid_out = (int)pid;
   return 0;

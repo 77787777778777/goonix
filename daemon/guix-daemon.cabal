@@ -32,7 +32,10 @@ library
         Goonix.Store.Files
         Goonix.Store.Writing
         Goonix.Store.Archive
+        Goonix.Store.Collector
         Goonix.Build.Engine
+        Goonix.Build.Offload
+        Goonix.Build.Seccomp
         Goonix.Build.Scheduler
     c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c cbits/logs.c
     extra-libraries: gcrypt sqlite3 z bz2
