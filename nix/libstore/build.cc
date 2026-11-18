@@ -972,6 +972,17 @@ void DerivationGoal::haveDerivation()
                    will actually build/use (matters for resolved outputs). */
                 drv.env[output.first] = output.second.path;
             }
+            /* A check must build at the logical content token, never at the
+               selected final path.  The latter is a valid store item and
+               rewriting or deleting it corrupts the chosen result.  Keep
+               the selected path only for the normal early-exit above. */
+            if (addressingOf(drv) == Addressing::content &&
+                (buildMode != bmNormal || !allRealised))
+                for (auto & output : drv.outputs) {
+                    output.second.path = tokenPath(output.first,
+                        storePathToName(originalDrv.outputs.at(output.first).path));
+                    drv.env[output.first] = output.second.path;
+                }
             if (buildMode == bmNormal && allRealised) {
                 done(BuildResult::AlreadyValid);
                 return;

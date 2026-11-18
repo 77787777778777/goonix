@@ -164,6 +164,16 @@
       (build-derivations store (list b))
       #f)))
 
+(test-assert "--check preserves a self-referencing result and its choice"
+  (let* ((drv (shell-drv "ca-check-self"
+                         "(call-with-output-file out (lambda (p) (display out p)))"))
+         (out (begin (build-derivations store (list drv)) (realised drv))))
+    (build-derivations store (list drv) (build-mode check))
+    (and (string=? out (read-all out))
+         (string=? out (realised drv))
+         (valid-path? store out)
+         (verify-store store #:check-contents? #t #:repair? #f))))
+
 (test-assert "resolved-addressed fallback builds at its final path"
   (let ((drv (shell-drv "ca-resolved" (write-output "resolved")
                         #:addressing 'resolved)))
