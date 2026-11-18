@@ -457,12 +457,14 @@ static void checkReservedFile(const Path & path)
     checkReserved(path, pending);
 }
 
-static void checkReservedTree(const Path & path, unsigned depth = 0)
+static void checkReservedTree(const Path & path, unsigned depth = 0,
+    const string & logicalName = "")
 {
     if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
     struct stat st;
     if (lstat(path.c_str(), &st)) throw SysError(std::format("scanning `{}'", path));
-    checkReserved(path, baseNameOf(path));
+    checkReserved(path, depth == 0 && !logicalName.empty() ?
+        logicalName : baseNameOf(path));
     if (S_ISDIR(st.st_mode)) {
         for (auto & entry : readDirectory(path))
             checkReservedTree(path + "/" + entry.name, depth + 1);
@@ -630,7 +632,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     const std::map<Path, Path> & finalOutputs, const Path & actualTokenPath)
 {
     const Path physical = actualTokenPath.empty() ? token : actualTokenPath;
-    checkReservedTree(physical);
+    checkReservedTree(physical, 0, baseNameOf(token));
     /* goonix: sibling tokens have the same fixed width as final hashes. */
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
@@ -723,12 +725,14 @@ Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
         resolved.env[output.first] = output.second.path;
     }
     resolved.env["goonixResolved"] = "1";
-    const string provisional = unparseDerivation(resolved);
+    resolved.env.erase("goonixResolved");
+    const string pathBytes = unparseDerivation(resolved);
+    resolved.env["goonixResolved"] = "1";
     for (auto & output : resolved.outputs) {
         if (!output.second.hash.empty() ||
             addressingOf(unresolved) != Addressing::resolved) continue;
-        string name = storePathToName(output.second.path);
-        output.second.path = resolvedAddressedPath(output.first, name, provisional);
+        string name = storePathToName(unresolved.outputs.at(output.first).path);
+        output.second.path = resolvedAddressedPath(output.first, name, pathBytes);
     }
     /* Every output's environment entry names its resolved path, not just
        `out'; multi-output derivations must stay consistent. */
