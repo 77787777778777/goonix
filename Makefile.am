@@ -551,6 +551,7 @@ TEST_EXTENSIONS = .scm .sh
 SCM_TESTS =					\
   tests/ca.scm					\
   tests/ca-build.scm				\
+  tests/ca-sharing.scm				\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
   tests/pure-eval.scm				\

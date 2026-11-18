@@ -532,7 +532,8 @@ uint64_t LocalStore::addValidPath(const ValidPathInfo & info, bool checkOutputs)
         // historical output:ID paths.  Validate their shape during resolution.
         if (checkOutputs) {
             bool ca = drv.env.find("goonixAddressing") != drv.env.end();
-            if (ca) {
+            bool resolved = resolvedDerivation(drv);
+            if (ca && !resolved) {
                 for (auto & output : drv.outputs) {
                     if (!isReservedStorePath(output.second.path))
                         throw Error(std::format("unresolved CA output `{}' is not a placeholder",
@@ -541,7 +542,14 @@ uint64_t LocalStore::addValidPath(const ValidPathInfo & info, bool checkOutputs)
                         throw Error(std::format("CA output `{}' disagrees with its environment",
                             output.first));
                 }
-            } else checkDerivationOutputs(info.path, drv);
+            } else if (resolved) {
+                checkResolvedDerivation(drv);
+            } else {
+                checkDerivationOutputs(info.path, drv);
+                // goonix: mixed policy - an input-addressed derivation may
+                // only depend on input-addressed/fixed-output derivations.
+                checkInputAddressedPolicy(*this, drv);
+            }
         }
 
         for (auto & i : drv.outputs) {
@@ -1000,9 +1008,13 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 // derivation in addValidPath().
                 Derivation drv = readDerivation(i.path);
                 // goonix: token/resolved output paths use their own checked format.
-                if (drv.env.find("goonixResolved") == drv.env.end() &&
-                    drv.env.find("goonixAddressing") == drv.env.end())
+                if (resolvedDerivation(drv))
+                    checkResolvedDerivation(drv);
+                else if (drv.env.find("goonixAddressing") == drv.env.end()) {
                     checkDerivationOutputs(i.path, drv);
+                    // goonix: mixed policy, inputs are valid now so we can check.
+                    checkInputAddressedPolicy(*this, drv);
+                }
             }
 
         /* Do a topological sort of the paths.  This will throw an
@@ -1292,6 +1304,9 @@ void LocalStore::recordBuild(const Path & resolvedPath,
     const string & output, const Path & path, const string & origin,
     bool relocationChecked)
 {
+    // goonix: a fact names a real, strict store path, never a token/placeholder.
+    assertStorePathStrict(path);
+    assertNotReserved(path);
     const string payload = unparseDerivation(readDerivation(resolvedPath));
     const string hash = printHash(hashString(htSHA256, payload));
     BuildRecord record{hash, resolvedPath, output, path, origin,
@@ -1306,16 +1321,25 @@ void LocalStore::recordGoonixBuild(const Path & resolvedPath,
 {
     BuildRecord record{resolvedHash, resolvedPath, output, path, origin,
         relocationChecked, signature};
-    const string actual = printHash(hashString(htSHA256,
-        unparseDerivation(readDerivation(resolvedPath))));
-    if (actual != resolvedHash)
-        throw AuthenticationError(
-            "goonix build record does not match resolved derivation content");
+    /* Authenticate first: an unsigned or unauthorized mapping is refused
+       regardless of its other fields (plan 7, NixOS/nix#11393). */
     const string expected = printHash(hashString(htSHA256,
         canonicalBuildRecordPayload(record)));
     if (verifySignature(signature) != expected)
         throw AuthenticationError(
             "goonix build record signature does not match its fields");
+    // goonix: reject malformed or unresolved paths before trusting any field.
+    if (!isStorePathStrict(path) || isReservedStorePath(path))
+        throw AuthenticationError(
+            "goonix build record does not name a valid realised store path");
+    if (!isStorePathStrict(resolvedPath) || !isDerivation(resolvedPath))
+        throw AuthenticationError(
+            "goonix build record does not name a resolved derivation");
+    const string actual = printHash(hashString(htSHA256,
+        unparseDerivation(readDerivation(resolvedPath))));
+    if (actual != resolvedHash)
+        throw AuthenticationError(
+            "goonix build record does not match resolved derivation content");
     goonixRecords->add(record);
 }
 
@@ -1323,6 +1347,88 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildRecords(
     const string & hash, const string & output)
 {
     return goonixRecords->query(hash, output);
+}
+
+std::vector<BuildRecord> LocalStore::queryGoonixRecordsByPath(const Path & path)
+{
+    return goonixRecords->queryByPath(path);
+}
+
+std::vector<BuildRecord> LocalStore::queryGoonixRecordsByResolved(const Path & resolved)
+{
+    return goonixRecords->queryByResolvedDerivation(resolved);
+}
+
+std::vector<RecordConflict> LocalStore::queryGoonixConflicts(
+    const string & hash, const string & output)
+{
+    return goonixRecords->conflicts(hash, output);
+}
+
+PathSet LocalStore::goonixDerivationsForPath(const Path & path)
+{
+    return goonixRecords->derivationsForPath(path);
+}
+
+PathSet LocalStore::goonixOriginalsForPath(const Path & path)
+{
+    return goonixRecords->originalsForPath(path);
+}
+
+PathSet LocalStore::goonixChosenPaths(const Path & unresolved)
+{
+    return goonixRecords->chosenPaths(unresolved);
+}
+
+/* Facts and choices are separate (plan 3.3).  A choice is set by the first
+   successful build or substitution and changed only on purpose.  Here:
+   - a valid existing choice is kept (default `keep-local' policy); a
+     disagreeing record is still stored, which is the reproducibility check;
+   - a collected (invalid) choice is repaired from any valid record;
+   - `adopt' is the explicit `adopt-server' policy and replaces the choice.
+   Returns the path this machine now uses, or "" if none is usable. */
+Path LocalStore::selectGoonixOutput(const Path & unresolved,
+    const string & output, const string & resolvedHash,
+    const Path & preferred, bool adopt)
+{
+    Path current = chosenOutput(unresolved, output);
+    bool currentValid = !current.empty() && isValidPath(current);
+
+    /* Gather candidate facts for this resolved derivation/output. */
+    auto records = goonixRecords->query(resolvedHash, output);
+
+    if (adopt && !preferred.empty() && isValidPath(preferred)) {
+        if (currentValid && current != preferred)
+            printMsg(lvlInfo, std::format(
+                "goonix: adopting `{0}' over local choice `{1}' for output `{2}' of `{3}' (disagreement recorded)",
+                preferred, current, output, unresolved));
+        goonixRecords->rechoose(unresolved, output, preferred);
+        return preferred;
+    }
+
+    if (currentValid) {
+        /* Keep the local choice.  A preferred result that differs is a
+           disagreement; it is already stored as a fact by the caller's
+           record import, so surface it but do not switch. */
+        if (!preferred.empty() && preferred != current && isValidPath(preferred))
+            printMsg(lvlInfo, std::format(
+                "goonix: keeping local choice `{0}' for output `{1}' of `{2}'; server offered `{3}' (disagreement recorded)",
+                current, output, unresolved, preferred));
+        return current;
+    }
+
+    /* No usable choice: prefer the offered path, else the first valid fact. */
+    if (!preferred.empty() && isValidPath(preferred)) {
+        goonixRecords->rechoose(unresolved, output, preferred);
+        return preferred;
+    }
+    for (auto & record : records)
+        if (isValidPath(record.path)) {
+            goonixRecords->rechoose(unresolved, output, record.path);
+            return record.path;
+        }
+    /* Nothing valid: leave any stale choice in place but report none. */
+    return "";
 }
 
 void LocalStore::chooseGoonixOutput(const Path & unresolved,
@@ -1367,10 +1473,16 @@ Path LocalStore::addResolvedDerivation(const string & name,
     const string & contents, const PathSet & references)
 {
     auto parsed = parseDerivationText(contents);
-    for (auto & output : parsed.outputs)
-        if (!isReservedStorePath(output.second.path) &&
-            !isStorePathStrict(output.second.path))
-            throw Error(std::format("invalid resolved output `{}'", output.second.path));
+    // goonix: a stored CA derivation is either unresolved (placeholder
+    // outputs) or fully resolved; validate whichever shape it claims.
+    if (resolvedDerivation(parsed))
+        checkResolvedDerivation(parsed);
+    else {
+        for (auto & output : parsed.outputs)
+            if (!isReservedStorePath(output.second.path) &&
+                !isStorePathStrict(output.second.path))
+                throw Error(std::format("invalid resolved output `{}'", output.second.path));
+    }
     return addTextToStoreNoDerivationOutputs(name, contents, references);
 }
 
@@ -1385,10 +1497,18 @@ Path LocalStore::realisedOutputPath(const Path & drvPath,
         return found->second.path;
     // goonix: the choice belongs to this original derivation, not another D.
     Path path = chosenOutput(drvPath, output);
-    if (path.empty())
+    if (!path.empty() && isValidPath(path))
+        return path;
+    // goonix: a collected choice can be re-realised from a permanent fact.
+    // Resolve against this machine's choices and consult the records for R.
+    Derivation resolved = resolveDerivation(*this, drvPath, drv);
+    const string hash = printHash(hashString(htSHA256,
+        unparseDerivation(resolved)));
+    Path selected = selectGoonixOutput(drvPath, output, hash, "", false);
+    if (selected.empty())
         throw Error(std::format("derivation output `{}' of `{}' is not realised",
             output, drvPath));
-    return path;
+    return selected;
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,

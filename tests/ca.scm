@@ -53,4 +53,35 @@
       (validate-token-path "/gnu/store/00000000000000000000000000000000-hello")
       #f)))
 
+(test-group "build record canonical payload"
+  ;; These literal vectors are shared with the daemon's C++ records-test; the
+  ;; two implementations must agree byte-for-byte (plan CA-0, CA-5).
+  (test-equal "record payload matches the daemon vector"
+    "da6009a94a97ea3c50f7528283ec6cc5f0f8d35ff413e0f5b0b562fa561a5002"
+    (bytevector->base16-string
+     (build-record-content-hash "resolved" "derivation" "out" "path" "origin"
+                                #:relocation-checked? #t)))
+  (test-equal "record payload length matches the daemon vector"
+    104
+    (bytevector-length
+     (canonical-build-record-payload "resolved" "derivation" "out" "path"
+                                     "origin" #:relocation-checked? #t)))
+  (test-assert "record payload is field-framed, not concatenated"
+    (not (equal? (canonical-build-record-payload "resolved" "derivation"
+                                                 "ou" "tpath" "origin")
+                 (canonical-build-record-payload "resolved" "derivation"
+                                                 "out" "path" "origin"))))
+  (test-assert "relocation flag changes the payload"
+    (not (equal? (canonical-build-record-payload "r" "d" "out" "p" "o"
+                                                 #:relocation-checked? #f)
+                 (canonical-build-record-payload "r" "d" "out" "p" "o"
+                                                 #:relocation-checked? #t))))
+  (test-assert "every signed field changes the payload"
+    (let ((base (canonical-build-record-payload "r" "d" "out" "p" "o")))
+      (and (not (equal? base (canonical-build-record-payload "r2" "d" "out" "p" "o")))
+           (not (equal? base (canonical-build-record-payload "r" "d2" "out" "p" "o")))
+           (not (equal? base (canonical-build-record-payload "r" "d" "lib" "p" "o")))
+           (not (equal? base (canonical-build-record-payload "r" "d" "out" "p2" "o")))
+           (not (equal? base (canonical-build-record-payload "r" "d" "out" "p" "o2")))))))
+
 (test-end)
