@@ -18,7 +18,8 @@ CLEANFILES += daemon/src/Goonix/Config.hs guix-daemon
 DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
   -threaded -with-rtsopts=-N \
   -XGHC2024 -XStrictData -i$(top_srcdir)/daemon/src \
-  -i$(top_builddir)/daemon/src
+  -i$(top_builddir)/daemon/src $(LIBGCRYPT_CPPFLAGS) \
+  $(LIBGCRYPT_LDFLAGS) $(LIBGCRYPT_LIBS)
 
 # All Haskell modules are prerequisites through the generated dependency file.
 -include daemon/.depends.mk
@@ -58,9 +59,14 @@ endif !BUILD_HASKELL_DAEMON
 EXTRA_DIST += \
   daemon/cabal.project daemon/guix-daemon.cabal daemon/local.mk \
   daemon/make-config.scm daemon/app/Main.hs \
-  daemon/src/Goonix/Store/Wire.hs daemon/proxy/Main.hs \
+  daemon/src/Goonix/Store/Wire.hs \
+  daemon/src/Goonix/Store/Base32.hs daemon/src/Goonix/Store/Hash.hs \
+  daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
+  daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
+  daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
   daemon/test/wire-proxy/inventory.scm daemon/test/check-build-flags.scm \
+  daemon/test/formats/Main.hs daemon/test/properties/Main.hs \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile \
   daemon/test/sandbox-probe/README.md \
@@ -71,6 +77,7 @@ EXTRA_DIST += \
   daemon/test/vectors/README.md \
   daemon/test/vectors/Generate.hs daemon/test/vectors/dump-nar.cc \
   daemon/test/vectors/hash-nar.cc daemon/test/vectors/inspect-item.cc \
+  daemon/test/vectors/hash-derivations.cc \
   daemon/test/vectors/generate.sh daemon/test/compare-trs.sh \
   daemon/test/RESULTS.md \
   daemon/test/transcripts/README.md \

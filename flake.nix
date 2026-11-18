@@ -42,8 +42,21 @@
             basePackages = nixpkgs.legacyPackages.${system}.haskell.packages.ghc910;
             projectRoot = ./daemon;
             packages.guix-daemon-hs.source = ./daemon;
+            # gcrypt is the C library used by libutil/hash.cc, not Hackage.
+            otherOverlays = [
+              (self: super: { gcrypt = nixpkgs.legacyPackages.${system}.libgcrypt; })
+            ];
+            settings.guix-daemon-hs = {
+              # These suites need the external store vectors and proxy path.
+              # They are run explicitly, not by the package's generic checkPhase.
+              check = false;
+              librarySystemDepends = [ nixpkgs.legacyPackages.${system}.libgcrypt ];
+            };
             autoWire = [ ];
             devShell = {
+              extraLibraries = hp: {
+                gcrypt = nixpkgs.legacyPackages.${system}.libgcrypt;
+              };
               hoogle = false;
               tools = hp: {
                 haskell-language-server = null;

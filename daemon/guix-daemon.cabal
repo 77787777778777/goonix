@@ -14,7 +14,14 @@ library
     import: warnings
     hs-source-dirs: src
     exposed-modules:
+        Goonix.Store.Base32
+        Goonix.Store.Derivation
+        Goonix.Store.Hash
+        Goonix.Store.Nar
+        Goonix.Store.Path
+        Goonix.Store.References
         Goonix.Store.Wire
+    extra-libraries: gcrypt
     build-depends:
         base >=4.20 && <5,
         bytestring >=0.12,
@@ -45,6 +52,30 @@ executable goonix-wire-proxy
         network,
         unix,
         stm >=2.5 && <2.6,
+        guix-daemon-hs
+
+test-suite format-properties
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/properties
+    main-is: Main.hs
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        unix,
+        guix-daemon-hs
+
+test-suite format-vectors
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/formats
+    main-is: Main.hs
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        directory,
         guix-daemon-hs
 
 test-suite wire-proxy

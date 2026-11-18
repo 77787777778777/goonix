@@ -39,7 +39,21 @@ common="-std=c++20 -I$root/../nix -I$root/../nix/libutil"
     "$root/test/vectors/inspect-item.cc" "$root/../nix/libutil/util.cc" \
     "$root/../nix/libutil/affinity.cc"
 
+# Link only the baseline C++ libraries.  This oracle reads copied vector
+# files and does not instantiate a store or connect to a daemon.
+# goonix: globals.cc needs the same configured path macros as libstore.
+common="$common -DNIX_STORE_DIR=\\\"/gnu/store\\\" -DNIX_STATE_DIR=\\\"/var/guix\\\" -DNIX_LOG_DIR=\\\"/var/log/guix\\\" -DGUIX_CONFIGURATION_DIRECTORY=\\\"/etc/guix\\\" -DNIX_BIN_DIR=\\\"/usr/bin\\\""
+"$cxx" $common -I"$root/../nix/libstore" \
+    "$root/test/vectors/hash-derivations.cc" \
+    "$root/../nix/libstore/derivations.cc" "$root/../nix/libstore/globals.cc" \
+    "$root/../nix/libstore/store-api.cc" \
+    "$root/../nix/libutil/hash.cc" "$root/../nix/libutil/serialise.cc" \
+    "$root/../nix/libutil/archive.cc" "$root/../nix/libutil/util.cc" "$root/../nix/libutil/affinity.cc" \
+    -lgcrypt -o "$out/bin/hash-derivations"
+
 "$out/bin/hash-nar" "$store" "$out/nar-hashes.tsv"
+"$out/bin/hash-derivations" "$out/derivations" "$out/derivation-hashes.tsv"
+find "$out/derivations" -maxdepth 1 -type f | sort > "$out/derivation-files"
 "$out/bin/inspect-item" "$store" "$out/sample-candidates.tsv"
 : > "$out/sample-manifest.tsv"
 sample_bytes=0
@@ -91,7 +105,9 @@ done
     printf 'store=%s\n' "$store"
     printf 'derivations=%s\n' "$(find "$out/derivations" -type f | wc -l)"
     printf 'hashed-items=%s\n' "$(wc -l < "$out/nar-hashes.tsv")"
+    printf 'modulo-hashes=%s\n' "$(wc -l < "$out/derivation-hashes.tsv")"
     printf 'sample-items=%s\n' "$sample_count"
     printf 'sample-cap=%s\n' "$sample_cap"
 } > "$out/manifest"
 (cd "$out" && find derivations nar -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+(cd "$out" && sha256sum derivation-hashes.tsv >> SHA256SUMS)
