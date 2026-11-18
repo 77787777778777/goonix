@@ -235,9 +235,14 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       forM_ sandboxRoot $ \root -> do
         Files.setFileMode root 0o755
         deleteTree root
-      if mode == Check
+      registration <- try $ if mode == Check
         then checkBuiltOutputs store drvPath replacements (keepFailed settings)
         else registerBuiltOutputs store drvPath drv
+      case registration of
+        Left (exception :: SomeException) -> do
+          forM_ redirected $ \path -> deleteTree path
+          buildFailed work (Just (show exception))
+        Right () -> pure ()
       removeBuildDirectory work
       traceSucceeded trace drvPath
     _ -> do
