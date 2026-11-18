@@ -67,15 +67,20 @@
            (pair? (flake-outputs-expression flake))))))
 
 (test-assert "a reader extension in flake.scm is refused"
+  ;; The code after #. leaves a file behind if the reader runs it; that the
+  ;; read fails is not enough, since running the code would fail it too.
   (let* ((directory (mkdtemp "/tmp/goonix-flake-read.XXXXXX"))
-         (file (string-append directory "/flake.scm")))
+         (file (string-append directory "/flake.scm"))
+         (trace (string-append directory "/executed")))
     (call-with-output-file file
       (lambda (port)
-        (display "(flake (format 1) (description #.(begin (error \"executed\") \"x\")))"
-                 port)))
-    (guard (condition (#t #t))
-      (read-flake file)
-      #f)))
+        (format port "(flake (format 1) (description #.(begin \
+(call-with-output-file ~s (lambda (port) (display 1 port))) \"x\")))"
+                trace)))
+    (and (guard (condition (#t #t))
+           (read-flake file)
+           #f)
+         (not (file-exists? trace)))))
 
 (test-assert "flake.lock round-trips as validated data"
   (let* ((directory (mkdtemp "/tmp/goonix-lock-data.XXXXXX"))
@@ -376,7 +381,7 @@
       '((add "value.txt" "old") (commit "old"))
     (let ((old (first-commit child)))
       (with-git-repository child '((add "value.txt" "new") (commit "new"))
-        (let ((new (first-commit child)))
+        (let ((new (invoke-git child "rev-parse" "HEAD")))
           (call-with-temporary-directory
            (lambda (root)
              (define (make-parent name commit)
@@ -419,6 +424,7 @@
                                      (equal? '(b c) (locked-input-identity input)))
                                    (flake-lock-inputs lock-data))))
                    (and a/c b/c
+                        (not (string=? old new))
                         (string=? old (locked-input-commit a/c))
                         (string=? new (locked-input-commit b/c))
                         (not (eq? a/c b/c))
