@@ -6,6 +6,8 @@
 #include <iostream>
 #include <format>
 
+#include <sys/stat.h>
+
 using namespace nix;
 
 static unsigned failures = 0;
@@ -85,8 +87,40 @@ static void checkOutputPathValidation(const Path & root)
     check(!accepted, "placeholder output path is bound to the unresolved derivation");
 }
 
+static void checkSymlinkModes(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    chmod(settings.nixStore.c_str(), 0755);
+    Path output = tokenPath("out", "symlink-output");
+    createSymlink(output, output);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, output, "out", "symlink-output",
+        PathSet{output}, references, narHash, narSize);
+    struct stat st;
+    if (stat(settings.nixStore.c_str(), &st))
+        throw SysError("reading isolated store mode");
+    check((st.st_mode & 07777) == 0755, "top-level symlink preserves store mode");
+    Path directory = tokenPath("out", "symlink-directory");
+    createDirs(directory);
+    chmod(directory.c_str(), 0755);
+    createSymlink(directory, directory + "/self");
+    references.clear();
+    final = finaliseContentOutput(store, directory, "out", "symlink-directory",
+        PathSet{directory}, references, narHash, narSize);
+    if (stat(final.c_str(), &st)) throw SysError("reading final directory mode");
+    check((st.st_mode & 07777) == 0755, "nested symlink preserves parent mode");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--symlink-modes") {
+        checkSymlinkModes(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--path-validation") {
         checkOutputPathValidation(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

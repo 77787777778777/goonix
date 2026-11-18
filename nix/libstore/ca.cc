@@ -423,13 +423,25 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         string target = replaceWhole(readLink(path), from, to, path);
         if (target != readLink(path)) {
             Path parent = dirOf(path);
-            chmod(parent.c_str(), 0700);
-            Path replacement = path + ".goonix-new-link";
-            unlink(replacement.c_str());
-            createSymlink(target, replacement);
-            if (rename(replacement.c_str(), path.c_str()))
-                throw SysError(std::format("replacing symlink `{}'", path));
-            chmod(parent.c_str(), st.st_mode);
+            struct stat parentStat;
+            if (stat(parent.c_str(), &parentStat))
+                throw SysError(std::format("reading parent of `{}'", path));
+            if (chmod(parent.c_str(), 0700))
+                throw SysError(std::format("making parent of `{}' writable", path));
+            /* goonix: restore the parent's mode, never the symlink's 0777. */
+            try {
+                Path replacement = path + ".goonix-new-link";
+                if (pathExists(replacement))
+                    throw BuildError(std::format("CA temporary symlink `{0}' already exists", replacement));
+                createSymlink(target, replacement);
+                if (rename(replacement.c_str(), path.c_str()))
+                    throw SysError(std::format("replacing symlink `{}'", path));
+                if (chmod(parent.c_str(), parentStat.st_mode & 07777))
+                    throw SysError(std::format("restoring parent mode of `{}'", path));
+            } catch (...) {
+                chmod(parent.c_str(), parentStat.st_mode & 07777);
+                throw;
+            }
         }
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
 }
