@@ -132,6 +132,7 @@ struct Plan {
     gid_t gidMapInside = 0;
     gid_t gidMapOutside = 0;
     Bytes root;
+    Bytes storeDirectory;
     Bytes hostname = "localhost";
     Bytes domainname = "(none)";
     std::vector<std::tuple<Bytes, Bytes, bool>> mounts;
@@ -383,6 +384,7 @@ Plan parseFields(const Bytes & input)
     plan.gidMapOutside = gid_t(reader.u32());
     if (plan.extended) {
         plan.root = reader.string();
+        plan.storeDirectory = reader.string();
         plan.hostname = reader.string();
         plan.domainname = reader.string();
         if (plan.root.empty() || plan.root.front() != '/')
@@ -508,8 +510,11 @@ void enterSandbox(Plan & plan)
     if (sethostname(plan.hostname.c_str(), plan.hostname.size()) == -1 ||
         setdomainname(plan.domainname.c_str(), plan.domainname.size()) == -1)
         sysError("setting sandbox hostname");
-    if (mount(nullptr, plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1)
+    if (mount(plan.root.c_str(), plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1)
         sysError("making sandbox root a mount point");
+    mkdirParents(plan.root + plan.storeDirectory);
+    if (chmod((plan.root + plan.storeDirectory).c_str(), 01777) == -1)
+        sysError("making sandbox store writable");
     for (const auto & [source, target, readOnly] : plan.mounts)
         mountIntoSandbox(plan, source, target, readOnly);
     if (plan.has(procFlag)) {

@@ -28,7 +28,6 @@ module Goonix.Build.Sandbox
   , sandboxFlagLockMounts
   ) where
 
-import Data.Bits ((.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.Word (Word32, Word64)
@@ -57,6 +56,7 @@ data SandboxPlan = SandboxPlan
   , planGidMapInside :: !Word32
   , planGidMapOutside :: !Word32
   , planRoot :: !ByteString
+  , planStoreDirectory :: !ByteString
   , planHostname :: !ByteString
   , planDomainname :: !ByteString
   , planMounts :: ![BindMount]
@@ -104,7 +104,7 @@ encodeSandboxPlan plan = B.concat
   , list u32 (planCloseFds plan)
   , u32 (planUidMapInside plan), u32 (planUidMapOutside plan)
   , u32 (planGidMapInside plan), u32 (planGidMapOutside plan)
-  , string (planRoot plan), string (planHostname plan), string (planDomainname plan)
+  , string (planRoot plan), string (planStoreDirectory plan), string (planHostname plan), string (planDomainname plan)
   , list mount (planMounts plan)
   , list seccomp (planSeccomp plan)
   ]

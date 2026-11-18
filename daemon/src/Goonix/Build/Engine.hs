@@ -43,7 +43,6 @@ import System.Exit (ExitCode (ExitSuccess))
 import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited))
-import System.Environment (lookupEnv)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
 import System.Posix.User (getRealGroupID, getRealUserID)
 import System.FilePath (takeDirectory)
@@ -193,13 +192,13 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   let command = if "builtin:" `B.isPrefixOf` builder drv
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs drv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (childPid, wait) <- if settingBool "build-use-sandbox" True settings
+  (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings
     then spawnSandboxedBuilder store work actualDrv command env writeFd
     else do
       (_, _, _, process) <- createProcess command
         { cwd = Just (C.unpack work), env = Just env, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
       pid <- maybe 0 fromIntegral <$> getPid process
-      pure (pid, waitForProcess process)
+      pure (pid, waitForProcess process, Nothing, [])
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
   drained <- newEmptyMVar
@@ -210,6 +209,16 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   hClose logHandle
   case status of
     ExitSuccess -> do
+      forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
+        let produced = root <> path
+        exists <- Files.fileExist produced
+        unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
+        deleteTree path
+        makeParentsWritable root path
+        copyTree produced path
+      forM_ sandboxRoot $ \root -> do
+        Files.setFileMode root 0o755
+        deleteTree root
       if mode == Check
         then checkBuiltOutputs store drvPath replacements (keepFailed settings)
         else registerBuiltOutputs store drvPath drv
@@ -227,23 +236,44 @@ runBuilder rootFd store settings trace mode drvPath drv = do
 foreign import ccall unsafe "goonix_spawn_sandbox"
   c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
 
-spawnSandboxedBuilder :: Store -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode)
+makeParentsWritable :: RawFilePath -> RawFilePath -> IO ()
+makeParentsWritable root path = go (C.split '/' path) root
+  where
+    go [] _ = pure ()
+    go [_] _ = pure ()
+    go (component:rest) parent = do
+      let directory = parent <> "/" <> component
+      Files.setFileMode directory 0o755
+      go rest directory
+
+copyTree :: RawFilePath -> RawFilePath -> IO ()
+copyTree source destination = do
+  status <- Files.getSymbolicLinkStatus source
+  if Files.isSymbolicLink status
+    then Files.readSymbolicLink source >>= Files.createSymbolicLink destination
+    else if Files.isDirectory status
+      then do
+        Dir.createDirectory destination 0o755
+        entries <- directoryEntries source
+        forM_ entries $ \entry -> copyTree (source <> "/" <> entry) (destination <> "/" <> entry)
+        Files.setFileMode destination (Files.fileMode status)
+      else do
+        bytes <- B.readFile (C.unpack source)
+        B.writeFile (C.unpack destination) bytes
+        Files.setFileMode destination (Files.fileMode status)
+
+spawnSandboxedBuilder :: Store -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
 spawnSandboxedBuilder store work drv command env (Fd logFd) = do
   helper <- maybe (storeDirectory store <> "/../guix-sandbox") id <$> getEnv "GUIX_SANDBOX"
   root <- makeSandboxRoot store
+  mkdirParents (work <> "/sandbox-tmp")
+  Files.setFileMode (work <> "/sandbox-tmp") 0o1777
   uid <- fromIntegral <$> getRealUserID
   gid <- fromIntegral <$> getRealGroupID
   inputs <- foldM derivationInputs Set.empty [drv]
-  let directOutputs = Set.fromList (map outputPath (Map.elems (outputs drv)))
-      writableInputs = Set.fromList [work, storeDirectory store]
-  forM_ (Map.elems (outputs drv)) $ \output -> do
-    let path = outputPath output
-    deleteTree path
-    if outputHashAlgo output `elem` ["r:sha256", "r:sha1", "r:sha512", "r:md5"]
-      then Dir.createDirectory path 0o755
-      else B.writeFile (C.unpack path) B.empty
+  let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
-  let sandboxWork = "/tmp/goonix-build"
+  let sandboxWork = "/build"
       program = case cmdspec command of
         RawCommand executable _ -> C.pack executable
         ShellCommand _ -> throwIO (storeError "shell builders are not supported") `seq` B.empty
@@ -254,9 +284,8 @@ spawnSandboxedBuilder store work drv command env (Fd logFd) = do
       replaceWork path = if work `B.isPrefixOf` path then sandboxWork <> B.drop (B.length work) path else path
       environment' = map (\(name, value) -> (name, replaceWork value)) (Map.toList (Map.fromList environment))
       mountInputs = [BindMount path path (not (Set.member path writableInputs)) | path <- Set.toList closure]
-      mountOutputs = [BindMount (storeDirectory store) (storeDirectory store) True] ++
-        [BindMount path path False | path <- Set.toList directOutputs, path `Set.notMember` closure]
-      mountWork = [BindMount work sandboxWork False]
+      mountOutputs = []
+      mountWork = [BindMount work sandboxWork False, BindMount (work <> "/sandbox-tmp") "/tmp" False]
       devices = [BindMount path path False | path <- ["/dev/null", "/dev/full", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"]]
       plan = SandboxPlan
         { planFlags = sandboxFlagUserNamespace .|. sandboxFlagMountNamespace .|.
@@ -271,11 +300,12 @@ spawnSandboxedBuilder store work drv command env (Fd logFd) = do
         , planGroups = [], planCloseFds = []
         , planUidMapInside = 30001, planUidMapOutside = uid
         , planGidMapInside = 30000, planGidMapOutside = gid
-        , planRoot = root, planHostname = "localhost", planDomainname = "(none)"
+        , planRoot = root, planStoreDirectory = storeDirectory store, planHostname = "localhost", planDomainname = "(none)"
         , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ devices
         , planSeccomp = []
         }
       planPath = root <> ".plan"
+  mkdirParents (root <> "/build")
   mkdirParents (root <> "/etc")
   B.writeFile (C.unpack (root <> "/etc/passwd"))
     "nixbld:x:30001:30000:Nix build user:/:/noshell\nnobody:x:65534:65534:Nobody:/:/noshell\n"
@@ -286,13 +316,14 @@ spawnSandboxedBuilder store work drv command env (Fd logFd) = do
     result <- c_spawn_sandbox program' path' logFd pidPointer
     if result < 0 then throwIO (storeError "cannot spawn sandbox helper") else do
       pid <- fromIntegral <$> peek pidPointer
-      pure (pid, waitForSandbox pid)
+      pure (pid, waitForSandbox pid, Just root, map outputPath (Map.elems (outputs drv)))
   where
     derivationInputs seen current
-      | Set.member (builder current) seen = pure seen
       | otherwise = do
-          let direct = Set.insert (builder current) (inputSrcs current)
-          foldM derivationInputs direct =<< mapM readStoreDerivation (Map.keys (inputDrvs current))
+          let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path)) (Set.insert (builder current) (inputSrcs current))
+          dependencies <- mapM readStoreDerivation (filter (`Set.notMember` seen) (Map.keys (inputDrvs current)))
+          let dependencyOutputs = Set.fromList [outputPath output | dependency <- dependencies, output <- Map.elems (outputs dependency)]
+          foldM derivationInputs (Set.union seen (Set.union direct dependencyOutputs)) dependencies
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
       either (throwIO . storeError) pure (parseDerivation bytes)
