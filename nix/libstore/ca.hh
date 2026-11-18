@@ -41,6 +41,9 @@ void checkInputAddressedPolicy(class LocalStore & store, const Derivation & drv)
    or strict final paths (resolved/fixed), environment agrees. */
 void checkResolvedDerivation(const Derivation & drv);
 void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv);
+std::vector<std::pair<string, Path>> contentOutputOrder(
+    const Derivation & drv, const PathSet & allPaths,
+    const Path & chrootRootDir = "");
 
 /* Resolve every original derivation/output through daemon-owned choices.
    The resulting derivation contains only realised paths and self tokens. */

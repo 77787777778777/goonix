@@ -3288,10 +3288,19 @@ void DerivationGoal::registerOutputs()
     // goonix: sibling tokens become their final output paths before naming.
     std::map<Path, Path> goonixFinalOutputs;
 
+    auto goonixOutputOrder = addressingOf(drv) == Addressing::content &&
+        resolvedDerivation(drv)
+        ? contentOutputOrder(drv, allPaths, useChroot ? chrootRootDir : "")
+        : std::vector<std::pair<string, Path>>{};
+    if (goonixOutputOrder.empty())
+        for (auto & output : drv.outputs)
+            goonixOutputOrder.push_back({output.first, output.second.path});
+
     /* Check whether the output paths were created, and grep each
        output path to determine what other paths it references.  Also make all
        output paths read-only. */
-    for (auto& i : drv.outputs) {
+    for (auto& ordered : goonixOutputOrder) {
+        auto & i = *drv.outputs.find(ordered.first);
         Path path = i.second.path;
         if (missingPaths.find(path) == missingPaths.end()) continue;
 

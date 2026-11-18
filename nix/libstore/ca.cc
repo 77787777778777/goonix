@@ -9,6 +9,8 @@
 #include <cstring>
 #include <format>
 #include <map>
+#include <set>
+#include <functional>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -190,8 +192,37 @@ void checkResolvedDerivation(const Derivation & drv)
     for (auto & entry : drv.env) scan(entry.second);
 }
 
-/* goonix: derive every output path from the derivation, never from a client's
-   choice of a syntactically valid store path. */
+/* Return content outputs in dependency order: an output that refers to a
+   sibling's token is finalised after that sibling.  Cycles are refused. */
+std::vector<std::pair<string, Path>> contentOutputOrder(
+    const Derivation & drv, const PathSet & allPaths,
+    const Path & chrootRootDir)
+{
+    std::vector<std::pair<string, Path>> result;
+    std::map<Path, string> outputs;
+    for (auto & output : drv.outputs)
+        outputs[output.second.path] = output.first;
+    std::set<Path> visiting, done;
+    std::function<void(const Path &)> visit = [&](const Path & path) {
+        if (done.count(path)) return;
+        if (!visiting.insert(path).second)
+            throw BuildError("cycle between content-addressed sibling outputs");
+        Path physical = chrootRootDir + path;
+        HashResult ignored;
+        PathSet references = scanForReferences(physical, allPaths, ignored);
+        for (auto & sibling : outputs) {
+            if (sibling.first == path) continue;
+            if (references.count(sibling.first))
+                visit(sibling.first);
+        }
+        visiting.erase(path);
+        done.insert(path);
+        result.push_back({outputs.at(path), path});
+    };
+    for (auto & output : drv.outputs) visit(output.second.path);
+    return result;
+}
+
 void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
 {
     string name = storePathToName(drvPath);

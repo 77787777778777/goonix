@@ -289,8 +289,29 @@ static void checkStagedToken(const Path & root)
         "staged symlink is rewritten against the logical token");
 }
 
+static void checkSiblingOrder(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Derivation drv;
+    drv.outputs["lib"] = DerivationOutput(tokenPath("lib", "multi-lib"), "", "");
+    drv.outputs["out"] = DerivationOutput(tokenPath("out", "multi-out"), "", "");
+    Path out = drv.outputs["out"].path;
+    createDirs(out);
+    writeFile(out + "/uses-lib", drv.outputs["lib"].path);
+    createDirs(drv.outputs["lib"].path);
+    auto order = contentOutputOrder(drv, PathSet{out, drv.outputs["lib"].path});
+    check(order.size() == 2 && order.front().first == "lib",
+        "referenced sibling is finalised before its dependent");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--sibling-order") {
+        checkSiblingOrder(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--staged") {
         checkStagedToken(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

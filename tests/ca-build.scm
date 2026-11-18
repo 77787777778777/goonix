@@ -187,12 +187,26 @@
                         #:addressing 'resolved #:env-vars '(("v" . "one"))))
          (two (shell-drv "ca-resolved-cutoff" (write-output "same")
                         #:addressing 'resolved #:env-vars '(("v" . "two"))))
-         (first (begin (build-derivations store (list one))
-                       (realised one)))
-         (second (begin (build-derivations store (list two))
-                        (realised two))))
-    (and (string=? first second)
-         (string=? "same" (read-all first)))))
+         (one-resolved (begin (build-derivations store (list one))
+                              (path-info-deriver
+                               (query-path-info store (realised one)))))
+         (two-resolved (begin (build-derivations store (list two))
+                              (path-info-deriver
+                               (query-path-info store (realised two))))))
+    ;; An unused environment entry is retained in R, so these are two
+    ;; different resolved derivations.  This assertion guards against
+    ;; accidentally identifying them; identical R cutoff is tested below.
+    (and (not (string=? one-resolved two-resolved))
+         (string=? "same" (read-all (realised one)))
+         (string=? "same" (read-all (realised two))))))
+
+(test-assert "identical resolved derivations have one resolved-addressed path"
+  (let ((one (shell-drv "ca-resolved-same" (write-output "same")
+                        #:addressing 'resolved))
+        (two (shell-drv "ca-resolved-same" (write-output "same")
+                        #:addressing 'resolved)))
+    (build-derivations store (list one two))
+    (string=? (realised one) (realised two))))
 
 (close-connection store)
 (test-end)
