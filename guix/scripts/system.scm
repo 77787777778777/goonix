@@ -1279,33 +1279,35 @@ resulting from command-line parsing."
              file-or-exp))
     obj)
 
-  (define file (match args
-                 ((file . _) file)
-                 (() (leave (G_ "no configuration specified~%")))))
-  (define system (assoc-ref opts 'system))
-  (define target (assoc-ref opts 'target))
-
   (define save-provenance?
     (or (assoc-ref opts 'save-provenance?)
         (memq action '(init reconfigure))))
 
-  (when (and (assoc-ref opts 'pure-eval?)
-             (memq action '(reconfigure init)))
-    (leave (G_ "--pure-eval is not supported for host-changing actions~%")))
-
+  ;; goonix: with --pure-eval the file is evaluated in a container and only
+  ;; a derivation comes back, so only 'build' can be carried out.
   (if (assoc-ref opts 'pure-eval?)
-      (with-store store
-        (set-build-options-from-command-line store opts)
-        (match (load-file-purely store file #:kind 'system
-                                 #:system system #:target target)
-          ((drv output)
-           (if (assoc-ref opts 'derivations-only?)
-               (display (string-append drv "\n"))
-               (begin
-                 (build-derivations store (list (read-derivation-from-file drv)))
-                 (when (assoc-ref opts 'gc-root)
-                   (register-root store (list output) (assoc-ref opts 'gc-root)))
-                 (display (string-append output "\n")))))))
+      (let ((file (match args
+                    ((file . _) file)
+                    (() (leave (G_ "--pure-eval needs a configuration file~%"))))))
+        (unless (eq? action 'build)
+          (leave (G_ "--pure-eval supports only the 'build' action~%")))
+        (when (assoc-ref opts 'expression)
+          (leave (G_ "--pure-eval cannot be combined with --expression~%")))
+        (with-store store
+          (set-build-options-from-command-line store opts)
+          (match (load-file-purely store file #:kind 'system
+                                   #:system (assoc-ref opts 'system)
+                                   #:target (assoc-ref opts 'target))
+            ((drv output)
+             (if (assoc-ref opts 'derivations-only?)
+                 (display (string-append drv "\n"))
+                 (begin
+                   (build-derivations store
+                                      (list (read-derivation-from-file drv)))
+                   (when (assoc-ref opts 'gc-root)
+                     (register-root store (list output)
+                                    (assoc-ref opts 'gc-root)))
+                   (display (string-append output "\n"))))))))
       (let* ((file        (match args
                         (() #f)
                         ((x . _) x)))

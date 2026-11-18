@@ -684,6 +684,7 @@ endif
 SH_TESTS =					\
   build-aux/check-goonix-hooks.sh		\
   tests/guix-pure-eval.sh			\
+  tests/guix-goonix-defaults.sh		\
   tests/guix-build.sh				\
   tests/guix-build-branch.sh			\
   tests/guix-download.sh			\
