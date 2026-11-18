@@ -125,8 +125,9 @@ appendTempRoot (Fd fd) path = do
 
 deduplicateTree :: RawFilePath -> RawFilePath -> IO ()
 deduplicateTree store path = do
-  mkdirParents (store <> "/.links")
-  walk path
+  unless (store == path) $ do
+    mkdirParents (store <> "/.links")
+    walk path
   where
     walk p = do
       status <- Files.getSymbolicLinkStatus p

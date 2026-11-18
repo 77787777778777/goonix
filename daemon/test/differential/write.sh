@@ -6,8 +6,8 @@ if test -e "$out"; then chmod -R u+rwX "$out" 2>/dev/null || true; rm -rf "$out"
 mkdir -p "$out"
 probe=$root/daemon/test/differential/write-probe.scm
 archive_probe=$root/daemon/test/differential/archive-probe.scm
-cxx=$root/guix-daemon
-hs=$root/guix-daemon
+cxx=${GOONIX_CXX_DAEMON:-$root/hs0-cxx-daemon}
+hs=${GOONIX_HS_DAEMON:-$root/guix-daemon}
 run_one() {
   name=$1; daemon=$2; fixture=$out/$name
   "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
