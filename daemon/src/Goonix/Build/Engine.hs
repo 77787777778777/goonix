@@ -180,7 +180,8 @@ allOutputsValid store drv = and <$> mapM (isValidPath store . outputPath) (Map.e
 
 runBuilder :: Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> Derivation -> IO ()
 runBuilder rootFd store settings trace mode drvPath drv = do
-  let outPaths = map outputPath (Map.elems (outputs drv))
+  let isBuiltin = "builtin:" `B.isPrefixOf` builder drv
+      outPaths = map outputPath (Map.elems (outputs drv))
       redirected = if mode == Check then map (redirectOutput store drvPath) outPaths else outPaths
       replacements = zip outPaths redirected
       actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
@@ -199,11 +200,14 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   let command = if "builtin:" `B.isPrefixOf` builder drv
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs drv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings
+  (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
     then spawnSandboxedBuilder store work drvPath actualDrv command env writeFd
     else do
+      -- As in builtins.cc, the downloader inherits the daemon's environment.
+      inherited <- if isBuiltin then getEnvironment else pure []
+      let childEnvironment = if isBuiltin then inherited else env
       (_, _, _, process) <- createProcess command
-        { cwd = Just (C.unpack work), env = Just env, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
+        { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
       pid <- maybe 0 fromIntegral <$> getPid process
       pure (pid, waitForProcess process, Nothing, [])
   traceStarted trace drvPath (platform drv) logPath childPid
@@ -231,13 +235,14 @@ runBuilder rootFd store settings trace mode drvPath drv = do
         else registerBuiltOutputs store drvPath drv
       removeBuildDirectory work
       traceSucceeded trace drvPath
-    _ -> buildFailed work
-  where
-    buildFailed work = do
-      traceFailed trace drvPath "builder failed"
+    _ -> do
       forM_ sandboxRoot $ \root -> do
         Files.setFileMode root 0o755
         deleteTree root
+      buildFailed work
+  where
+    buildFailed work = do
+      traceFailed trace drvPath "builder failed"
       when (mode == Normal && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
         mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
       if keepFailed settings

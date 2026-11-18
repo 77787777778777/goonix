@@ -158,21 +158,27 @@ mkdirParents path = withCStringBytes path $ \path' -> checkIO "cannot create dir
 
 deleteTree :: RawFilePath -> IO ()
 deleteTree path = do
-  exists <- Files.fileExist path
-  when exists $ do
-    status <- Files.getSymbolicLinkStatus path
-    if Files.isDirectory status && not (Files.isSymbolicLink status)
-      then do
-        Files.setFileMode path 0o755
-        entries <- directoryEntries path
-        forM_ entries $ \entry -> deleteTree (path <> "/" <> entry)
-        Dir.removeDirectory path
-      else do
-        let directory = parent path
-        parentStatus <- Files.getSymbolicLinkStatus directory
-        Files.setFileMode directory 0o755
-        (unless (Files.isSymbolicLink status) (Files.setFileMode path 0o644) >> Files.removeLink path)
-          `finally` Files.setFileMode directory (Files.fileMode parentStatus)
+  -- Use lstat, not fileExist: a symlink to another store path is dangling
+  -- outside the private sandbox root, but its directory entry still needs
+  -- to be removed.
+  result <- try (Files.getSymbolicLinkStatus path)
+  case result of
+    Left error' | isDoesNotExistError error' -> pure ()
+                | otherwise -> throwIO (error' :: IOException)
+    Right status -> remove status
+  where
+    remove status
+      | Files.isDirectory status = do
+          Files.setFileMode path 0o755
+          entries <- directoryEntries path
+          forM_ entries $ \entry -> deleteTree (path <> "/" <> entry)
+          Dir.removeDirectory path
+      | otherwise = do
+          let directory = parent path
+          parentStatus <- Files.getSymbolicLinkStatus directory
+          Files.setFileMode directory 0o755
+          (unless (Files.isSymbolicLink status) (Files.setFileMode path 0o644) >> Files.removeLink path)
+            `finally` Files.setFileMode directory (Files.fileMode parentStatus)
 
 directoryEntries :: RawFilePath -> IO [RawFilePath]
 directoryEntries path = bracket (Dir.openDirStream path) Dir.closeDirStream $ \stream -> do
