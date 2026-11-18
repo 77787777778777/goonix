@@ -93,7 +93,7 @@ buildDerivation config rootFd store settings trace mode drvPath = do
   unless valid $ throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' is not valid"))
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
-  forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace mode input
+  forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace Normal input
   forM_ (Set.toList (inputSrcs drv)) $ \input -> do
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
@@ -180,7 +180,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
   drained <- newEmptyMVar
-  _ <- forkIO $ copyLog childPid (settingInt "multiplexed-build-output" 0 settings /= 0) readHandle logHandle trace `finally` putMVar drained ()
+  _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace `finally` putMVar drained ()
   status <- waitForProcess process
   takeMVar drained
   hClose readHandle
