@@ -324,7 +324,7 @@ Path resolvedAddressedPath(const string & output, const string & name,
 }
 
 static string replaceWhole(string input, const string & from, const string & to,
-    const string & file)
+    const string & file, bool rejectOpaque = true)
 {
     if (from.size() != to.size()) throw Error("internal CA token length mismatch");
     size_t at = 0;
@@ -332,6 +332,7 @@ static string replaceWhole(string input, const string & from, const string & to,
         input.replace(at, from.size(), to);
         at += to.size();
     }
+    if (!rejectOpaque) return input;
     /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable.
        Name the file and the byte offset of the offending fragment (plan 4.2). */
     for (size_t i = 0; i + 8 <= from.size(); ++i) {
@@ -383,6 +384,13 @@ static void rewriteRegularFile(const Path & path, const string & from,
         pending.append((const char *) buffer.data(), n);
         size_t keep = from.size() - 1;
         size_t process = pending.size() > keep ? pending.size() - keep : 0;
+        /* A prefix of FROM at the end is a potential whole match crossing
+           the next read, not an opaque fragment at this boundary. */
+        for (size_t length = std::min(process, from.size() - 1); length > 0; --length)
+            if (pending.compare(process - length, length, from, 0, length) == 0) {
+                process -= length;
+                break;
+            }
         string rewritten = replaceWhole(pending.substr(0, process), from, to, path);
         writeFull(outputFD, rewritten);
         pending.erase(0, process);
@@ -455,17 +463,30 @@ static void rewriteTree(const Path & path, const string & from, const string & t
     struct stat st;
     if (lstat(path.c_str(), &st)) throw SysError(std::format("reading `{}' for CA rewrite", path));
     if (S_ISDIR(st.st_mode)) {
-        auto entries = readDirectory(path);
-        for (auto & entry : entries)
-            rewriteTree(path + "/" + entry.name, from, to, depth + 1);
-        for (auto & entry : entries) {
-            auto name = replaceWhole(entry.name, from, to, path + "/" + entry.name);
-            if (name != entry.name) {
-                if (name.empty() || name == "." || name == ".." || name.find('/') != string::npos)
-                    throw BuildError(std::format("invalid CA file name in `{}'", path));
-                if (rename((path + "/" + entry.name).c_str(), (path + "/" + name).c_str()))
-                    throw SysError(std::format("renaming `{}' for CA", path + "/" + entry.name));
+        mode_t originalMode = st.st_mode & 07777;
+        if (chmod(path.c_str(), 0700))
+            throw SysError(std::format("making CA directory `{}' writable", path));
+        try {
+            auto entries = readDirectory(path);
+            for (auto & entry : entries)
+                rewriteTree(path + "/" + entry.name, from, to, depth + 1);
+            for (auto & entry : entries) {
+                auto name = replaceWhole(entry.name, from, to, path + "/" + entry.name);
+                if (name != entry.name) {
+                    if (name.empty() || name == "." || name == ".." || name.find('/') != string::npos)
+                        throw BuildError(std::format("invalid CA file name in `{}'", path));
+                    if (rename((path + "/" + entry.name).c_str(), (path + "/" + name).c_str()))
+                        throw SysError(std::format("renaming `{}' for CA", path + "/" + entry.name));
+                }
             }
+            const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
+            if (utimensat(AT_FDCWD, path.c_str(), times, 0))
+                throw SysError(std::format("restoring timestamp of `{}'", path));
+            if (chmod(path.c_str(), originalMode))
+                throw SysError(std::format("restoring mode of `{}'", path));
+        } catch (...) {
+            chmod(path.c_str(), originalMode);
+            throw;
         }
         /* The parent may need renaming after its contents, not before. */
     } else if (S_ISREG(st.st_mode)) {
@@ -488,6 +509,9 @@ static void rewriteTree(const Path & path, const string & from, const string & t
                 createSymlink(target, replacement);
                 if (rename(replacement.c_str(), path.c_str()))
                     throw SysError(std::format("replacing symlink `{}'", path));
+                const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
+                if (utimensat(AT_FDCWD, path.c_str(), times, AT_SYMLINK_NOFOLLOW))
+                    throw SysError(std::format("restoring timestamp of `{}'", path));
                 if (chmod(parent.c_str(), parentStat.st_mode & 07777))
                     throw SysError(std::format("restoring parent mode of `{}'", path));
             } catch (...) {
@@ -496,6 +520,80 @@ static void rewriteTree(const Path & path, const string & from, const string & t
             }
         }
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
+}
+
+static string inverseTree(const Path & path, const string & final,
+    const string & token, unsigned depth = 0)
+{
+    if (depth > 1024) throw Error("CA tree nesting exceeds 1024 directories");
+    struct stat st;
+    if (lstat(path.c_str(), &st))
+        throw SysError(std::format("reading CA tree `{}'", path));
+    if (S_ISREG(st.st_mode)) {
+        string header = treeDomain;
+        header.push_back(1);
+        header.push_back(st.st_mode & S_IXUSR ? 1 : 0);
+        int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) throw SysError(std::format("opening `{}' for CA verification", path));
+        AutoCloseFD input = fd;
+        std::vector<unsigned char> buffer(128 * 1024);
+        string pending;
+        put64(header, st.st_size);
+        HashSink sink(htSHA256);
+        sink((const unsigned char *) header.data(), header.size());
+        auto write = [&](const string & part) {
+            sink((const unsigned char *) part.data(), part.size());
+        };
+        while (true) {
+            ssize_t n = read(input, buffer.data(), buffer.size());
+            if (n < 0) { if (errno == EINTR) continue;
+                throw SysError(std::format("reading `{}' for CA verification", path)); }
+            if (n == 0) break;
+            pending.append((const char *) buffer.data(), n);
+            size_t keep = final.size() - 1;
+            size_t process = pending.size() > keep ? pending.size() - keep : 0;
+            for (size_t length = std::min(process, final.size() - 1); length > 0; --length)
+                if (pending.compare(process - length, length, final, 0, length) == 0) {
+                    process -= length;
+                    break;
+                }
+            write(replaceWhole(pending.substr(0, process), final, token, path, false));
+            pending.erase(0, process);
+        }
+        write(replaceWhole(pending, final, token, path, false));
+        return printHash(sink.finish().first);
+    }
+    string encoding = treeDomain;
+    if (S_ISLNK(st.st_mode)) {
+        encoding.push_back(2);
+        putBytes(encoding, replaceWhole(readLink(path), final, token, path, false));
+        return printHash(hashString(htSHA256, encoding));
+    }
+    if (S_ISDIR(st.st_mode)) {
+        encoding.push_back(3);
+        auto entries = readDirectory(path);
+        std::sort(entries.begin(), entries.end(), [](const DirEntry & a, const DirEntry & b) {
+            return std::lexicographical_compare(a.name.begin(), a.name.end(),
+                b.name.begin(), b.name.end(), [](unsigned char x, unsigned char y) { return x < y; });
+        });
+        put64(encoding, entries.size());
+        for (auto & entry : entries) {
+            string name = replaceWhole(entry.name, final, token, path, false);
+            putBytes(encoding, name);
+            putBytes(encoding, inverseTree(path + "/" + entry.name,
+                final, token, depth + 1));
+        }
+        return printHash(hashString(htSHA256, encoding));
+    }
+    throw Error(std::format("unsupported file type in CA tree `{}'", path));
+}
+
+/* goonix: compare the inverse tree without writing to an existing store item. */
+static bool sameContent(const Path & path, const string & final,
+    const string & token, const Hash & expected)
+{
+    return inverseTree(path, baseNameOf(final).substr(0, 32),
+        baseNameOf(token).substr(0, 32)) == printHash(expected);
 }
 
 Path finaliseContentOutput(LocalStore & store, const Path & token,
@@ -521,9 +619,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (!store.isValidPath(final))
             throw BuildError(std::format(
                 "CA final path `{0}' exists but is not a valid store item", final));
-        rewriteTree(final, newHash, oldHash);
-        bool same = treeHash(final) == built;
-        rewriteTree(final, oldHash, newHash);
+        bool same = sameContent(final, final, token, built);
         if (!same)
             throw BuildError(std::format(
                 "CA content address collision at `{0}': existing item differs", final));
@@ -541,10 +637,8 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
        Verification is the inverse mapping performed below. */
     if (rename(token.c_str(), final.c_str()))
         throw SysError(std::format("moving CA output `{}' to `{}'", token, final));
-    /* Inverse verification is performed on the actual final tree. */
-    rewriteTree(final, newHash, oldHash);
-    bool good = treeHash(final) == built;
-    rewriteTree(final, oldHash, newHash);
+    /* goonix: the inverse mapping is verified without touching the final tree. */
+    bool good = sameContent(final, final, token, built);
     if (!good) {
         deletePath(final);
         throw BuildError(std::format("CA inverse mapping failed for `{}'", final));

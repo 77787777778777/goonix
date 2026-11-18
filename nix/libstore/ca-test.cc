@@ -97,7 +97,11 @@ static void checkSymlinkModes(const Path & root)
     createDirs(settings.nixStore);
     chmod(settings.nixStore.c_str(), 0755);
     Path output = tokenPath("out", "symlink-output");
-    createSymlink(output, output);
+    createDirs(output);
+    const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
+    if (utimensat(AT_FDCWD, output.c_str(), times, 0))
+        throw SysError("canonicalising symlink test timestamp");
+    createSymlink(baseNameOf(output), output + "/self");
     PathSet references;
     Hash narHash;
     uint64_t narSize = 0;
@@ -111,11 +115,21 @@ static void checkSymlinkModes(const Path & root)
     createDirs(directory);
     chmod(directory.c_str(), 0755);
     createSymlink(directory, directory + "/self");
+    writeFile(directory + "/reference", directory);
+    if (utimensat(AT_FDCWD, (directory + "/self").c_str(), times, AT_SYMLINK_NOFOLLOW) ||
+        utimensat(AT_FDCWD, (directory + "/reference").c_str(), times, 0) ||
+        utimensat(AT_FDCWD, directory.c_str(), times, 0))
+        throw SysError("canonicalising CA test timestamps");
     references.clear();
     final = finaliseContentOutput(store, directory, "out", "symlink-directory",
         PathSet{directory}, references, narHash, narSize);
     if (stat(final.c_str(), &st)) throw SysError("reading final directory mode");
     check((st.st_mode & 07777) == 0755, "nested symlink preserves parent mode");
+    check(st.st_mtime == 1, "rewritten directory retains canonical timestamp");
+    if (lstat((final + "/self").c_str(), &st)) throw SysError("reading rewritten symlink");
+    check(st.st_mtime == 1, "rewritten symlink retains canonical timestamp");
+    if (stat((final + "/reference").c_str(), &st)) throw SysError("reading rewritten file");
+    check(st.st_mtime == 1, "rewritten file retains canonical timestamp");
 }
 
 static void checkStreamingFinalisation(const Path & root)
@@ -145,8 +159,49 @@ static void checkStreamingFinalisation(const Path & root)
     check(pathExists(final), "sparse output finalises within the memory limit");
 }
 
+static void checkExistingItemIsUntouched(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "existing-output");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, token, "out", "existing-output",
+        PathSet{token}, references, narHash, narSize);
+    ValidPathInfo valid;
+    valid.path = final;
+    valid.hash = narHash;
+    valid.narSize = narSize;
+    valid.references = references;
+    store.registerValidPath(valid);
+    Path witness = root + "/witness";
+    createDirs(witness);
+    writeFile(witness + "/reference", final);
+    if (link((final + "/reference").c_str(), (witness + "/linked").c_str()))
+        throw SysError("hard-linking early-cutoff witness");
+    chmod(final.c_str(), 0555);
+    Path againToken = tokenPath("out", "existing-output");
+    createDirs(againToken);
+    writeFile(againToken + "/reference", againToken);
+    Path again = finaliseContentOutput(store, againToken, "out", "existing-output",
+        PathSet{againToken}, references, narHash, narSize);
+    check(again == final, "existing result is reused at the same address");
+    check(readFile(final + "/reference") == final,
+        "existing self-reference remains in final form");
+    check(readFile(witness + "/linked") == final,
+        "hard-linked content is not rewritten");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--existing-item") {
+        checkExistingItemIsUntouched(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--streaming") {
         checkStreamingFinalisation(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
