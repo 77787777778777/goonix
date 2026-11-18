@@ -9,6 +9,7 @@ module Goonix.Build.Engine
   , buildThings
   , buildThingsWithTrace
   , buildThingsWithConfig
+  , ensureStorePath
   , BuildTrace (..)
   ) where
 
@@ -73,10 +74,13 @@ buildThingsInternal config rootFd store settings trace things mode = do
           let (drv, _) = B.break (== 33) thing
           buildOne drv
       | otherwise = case config of
-          Just serverConfig -> do
-            substituted <- trySubstitute serverConfig rootFd store settings trace thing
-            unless substituted $ throwIO (storeError ("cannot substitute path `" ++ C.unpack thing ++ "'"))
-          Nothing -> throwIO (storeError ("path `" ++ C.unpack thing ++ "' is not valid"))
+          Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace thing)
+          Nothing -> pure ()
+
+ensureStorePath :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO ()
+ensureStorePath config rootFd store settings trace path = do
+  substituted <- trySubstitute config rootFd store settings trace path
+  unless substituted $ throwIO (storeError ("path `" ++ C.unpack path ++ "' does not exist and cannot be created"))
 
 buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =

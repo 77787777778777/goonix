@@ -33,7 +33,7 @@ import Goonix.Store.Settings
 import Goonix.Store.Socket
 import Goonix.Store.Substitute
 import Goonix.Store.Archive (exportPath, importPathsFrom)
-import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig)
+import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, ensureStorePath)
 import Goonix.Store.Hash (algorithmFromName, hashDigest)
 import Goonix.Store.Wire
 import Goonix.Store.Writing
@@ -199,7 +199,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     path <- readStringSocket client
     _ <- assertStorePath store path
     settings <- readIORef settingsRef
-    buildThingsWithConfig config rootFd store settings (buildTrace settings client) [path] Normal
+    ensureStorePath config rootFd store settings (buildTrace settings client) path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   8 -> do
