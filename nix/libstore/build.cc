@@ -754,6 +754,7 @@ private:
     void outputsSubstituted();
     void closureRepaired();
     void inputsRealised();
+    void initialiseBuildKind();
     void tryToBuild();
     void buildDone();
 
@@ -998,7 +999,7 @@ void DerivationGoal::haveDerivation()
             allPaths.insert(inputPaths.begin(), inputPaths.end());
             for (auto & output : drv.outputs) allPaths.insert(output.second.path);
             missingPaths = outputPaths(drv);
-            nrRounds = settings.get("build-repeat", 0) + 1;
+            initialiseBuildKind();
             state = &DerivationGoal::tryToBuild;
             worker.wakeUp(shared_from_this());
             return;
@@ -1256,20 +1257,28 @@ void DerivationGoal::inputsRealised()
 
     allPaths.insert(inputPaths.begin(), inputPaths.end());
 
-    /* Is this a fixed-output derivation? */
-    fixedOutput = true;
-    for (auto & i : drv.outputs)
-	if (i.second.hash == "") fixedOutput = false;
-
-    /* Don't repeat fixed-output derivations since they're already
-       verified by their output hash.*/
-    nrRounds = fixedOutput ? 1 : settings.get("build-repeat", 0) + 1;
+    /* Fixed-output properties and repeat count are common to input- and
+       resolved-addressed build paths. Keep them in one place so resolved
+       fixed outputs retain impureEnvVars, network setup and one-round
+       behavior. */
+    initialiseBuildKind();
 
     /* Okay, try to build.  Note that here we don't wait for a build
        slot to become available, since we don't need one if there is a
        build hook. */
     state = &DerivationGoal::tryToBuild;
     worker.wakeUp(shared_from_this());
+}
+
+void DerivationGoal::initialiseBuildKind()
+{
+    /* All declared outputs must have a hash for the derivation to use the
+       fixed-output environment and network setup. Fixed outputs are checked
+       by their declared hash and need no repeat rounds. */
+    fixedOutput = true;
+    for (auto & output : drv.outputs)
+        if (output.second.hash.empty()) fixedOutput = false;
+    nrRounds = fixedOutput ? 1 : settings.get("build-repeat", 0) + 1;
 }
 
 

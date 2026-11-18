@@ -77,6 +77,13 @@
 (define (read-all file) (call-with-input-file file get-string-all))
 (define (realised drv) (realised-output-path store drv "out"))
 
+(define (fresh-name prefix)
+  ;; A new name on every run: the test store outlives a run, and some of
+  ;; these assertions must observe a build rather than an existing choice.
+  (string-append prefix "-"
+                 (number->string (random 1000000000
+                                         (random-state-from-platform)))))
+
 (define (failed-build-log drv)
   ;; The final protocol error is generic.  The daemon's specific build
   ;; diagnostic is in its output, even at the default test verbosity.
@@ -104,17 +111,17 @@
                  (string-contains text output))))
         (matching-store-files (string-append "-" name ".drv"))))
 
-(define (failed-partial-derivation)
-  (let ((drv (shell-drv "ca-partial"
+(define (failed-partial-derivation name)
+  (let ((drv (shell-drv name
                         "(call-with-output-file out (lambda (p) (display out p)))"
                         #:outputs '("out" "missing"))))
     (guard (condition ((store-protocol-error? condition)
-                       (resolved-derivation-with-output "ca-partial" "missing")))
+                       (resolved-derivation-with-output name "missing")))
       (build-derivations store (list drv))
       #f)))
 
-(define (successful-partial-retry)
-  (let ((drv (shell-drv "ca-partial"
+(define (successful-partial-retry name)
+  (let ((drv (shell-drv name
                         "(call-with-output-file out (lambda (p) (display out p)))\n(call-with-output-file (getenv \"missing\") (lambda (p) (display \"ok\" p)))"
                         #:outputs '("out" "missing"))))
     (build-derivations store (list drv))
@@ -241,21 +248,23 @@
       (and (string=? lib (read-all (string-append out "/reference")))
            (member lib (references store out))))))
 
-(define (partial-failure-is-clean?)
-  (let* ((resolved (failed-partial-derivation))
+(define (partial-failure-is-clean? name)
+  (let* ((resolved (failed-partial-derivation name))
          (hash (sha256 (string->utf8 (read-all resolved)))))
     (and resolved
          (null? (query-build-records store hash "out"))
-         (every (negate file-exists?) (matching-store-files "-ca-partial")))))
+         (every (negate file-exists?)
+                (matching-store-files (string-append "-" name))))))
 
-(define (partial-retry-is-valid?)
-  (let* ((out (successful-partial-retry))
+(define (partial-retry-is-valid? name)
+  (let* ((out (successful-partial-retry name))
          (contents (read-all out)))
     (and (valid-path? store out) (string=? out contents))))
 
 (test-assert "a failed sibling leaves no record or final tree, and can be retried"
-  (and (partial-failure-is-clean?)
-       (partial-retry-is-valid?)))
+  (let ((name (fresh-name "ca-partial")))
+    (and (partial-failure-is-clean? name)
+         (partial-retry-is-valid? name))))
 
 (test-assert "a successful build has no failure log"
   (let ((drv (derivation store "ca-success-log" bash
@@ -300,7 +309,7 @@
            (string=? "ok" (read-all (realised ordinary)))))))
 
 (test-assert "two goals for one resolved derivation build only once"
-  (let ((drv (shell-drv "ca-concurrent" (write-output "same"))))
+  (let ((drv (shell-drv (fresh-name "ca-concurrent") (write-output "same"))))
     ;; Both requests carry the same unresolved derivation, so both goals
     ;; resolve to the same R and must share the single recorded result.
     ;; Count the daemon's build events, not a file hidden from the builder.
