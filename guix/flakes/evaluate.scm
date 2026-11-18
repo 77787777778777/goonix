@@ -11,7 +11,7 @@
   #:use-module (guix profiles)
   #:use-module (guix build utils)
   #:autoload   (guix scripts build) (register-root)
-  #:use-module ((guix utils) #:select (%current-system))
+  #:use-module ((guix utils) #:select (%current-system cache-directory))
   #:use-module ((guix config) #:select (%guile))
   #:use-module ((gnu build linux-container)
                 #:select (run-container %writable-/tmp))
@@ -25,7 +25,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-34)
   #:export (%evaluation-cache evaluate-flake evaluate-flake-outputs flake-option-value
-            parse-option-value))
+            parse-option-value evaluator-starts))
 
 (define (parse-option-value option string)
   (case (flake-option-type option)
@@ -88,8 +88,13 @@
   (or (locked-input-checkout input)
       (tree-snapshot-directory (locked-input-snapshot input))))
 
+(define evaluator-starts
+  ;; Exported for tests; it counts confined process launches, not cache hits.
+  (make-parameter 0))
+
 (define* (evaluate-request store directory kind name #:key (options '())
-                           (system (%current-system)) target (pure? #t))
+                           (system (%current-system)) target (pure? #t)
+                           imported-source)
   "Evaluate a locked tree in a fresh confined Guile and return output handles."
   (let* ((directory (canonicalize-path directory))
          (flake (read-flake (string-append directory "/flake.scm")))
@@ -106,11 +111,12 @@
                            ("flakes" directory
                             ("support.scm" regular
                              (file ,(search-path %load-path "guix/flakes/support.scm")))))))
-         (source (if (and pure?
-                           (not (string-prefix? (string-append (%store-prefix) "/")
-                                                directory)))
-                     (import-tracked-tree store directory)
-                     directory))
+         (source (or imported-source
+                     (if (and pure?
+                              (not (string-prefix? (string-append (%store-prefix) "/")
+                                                   directory)))
+                         (import-tracked-tree store directory)
+                         directory)))
          (locked-trees
           (map (lambda (input)
                  (let ((path (locked-input-directory input)))
@@ -150,6 +156,7 @@
     (dynamic-wind
       (const #t)
       (lambda ()
+        (evaluator-starts (+ 1 (evaluator-starts)))
         (match (pipe) ((child-in . host-out)
           (match (pipe) ((host-in . child-out)
             (let ((pid (run-container root mounts '(user mnt pid uts ipc net) 1
@@ -173,7 +180,9 @@
               (write `((source . ,source) (kind . ,kind) (name . ,name)
                        (system . ,system) (target . ,target)
                        (options . ,(validated-options flake options))
-                       (revision . #f) (input-sources . ,locked-trees)) host-out)
+                       (revision . ,(and (not imported-source)
+                                         (tracked-tree-revision directory)))
+                       (input-sources . ,locked-trees)) host-out)
               (newline host-out) (force-output host-out)
               (let loop ((message (read host-in)))
                 (if (eof-object? message)
@@ -208,10 +217,96 @@
       (error "flake evaluator failed" (and status (exit-status status))))
     (reverse result)))
 
+(define %evaluation-cache
+  ;; The on-disk cache survives Guix processes; this table avoids repeated I/O
+  ;; within one command.  Impure evaluations are deliberately not cached.
+  (make-hash-table))
+
+(define (flake-cache-key directory source kind name options system target)
+  (let* ((manifest (call-with-input-file (string-append source "/flake.scm")
+                     get-string-all))
+         (lock-file (string-append source "/flake.lock"))
+         (lock (and (file-exists? lock-file)
+                    (call-with-input-file lock-file get-string-all)))
+         (guix (search-path %load-path "guix/flakes/evaluator.scm"))
+         (guix-source (and guix (call-with-input-file guix get-string-all))))
+    (list 1 manifest lock source kind name options system target guix-source)))
+
+(define (flake-cache-files key)
+  (let* ((digest (bytevector->base16-string
+                  (sha256 (string->utf8 (object->string key)))))
+         (directory (string-append (cache-directory) "/flake-eval")))
+    (mkdir-p directory)
+    (list (string-append directory "/" digest ".scm")
+          (string-append directory "/" digest ".drv"))))
+
+(define (cached-evaluation store key)
+  (let ((datum (false-if-exception
+                (call-with-input-file (car (flake-cache-files key)) read))))
+    (match datum
+      (('evaluation 1 stored-key outputs)
+       (and (equal? stored-key key) (every (lambda (output)
+                   (match output
+                     (('output kind name path metadata)
+                      (and (string? path) (string-suffix? ".drv" path)
+                           (valid-path? store path)))
+                     (_ #f)))
+                 outputs)
+          outputs))
+    (_ #f))))
+
+(define (store-evaluation! store key outputs)
+  (match (flake-cache-files key)
+    ((file root)
+     (let ((temporary (string-append file ".tmp." (number->string (getpid)))))
+       (call-with-output-file temporary
+         (lambda (port)
+           (write (list 'evaluation 1 key outputs) port)
+           (newline port)))
+       (rename-file temporary file)
+       (for-each (lambda (output)
+                   (match output
+                     (('output kind name path metadata)
+                      (let ((item (string-append root "-" (symbol->string kind)
+                                                "-" (symbol->string name))))
+                        (when (file-exists? item) (delete-file item))
+                        (register-root store (list path) item)))
+                     (_ #f)))
+                 outputs)))))
+
+(define (evaluate-flake/cached store directory kind name source options system target)
+  (if (string-prefix? (string-append (%store-prefix) "/") source)
+      (let* ((key (flake-cache-key directory source kind name options system target))
+             (memory (hash-ref %evaluation-cache key)))
+        (or (and memory (every (lambda (output)
+                                 (valid-path? store (cadddr output)))
+                               memory)
+                 memory)
+            (let ((cached (cached-evaluation store key)))
+              (if cached
+                  (begin (hash-set! %evaluation-cache key cached) cached)
+       (let ((outputs (evaluate-request store directory kind name
+                                        #:options options #:system system
+                                        #:target target #:pure? #t
+                                        #:imported-source source)))
+                    (store-evaluation! store key outputs)
+                    (hash-set! %evaluation-cache key outputs)
+                    outputs)))))
+      (evaluate-request store directory kind name #:options options
+                        #:system system #:target target #:pure? #f)))
+
+(define (evaluate-flake/cache store directory kind name options system target pure?)
+  (let* ((directory (canonicalize-path directory))
+         (source (if (and pure?
+                           (not (string-prefix? (string-append (%store-prefix) "/")
+                                                directory)))
+                     (import-tracked-tree store directory)
+                     directory)))
+    (evaluate-flake/cached store directory kind name source options system target)))
+
 (define* (evaluate-flake store directory kind name #:key (options '())
                          (system (%current-system)) target (pure? #t))
-  (match (evaluate-request store directory kind name #:options options
-                           #:system system #:target target #:pure? pure?)
+  (match (evaluate-flake/cache store directory kind name options system target pure?)
     ((output) (read-derivation-from-file (canonicalize-path (cadddr output))))
     (_ (error "flake did not return one named output" kind name))))
 
@@ -219,5 +314,4 @@
                                  (system (%current-system)) target (pure? #t))
   (map (lambda (message)
          (match message (('output kind name path metadata) (list kind name path))))
-       (evaluate-request store directory '* #f #:options options
-                         #:system system #:target target #:pure? pure?)))
+       (evaluate-flake/cache store directory '* #f options system target pure?)))

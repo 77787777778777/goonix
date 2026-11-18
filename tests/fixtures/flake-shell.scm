@@ -1,0 +1,5 @@
+(flake (format 1)
+ (outputs (lambda (in)
+  (use-modules (guix packages) (guix profiles) (guix gexp))
+  `((shells (default . ,(shell (packages (list))
+                               (environment '(("TEST_SHELL" . "yes"))))))))))

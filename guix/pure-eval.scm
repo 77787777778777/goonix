@@ -29,6 +29,7 @@
   #:use-module (srfi srfi-34)
   #:export (pure-eval-supported?
             import-tracked-tree
+            tracked-tree-revision
             import-source-set
             import-guix-modules
             call-with-pure-eval
@@ -39,6 +40,21 @@
   (and (user-namespace-supported?)
        (unprivileged-user-namespace-supported?)
        (setgroups-supported?)))
+
+(define (tracked-tree-revision directory)
+  "Return the commit of DIRECTORY, or #f when tracked contents have changed."
+  (and (file-exists? (string-append directory "/.git"))
+       (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
+                               "status" "--porcelain" "--untracked-files=no"
+                               "--ignore-submodules=all"))
+              (changes (get-string-all port))
+              (status (close-pipe port)))
+         (and (zero? status) (string-null? (string-trim-both changes))
+              (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
+                                      "rev-parse" "HEAD"))
+                     (revision (get-string-all port))
+                     (status (close-pipe port)))
+                (and (zero? status) (string-trim-right revision)))))))
 
 (define (tracked-tree directory)
   "Materialize the working contents of DIRECTORY's tracked files.

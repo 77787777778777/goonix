@@ -8,6 +8,7 @@
   #:use-module (guix build utils)
   #:use-module (ice-9 textual-ports)
   #:use-module ((guix utils) #:select (call-with-temporary-directory string-replace-substring))
+  #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-64))
 
 (test-begin "flake-eval")
@@ -104,5 +105,58 @@
          (let ((third (evaluate-flake store directory 'packages 'sample)))
            (and (string=? (derivation-file-name first) (derivation-file-name second))
                 (not (string=? (derivation-file-name first) (derivation-file-name third))))))))))
+
+(test-assert "a persistent cache hit starts no evaluator"
+  (call-with-temporary-directory
+   (lambda (directory)
+     (let ((cache (string-append directory "/cache"))
+           (project (string-append directory "/project")))
+       (mkdir-p project)
+       (let ((old-cache (getenv "XDG_CACHE_HOME")))
+         (dynamic-wind
+           (lambda () (setenv "XDG_CACHE_HOME" cache))
+           (lambda ()
+             (init-repo project)
+             (copy-file "tests/fixtures/flake-child.scm"
+                        (string-append project "/flake.scm"))
+             (commit-all project)
+             (let ((first (evaluate-flake store project 'packages 'sample)))
+               (hash-clear! %evaluation-cache)
+               (let ((starts (evaluator-starts)))
+                 (let ((second (evaluate-flake store project 'packages 'sample)))
+                   (and (= starts (evaluator-starts))
+                        (string=? (derivation-file-name first)
+                                  (derivation-file-name second)))))))
+           (lambda ()
+             (if old-cache (setenv "XDG_CACHE_HOME" old-cache)
+                 (unsetenv "XDG_CACHE_HOME")))))))))
+
+(test-assert "typed shells lower to profile derivations"
+  (call-with-temporary-directory
+   (lambda (directory)
+     (init-repo directory)
+     (copy-file "tests/fixtures/flake-shell.scm"
+                (string-append directory "/flake.scm"))
+     (commit-all directory)
+     (let ((drv (evaluate-flake store directory 'shells 'default)))
+       (string-suffix? "profile.drv" (derivation-file-name drv))))))
+
+(test-assert "overrides replace inputs at lowering time and exempt wrappers"
+  (call-with-temporary-directory
+   (lambda (directory)
+     (init-repo directory)
+     (copy-file "tests/fixtures/flake-override.scm"
+                (string-append directory "/flake.scm"))
+     (commit-all directory)
+     (let ((consumer (evaluate-flake store directory 'packages 'consumer))
+           (wrapper (evaluate-flake store directory 'packages 'wrapper)))
+       (and (any (lambda (input)
+                   (string-suffix? "wrapper-0.drv"
+                                   (derivation-input-path input)))
+                 (derivation-inputs consumer))
+            (any (lambda (input)
+                   (string-suffix? "original-0.drv"
+                                   (derivation-input-path input)))
+                 (derivation-inputs wrapper)))))))
 
 (test-end)

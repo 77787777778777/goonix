@@ -1,5 +1,6 @@
 ;;; goonix: the confined flake evaluator protocol.
 (define-module (guix flakes evaluator)
+  #:use-module (guix flakes support)
   #:use-module (guix store)
   #:use-module (guix packages)
   #:use-module (guix search-paths)
@@ -15,20 +16,31 @@
   #:use-module (srfi srfi-1)
   #:export (run-flake-evaluator))
 
-(define (lowest store object name system target)
+(define (lowered-output object name system target)
+  "Return a monadic lowering computation for OBJECT."
   (match object
-    ((? derivation? derivation) derivation)
+    ((? derivation? derivation) (with-monad %store-monad (return derivation)))
     ((? package? package)
-     (if target (package-cross-derivation store package target system)
-         (package-derivation store package system)))
-    ((? operating-system? os) (run-with-store store (operating-system-derivation os)))
-    ((? image? image) (run-with-store store (lower-object (system-image image))))
-    ((? gexp? gexp) (run-with-store store (gexp->derivation name gexp
-                                                #:system system #:target target)))
-    ((? file-like? file) (run-with-store store (lower-object file)))
+     (lower-object package system #:target (or target #f)))
+    ((? operating-system? os) (operating-system-derivation os))
+    ((? image? image) (lower-object (system-image image)))
+    ((? gexp? gexp)
+     (gexp->derivation name gexp #:system system #:target target))
+    ((? file-like? file) (lower-object file system #:target (or target #f)))
     (_ (error "output is not a package or other buildable object" object))))
 
-(define (metadata store object system target)
+(define (lower-value store object name system target overrides)
+  (let ((active (remove (lambda (item)
+                          (eq? object (override-replacement item)))
+                        overrides)))
+    (run-with-store store
+      (with-package-overrides (map (lambda (item)
+                                    (cons (override-original item)
+                                          (override-replacement item)))
+                                  active)
+        (lowered-output object name system target)))))
+
+(define (metadata store object system target overrides)
   (cond ((package? object)
          `((version . ,(package-version object))
            (outputs . ,(package-outputs object))
@@ -40,9 +52,14 @@
                         ((label item . outputs)
                          (list label
                                (derivation-file-name
-                                (lowest store item label system target))
+                                (lower-value store item label system target overrides))
                                outputs))))
                     (package-propagated-inputs object)))))
+        ((shell? object)
+         `((shell . #t)
+           (environment . ,(shell-environment object))
+           (packages . ,(map package-name (shell-packages object)))
+           (inputs-from . ,(map package-name (shell-inputs-from object)))))
         ((derivation? object) `((outputs . ,(map car (derivation-outputs object)))))
         (else '())))
 
@@ -90,21 +107,27 @@
     (let* ((outputs ((eval output-form module) context))
            (kind (assoc-ref request 'kind))
            (name (assoc-ref request 'name))
-           (groups (if (eq? kind '*) outputs (list (assq kind outputs)))))
+           (groups (if (eq? kind '*) outputs
+                       (list (or (assq kind outputs)
+                                 (error "unknown flake output kind" kind)))))
+           (overrides (append-map
+                       (lambda (spec)
+                         (if (eq? 'overrides (car spec))
+                             (map cdr (cdr spec)) '()))
+                       outputs)))
       (parameterize ((%current-system system) (%current-target-system target))
         (for-each
          (lambda (group)
-           (unless group (error "unknown flake output kind" kind))
            (for-each
             (lambda (entry)
-              (unless (or (eq? kind '*) (eq? name (car entry)))
-                (error "unexpected flake output" (car entry)))
-              (let ((object (cdr entry)))
-                (write (list 'output (car group) (car entry)
-                             (derivation-file-name
-                              (lowest s object (symbol->string (car entry)) system target))
-                             (metadata s object system target)))
-                (newline) (force-output)))
+              (when (or (eq? kind '*) (eq? name (car entry)))
+                (let ((object (cdr entry)))
+                  (write (list 'output (car group) (car entry)
+                               (derivation-file-name
+                                (lower-value s object (symbol->string (car entry))
+                                             system target overrides))
+                               (metadata s object system target overrides)))
+                  (newline) (force-output))))
             (cdr group)))
          groups))
       (write '(done)) (newline) (force-output)
