@@ -51,7 +51,8 @@
   #:autoload   (guix build syscalls) (terminal-columns)
   #:use-module (guix transformations)
   #:autoload   (guix pure-eval) (load-file-purely)
-  #:autoload   (guix flakes evaluate) (evaluate-flake)
+  #:autoload   (guix scripts flake) (flake-reference? ;goonix: DIRECTORY#NAME
+                                     flake-package-derivation)
   #:export (log-url
 
             %standard-build-options
@@ -603,28 +604,6 @@ must be one of 'package', 'all', or 'transitive'~%")
       (mlet %store-monad ((edges (node-back-edges %bag-node-type (all-packages))))
         (return (get-dependents packages edges))))))
 
-(define (flake-reference? spec)
-  (let ((hash (string-index spec #\#)))
-    (and hash (> hash 0) (< hash (- (string-length spec) 1))
-         (let ((path (string-take spec hash)))
-           (or (string=? path ".") (string=? path "..")
-               (string-prefix? "/" path)
-               (string-prefix? "./" path)
-               (string-prefix? "../" path))))))
-
-(define (flake-reference->derivation store spec opts)
-  (let* ((hash (string-index spec #\#))
-         (path (string-take spec hash))
-         (name (string->symbol (string-drop spec (+ hash 1))))
-         (directory (canonicalize-path path))
-         (options (filter-map (match-lambda
-                               (('option . pair) pair)
-                               (_ #f)) opts)))
-    (evaluate-flake store directory 'packages name
-                    #:options options
-                    #:system (or (assoc-ref opts 'system) (%current-system))
-                    #:target (assoc-ref opts 'target))))
-
 (define (options->things-to-build store opts)
   "Read the arguments from OPTS and return a list of high-level objects to
 build---packages, gexps, derivations, and so on."
@@ -722,13 +701,12 @@ values.")))))))))
                  ;; Nothing to do; maybe for --log-file.
                  (loop tail type result))
                 (else
-                 (if (flake-reference? spec)
-                     (loop tail 'regular
-                           (cons (flake-reference->derivation store spec opts)
-                                 result))
-                     (loop tail 'regular
-                           (append (for-type (specification->package spec))
-                                   result))))))
+                 (loop tail 'regular
+                       (append (if (flake-reference? spec) ;goonix: DIRECTORY#NAME
+                                   (list (flake-package-derivation store spec
+                                                                   opts))
+                                   (for-type (specification->package spec)))
+                               result)))))
          (('argument . (? derivation? drv))
           (loop tail 'regular (cons drv result)))
          (('file . file)

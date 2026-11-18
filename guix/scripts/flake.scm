@@ -45,6 +45,7 @@
             parse-flake-reference
             flake-options-from-opts
             flake-output-derivation
+            flake-package-derivation
             flake-acting-output
             flake-checked-output
             lower-flake-object
@@ -148,6 +149,13 @@ Lock, inspect, and evaluate a goonix flake.
         (cons (canonicalize-path (string-take spec hash))
               (string->symbol (string-drop spec (+ hash 1))))
         (cons (canonicalize-path spec) #f))))
+
+(define (flake-package-derivation store spec opts)
+  "Return the derivation of the package that SPEC, a flake reference, names,
+for 'guix build' with options OPTS."
+  (match (parse-flake-reference spec)
+    ((directory . name)
+     (flake-output-derivation store directory 'packages name opts))))
 
 (define (flake-output-derivation store directory kind name opts)
   "Purely evaluate DIRECTORY's output KIND NAME and return its derivation."
