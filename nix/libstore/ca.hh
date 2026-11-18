@@ -40,6 +40,7 @@ void checkInputAddressedPolicy(class LocalStore & store, const Derivation & drv)
    marked resolved, no floating inputs, outputs are self tokens (content)
    or strict final paths (resolved/fixed), environment agrees. */
 void checkResolvedDerivation(const Derivation & drv);
+void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv);
 
 /* Resolve every original derivation/output through daemon-owned choices.
    The resulting derivation contains only realised paths and self tokens. */

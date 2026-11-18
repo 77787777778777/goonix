@@ -1,5 +1,6 @@
 // goonix: test vectors for tokens, placeholders and reserved paths.
 #include "ca.hh"
+#include "local-store.hh"
 #include "globals.hh"
 #include <cstdlib>
 #include <iostream>
@@ -25,8 +26,71 @@ template<class F> static bool throws(F && f)
     catch (const Error &) { return true; }
 }
 
-int main()
+static void configureIsolatedStore(const Path & root)
 {
+    settings.nixStateDir = root + "/state";
+    settings.nixStore = root + "/store";
+    settings.nixDBPath = root + "/db";
+    settings.nixConfDir = root + "/etc";
+    settings.nixLogDir = root + "/log";
+    settings.nixDaemonSocketFile = root + "/socket";
+    settings.buildUsersGroup = "";
+}
+
+static void checkOutputPathValidation(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    Hash hash = hashString(htSHA256, "attacker-controlled content");
+    Derivation drv;
+    drv.platform = "x86_64-linux";
+    drv.builder = "/bin/sh";
+    drv.env["goonixResolved"] = "1";
+    drv.outputs["out"] = DerivationOutput(
+        settings.nixStore + "/00000000000000000000000000000000-chosen",
+        "r:sha256", printHash(hash));
+    drv.env["out"] = drv.outputs["out"].path;
+    bool accepted = true;
+    try {
+        store.addTextToStore("fixed.drv", unparseDerivation(drv), PathSet());
+    } catch (const Error &) {
+        accepted = false;
+    }
+    check(!accepted, "fixed output path is recomputed, not attacker chosen");
+
+    drv.env.erase("goonixResolved");
+    drv.outputs["out"] = DerivationOutput(
+        settings.nixStore + "/00000000000000000000000000000001-chosen", "", "");
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("unvalidated.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "addressing marker cannot bypass output path validation");
+
+    drv.env["goonixAddressing"] = "resolved";
+    drv.env["goonixResolved"] = "1";
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("resolved-chosen.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "resolved-addressed path is recomputed from resolved bytes");
+
+    drv.outputs["out"] = DerivationOutput(
+        makePlaceholder(unparseDerivation(drv), "out", "placeholder"), "", "");
+    drv.env["goonixResolved"] = "1";
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("placeholder.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "placeholder output path is bound to the unresolved derivation");
+}
+
+int main(int argc, char ** argv)
+{
+    if (argc == 3 && string(argv[1]) == "--path-validation") {
+        checkOutputPathValidation(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     settings.nixStore = "/gnu/store";
 
     auto out = selfToken("out");

@@ -1007,10 +1007,11 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 // FIXME: inefficient; we already loaded the
                 // derivation in addValidPath().
                 Derivation drv = readDerivation(i.path);
-                // goonix: token/resolved output paths use their own checked format.
-                if (resolvedDerivation(drv))
-                    checkResolvedDerivation(drv);
-                else if (drv.env.find("goonixAddressing") == drv.env.end()) {
+                // goonix: recompute every CA output path at registration.
+                if (drv.env.find("goonixAddressing") != drv.env.end() ||
+                    resolvedDerivation(drv))
+                    checkGoonixDerivationOutputs(i.path, drv);
+                else {
                     checkDerivationOutputs(i.path, drv);
                     // goonix: mixed policy, inputs are valid now so we can check.
                     checkInputAddressedPolicy(*this, drv);

@@ -189,6 +189,53 @@ void checkResolvedDerivation(const Derivation & drv)
     for (auto & entry : drv.env) scan(entry.second);
 }
 
+/* goonix: derive every output path from the derivation, never from a client's
+   choice of a syntactically valid store path. */
+void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
+{
+    string name = storePathToName(drvPath);
+    if (name.ends_with(drvExtension)) name.resize(name.size() - drvExtension.size());
+    Derivation blank = drv;
+    for (auto & output : blank.outputs) {
+        output.second.path = "";
+        blank.env[output.first] = "";
+    }
+    const string bytes = unparseDerivation(blank);
+    for (auto & output : drv.outputs) {
+        bool recursive;
+        HashType hashType;
+        Hash hash;
+        Path expected;
+        if (!output.second.hash.empty()) {
+            output.second.parseHashInfo(recursive, hashType, hash);
+            expected = makeFixedOutputPath(recursive, hashType, hash,
+                name + (output.first == "out" ? "" : "-" + output.first));
+        } else if (addressingOf(drv) == Addressing::content) {
+            expected = tokenPath(output.first,
+                name + (output.first == "out" ? "" : "-" + output.first));
+            if (!resolvedDerivation(drv))
+                expected = makePlaceholder(bytes, output.first, name);
+        } else if (addressingOf(drv) == Addressing::resolved) {
+            expected = resolvedAddressedPath(output.first,
+                name + (output.first == "out" ? "" : "-" + output.first), bytes);
+        } else {
+            if (!resolvedDerivation(drv))
+                throw Error(std::format(
+                    "goonix: unresolved input-addressed output `{0}' is not validated here",
+                    output.first));
+            continue;
+        }
+        if (output.second.path != expected)
+            throw Error(std::format(
+                "goonix: output `{0}' has incorrect path `{1}', expected `{2}'",
+                output.first, output.second.path, expected));
+        auto env = drv.env.find(output.first);
+        if (env == drv.env.end() || env->second != expected)
+            throw Error(std::format(
+                "goonix: output `{0}' has an incorrect environment path", output.first));
+    }
+}
+
 static void put64(string & out, uint64_t value)
 {
     for (unsigned i = 0; i < 8; ++i) out.push_back((value >> (i * 8)) & 0xff);
