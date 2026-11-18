@@ -10,6 +10,7 @@
 #include "builtins.hh"
 #include "spawn.hh"
 #include "ca.hh" // goonix: resolution and content finalisation
+#include "deep-scan.hh" // goonix: unprivileged compressed-output scanner
 
 #include <map>
 #include <algorithm>
@@ -3457,6 +3458,14 @@ void DerivationGoal::registerOutputs()
                     copyFileRecursively(actualPath, staged, true);
                 finalisationPath = staged;
             }
+            /* goonix: decompress outside the daemon, as the still-held build
+               user, and include every output token before sibling finalisation. */
+            StringSet deepTokens;
+            for (auto & output : originalDrv.outputs)
+                deepTokens.insert(selfToken(output.first));
+            checkDeepOutput(finalisationPath, deepTokens,
+                buildUser.enabled() ? buildUser.getUID() : (uid_t) -1,
+                buildUser.enabled() ? buildUser.getGID() : (gid_t) -1);
             if (buildMode == bmCheck) {
                 /* --check builds again and compares content addresses.  A
                    different result is stored as a second record for the same

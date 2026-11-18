@@ -66,13 +66,14 @@ libstore_a_SOURCES =				\
   %D%/libstore/build.cc				\
   %D%/libstore/pathlocks.cc			\
   %D%/libstore/derivations.cc			\
-  %D%/libstore/builtins.cc
+  %D%/libstore/builtins.cc			\
+  %D%/libstore/sqlite.cc
 
 # goonix: CA store modules.
 libstore_a_SOURCES +=				\
-  %D%/libstore/sqlite.cc			\
   %D%/libstore/records.cc			\
-  %D%/libstore/ca.cc
+  %D%/libstore/ca.cc				\
+  %D%/libstore/deep-scan.cc
 
 libstore_headers =				\
   %D%/libstore/references.hh			\
@@ -83,13 +84,14 @@ libstore_headers =				\
   %D%/libstore/misc.hh				\
   %D%/libstore/local-store.hh			\
   %D%/libstore/sqlite.hh			\
-  %D%/libstore/builtins.hh
+  %D%/libstore/builtins.hh			\
+  %D%/libstore/store-api.hh
 
 # goonix: CA store headers.
 libstore_headers +=				\
-  %D%/libstore/store-api.hh			\
   %D%/libstore/ca.hh				\
-  %D%/libstore/records.hh
+  %D%/libstore/records.hh			\
+  %D%/libstore/deep-scan.hh
 
 libstore_a_CPPFLAGS =				\
   $(libutil_a_CPPFLAGS)				\
@@ -110,8 +112,8 @@ bin_PROGRAMS = guix-daemon
 noinst_PROGRAMS = nix/ca-test nix/records-test
 
 nix_ca_test_SOURCES = %D%/libstore/ca-test.cc
-nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS) $(LIBARCHIVE_CFLAGS)
-nix_ca_test_LDADD = libstore.a libutil.a -lz $(LIBARCHIVE_LIBS) $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
+nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS) # goonix: helper path for tests.
+nix_ca_test_LDADD = libstore.a libutil.a -lz $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
 nix_records_test_SOURCES = %D%/libstore/records-test.cc
 nix_records_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
 nix_records_test_LDADD = $(nix_ca_test_LDADD)
@@ -135,9 +137,6 @@ guix_daemon_LDFLAGS = 				\
 guix_daemon_LDADD =				\
   libstore.a libutil.a -lz		\
   $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
-
-# goonix: deep CA helper dependencies.
-guix_daemon_LDADD += $(LIBARCHIVE_LIBS)
 
 guix_daemon_headers =				\
   %D%/nix-daemon/nix-daemon.hh

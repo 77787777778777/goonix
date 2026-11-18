@@ -988,6 +988,8 @@ include doc/local.mk
 if BUILD_DAEMON
 
 include nix/local.mk
+# goonix: optional out-of-process CA decoder.
+include nix/goonix.mk
 
 endif BUILD_DAEMON
 

@@ -59,7 +59,8 @@ EXTRA_DIST +=					\
   tests/fixtures/ca-self-token.gz			\
   tests/fixtures/ca-self-token.xz			\
   tests/fixtures/ca-self-token.bz2			\
-  tests/fixtures/ca-self-token.zip
+  tests/fixtures/ca-self-token.zip			\
+  tests/fixtures/ca-placeholder-boundary.gz
 
 if CAN_RUN_TESTS
 if BUILD_DAEMON
@@ -86,6 +87,9 @@ goonix_ca_store_checks =			\
 # suite's own state directory and a 'guix' that runs from the build tree.
 check-local:
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test
+if HAVE_LIBARCHIVE
+	$(AM_V_at)$(abs_top_builddir)/nix/ca-scan-test $(abs_top_builddir)/goonix-ca-scan
+endif HAVE_LIBARCHIVE
 	$(AM_V_at)directory=`mktemp -d` || exit 1; \
 	  $(abs_top_builddir)/nix/ca-test --shared-vectors \
 	    $(abs_top_srcdir)/tests/ca-vectors.json "$$directory"; \

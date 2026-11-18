@@ -31,11 +31,6 @@ if test "x$guix_build_daemon" = "xyes"; then
     HAVE_LIBBZ2="$ac_cv_header_bzlib_h"
   fi
 
-  # goonix: optional deep CA scanning uses libarchive in the helper.
-  AC_CHECK_HEADERS([archive.h], [true],
-    [AC_MSG_ERROR([goonix deep CA scanning requires libarchive.])])
-  PKG_CHECK_MODULES([LIBARCHIVE], [libarchive])
-
   dnl Look for SQLite, a required dependency.
   PKG_CHECK_MODULES([SQLITE3], [sqlite3 >= 3.6.19])
 
@@ -162,6 +157,15 @@ if test "x$guix_build_daemon" = "xyes"; then
   dnl Packet Filter VM, which only directly operates on 32-bit words.
   AC_C_BIGENDIAN
 fi
+
+# goonix: optional out-of-process deep CA scanner.  These macros must be
+# unconditional so --disable-daemon also defines the Automake conditional.
+AC_CHECK_HEADERS([archive.h], [have_libarchive_header=yes], [have_libarchive_header=no])
+PKG_CHECK_MODULES([LIBARCHIVE], [libarchive], [have_libarchive=yes], [have_libarchive=no])
+if test "x$have_libarchive_header" != xyes; then have_libarchive=no; fi
+AM_CONDITIONAL([HAVE_LIBARCHIVE], [test "x$have_libarchive" = xyes])
+AC_DEFINE_UNQUOTED([GUIX_LIBEXECDIR], ["$libexecdir"],
+  [Directory for goonix's unprivileged helper programs.])
 
 AM_CONDITIONAL([HAVE_LIBBZ2], [test "x$HAVE_LIBBZ2" = "xyes"])
 AM_CONDITIONAL([BUILD_DAEMON], [test "x$guix_build_daemon" = "xyes"])

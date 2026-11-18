@@ -633,6 +633,9 @@ static void performOp(bool trusted, unsigned int clientVersion,
                     || name == "build-max-log-size"
                     || name == "build-max-jobs" || name == "build-cores"
                     || name == "build-repeat"
+                    /* goonix: an unprivileged, bounded helper makes the
+                       client's own builds stricter, never more permissive. */
+                    || name == "goonix-deep-scan"
                     || name == "multiplexed-build-output")
                     settings.set(name, value);
 		else if (name == "user-name"

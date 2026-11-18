@@ -1,12 +1,10 @@
 #include "ca.hh"
+#include "deep-scan.hh"
 #include "local-store.hh"
 #include "archive.hh"
 #include "globals.hh"
 #include "references.hh"
 #include "misc.hh"
-#include <zlib.h>
-#include <archive.h>
-#include <archive_entry.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -468,144 +466,6 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
     rewriteRegularFile(path, from, to, 0444);
 }
 
-static void checkReserved(const Path & path, const string & bytes);
-
-static void scanDeepArchive(const Path & path, const string & token,
-    bool xz, bool bzip2, bool zip);
-
-static void checkDeepFile(const Path & path, const string & token)
-{
-    if (!settings.get("goonix-deep-scan", false)) return;
-    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) throw SysError(std::format("opening deep CA input `{}'", path));
-    AutoCloseFD input = fd;
-    unsigned char magic[6];
-    ssize_t count = read(input, magic, sizeof(magic));
-    if (count < 0) throw SysError(std::format("reading deep CA input `{}'", path));
-    bool gzipMagic = count >= 2 && magic[0] == 0x1f && magic[1] == 0x8b;
-    bool xzMagic = count == 6 && memcmp(magic, "\xfd" "7zXZ\0", 6) == 0;
-    bool bzip2Magic = count >= 3 && memcmp(magic, "BZh", 3) == 0;
-    bool zipMagic = count >= 4 && memcmp(magic, "PK\003\004", 4) == 0;
-    if (!gzipMagic) {
-        if (xzMagic) scanDeepArchive(path, token, true, false, false);
-        else if (bzip2Magic) scanDeepArchive(path, token, false, true, false);
-        else if (zipMagic) scanDeepArchive(path, token, false, false, true);
-        return;
-    }
-    if (lseek(input, 0, SEEK_SET) < 0)
-        throw SysError(std::format("rewinding deep CA input `{}'", path));
-    int decoderFD = dup(fd);
-    if (decoderFD < 0) throw SysError(std::format("duplicating deep CA input `{}'", path));
-    gzFile gzip = gzdopen(decoderFD, "rb");
-    if (!gzip) {
-        close(decoderFD);
-        throw BuildError(std::format("opening gzip CA member `{}'", path));
-    }
-    try {
-        std::vector<char> buffer(128 * 1024);
-        string pending;
-        uint64_t total = 0;
-        while (true) {
-            int length = gzread(gzip, buffer.data(), buffer.size());
-            if (length < 0) {
-                int code = Z_OK;
-                string message = gzerror(gzip, &code);
-                throw BuildError(std::format("decoding deep CA gzip `{0}': {1}", path, message));
-            }
-            if (!length) break;
-            total += length;
-            if (total > 256ULL * 1024 * 1024)
-                throw BuildError(std::format("deep CA gzip member `{0}' exceeds 256 MiB", path));
-            pending.append(buffer.data(), length);
-            size_t offset = pending.find(token);
-            if (offset != string::npos)
-                throw BuildError(std::format(
-                    "unresolved goonix self token in decompressed `{0}' at byte {1}",
-                    path, total - pending.size() + offset));
-            checkReserved(path, pending);
-            if (pending.size() > token.size() - 1)
-                pending.erase(0, pending.size() - token.size() + 1);
-        }
-        if (gzclose(gzip) != Z_OK)
-            throw BuildError(std::format("closing deep CA gzip `{}'", path));
-    } catch (...) {
-        gzclose(gzip);
-        throw;
-    }
-}
-
-struct ArchiveCloser {
-    void operator()(archive * reader) { archive_read_free(reader); }
-};
-using Archive = std::unique_ptr<archive, ArchiveCloser>;
-
-static void scanDeepArchive(const Path & path, const string & token,
-    bool xz, bool bzip2, bool zip)
-{
-    Archive reader(archive_read_new());
-    if (!reader) throw BuildError(std::format("allocating deep CA reader `{}'", path));
-    if (xz) archive_read_support_filter_xz(reader.get());
-    if (bzip2) archive_read_support_filter_bzip2(reader.get());
-    if (zip) archive_read_support_format_zip(reader.get());
-    /* Raw is required for a bare xz or bzip2 member, but it is selected
-       only after one of those compression filters recognized its magic. */
-    if (!zip) archive_read_support_format_raw(reader.get());
-    if (archive_read_open_filename(reader.get(), path.c_str(), 128 * 1024) != ARCHIVE_OK)
-        throw BuildError(std::format("opening deep CA archive `{0}': {1}", path,
-            archive_error_string(reader.get())));
-    archive_entry * entry = nullptr;
-    int result;
-    while ((result = archive_read_next_header(reader.get(), &entry)) == ARCHIVE_OK) {
-        if (archive_entry_filetype(entry) != AE_IFREG) continue;
-        std::vector<char> buffer(128 * 1024);
-        string pending;
-        uint64_t total = 0;
-        while (true) {
-            ssize_t length = archive_read_data(reader.get(), buffer.data(), buffer.size());
-            if (length < 0)
-                throw BuildError(std::format("decoding deep CA archive `{0}': {1}", path,
-                    archive_error_string(reader.get())));
-            if (!length) break;
-            total += length;
-            if (total > 256ULL * 1024 * 1024)
-                throw BuildError(std::format("deep CA archive member `{0}' exceeds 256 MiB", path));
-            pending.append(buffer.data(), length);
-            size_t offset = pending.find(token);
-            if (offset != string::npos)
-                throw BuildError(std::format(
-                    "unresolved goonix self token in decompressed `{0}' at byte {1}",
-                    path, total - pending.size() + offset));
-            checkReserved(path, pending);
-            if (pending.size() > token.size() - 1)
-                pending.erase(0, pending.size() - token.size() + 1);
-        }
-    }
-    if (result != ARCHIVE_EOF)
-        throw BuildError(std::format("reading deep CA archive `{0}': {1}", path,
-            archive_error_string(reader.get())));
-    if (archive_read_close(reader.get()) != ARCHIVE_OK)
-        throw BuildError(std::format("closing deep CA archive `{}'", path));
-}
-
-void checkDeepArchiveForTest(const Path & path, const string & token,
-    const string & format)
-{
-    scanDeepArchive(path, token, format == "xz", format == "bzip2", format == "zip");
-}
-
-static void checkDeepTree(const Path & path, const string & token, unsigned depth = 0)
-{
-    if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
-    struct stat st;
-    if (lstat(path.c_str(), &st)) throw SysError(std::format("scanning `{}'", path));
-    if (S_ISDIR(st.st_mode)) {
-        for (auto & entry : readDirectory(path))
-            checkDeepTree(path + "/" + entry.name, token, depth + 1);
-    } else if (S_ISREG(st.st_mode)) checkDeepFile(path, token);
-    else if (!S_ISLNK(st.st_mode))
-        throw BuildError(std::format("unsupported CA output file `{}'", path));
-}
-
 static void checkReserved(const Path & path, const string & bytes)
 {
     /* The normal reference scanner only knows base32 hashes.  Reserved
@@ -823,7 +683,6 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     for (auto & sibling : finalOutputs)
         referencePaths.insert(sibling.second);
     checkReservedTree(physical, 0, baseNameOf(token));
-    checkDeepTree(physical, baseNameOf(token).substr(0, 32));
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
             rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),

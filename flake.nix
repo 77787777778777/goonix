@@ -35,6 +35,9 @@
           version = "${baseVersion}-goonix.${rev}";
           src = self;
 
+          # goonix: the optional CA decoder is a separate helper program.
+          buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.libarchive ];
+
           meta = old.meta // {
             description = "Fork of GNU Guix, a functional package manager with a Scheme interface";
             homepage = "https://github.com/hurdkit/goonix";

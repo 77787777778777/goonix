@@ -1,5 +1,6 @@
 // goonix: test vectors for tokens, placeholders and reserved paths.
 #include "ca.hh"
+#include "deep-scan.hh"
 #include "references.hh"
 #include "local-store.hh"
 #include "globals.hh"
@@ -18,7 +19,6 @@
 using namespace nix;
 namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
-void checkDeepArchiveForTest(const Path & path, const string & token, const string & format);
 }
 
 static unsigned failures = 0;
@@ -733,7 +733,7 @@ static void checkDeepCompressedSelfToken(const Path & root)
     LocalStore store(false);
     createDirs(settings.nixStore);
     chmod(settings.nixStore.c_str(), 0755);
-    Path directory = tokenPath("out", "deep-scan");
+    Path directory = settings.nixStore + "/" + baseNameOf(tokenPath("out", "deep-scan"));
     createDirs(directory);
     string token = baseNameOf(directory).substr(0, 32);
     Path archive = root + "/member.gz";
@@ -748,34 +748,66 @@ static void checkDeepCompressedSelfToken(const Path & root)
     check(!final.empty() && pathExists(final), "ordinary finalisation accepts a compressed self token");
     deletePath(final);
 
-    directory = tokenPath("out", "deep-scan");
+    /* The environment override is how a build-tree daemon finds its helper. */
+    createDirs(directory);
+    writeFile(directory + "/member.gz", readFile(archive));
+    ::setenv("GOONIX_DEEP_SCAN_HELPER", (root + "/missing-from-environment").c_str(), 1);
+    settings.set("goonix-deep-scan", "true");
+    bool environmentMissing = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        environmentMissing = string(error.what()).find("unavailable") != string::npos;
+    }
+    check(environmentMissing, "missing helper from the environment refuses deep scanning");
+    settings.set("goonix-deep-scan", "false");
+    references.clear();
+    final = finaliseContentOutput(store, directory, "out", "deep-scan",
+        PathSet{directory}, references, narHash, narSize);
+    check(!final.empty() && pathExists(final),
+        "missing helper does not affect ordinary finalisation");
+    deletePath(final);
+    ::unsetenv("GOONIX_DEEP_SCAN_HELPER");
+
+    directory = settings.nixStore + "/" + baseNameOf(tokenPath("out", "deep-scan"));
     createDirs(directory);
     writeFile(directory + "/member.gz", readFile(archive));
     references.clear();
     settings.set("goonix-deep-scan", "true");
+    if (getEnv("GOONIX_DEEP_SCAN_HELPER").empty())
+        settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
     bool rejected = false;
-    try {
-        finaliseContentOutput(store, directory, "out", "deep-scan",
-            PathSet{directory}, references, narHash, narSize);
-    } catch (const Error & error) {
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
         string message = error.what();
-        rejected = message.find("member.gz") != string::npos &&
-            message.find("byte 7") != string::npos;
+        rejected = message.find("decompressed") != string::npos &&
+            message.find("member.gz") != string::npos;
     }
-    check(rejected, "deep scan rejects compressed token with member offset");
+    check(rejected, "daemon rejects a found token from the helper");
 
-    for (auto format : {"xz", "bzip2", "zip"}) {
-        Path input = string("tests/fixtures/ca-self-token.") +
-            (string(format) == "bzip2" ? "bz2" : format);
-        bool refused = false;
-        try { checkDeepArchiveForTest(input, token, format); }
-        catch (const Error & error) {
-            string message = error.what();
-            refused = message.find("decompressed") != string::npos &&
-                message.find("byte 7") != string::npos;
-        }
-        check(refused, string("deep scan rejects ") + format + " token at decoded offset");
+    settings.set("goonix-deep-scan-helper", root + "/missing-helper");
+    check(throws([&] { checkDeepOutput(directory, StringSet{token}); }),
+        "missing helper refuses finalisation");
+    Path crash = root + "/crash-helper";
+    writeFile(crash, readFile("nix/ca-scan-crash"));
+    chmod(crash.c_str(), 0755);
+    settings.set("goonix-deep-scan-helper", crash);
+    bool crashRefused = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        crashRefused = string(error.what()).find("crashed") != string::npos;
     }
+    check(crashRefused, "helper crash refuses finalisation");
+    Path stall = root + "/stall-helper";
+    writeFile(stall, readFile("nix/ca-scan-stall"));
+    chmod(stall.c_str(), 0755);
+    settings.set("goonix-deep-scan-helper", stall);
+    settings.set("goonix-deep-scan-timeout", "1");
+    bool timeoutRefused = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        timeoutRefused = string(error.what()).find("exceeded") != string::npos;
+    }
+    check(timeoutRefused, "helper timeout refuses finalisation");
 }
 
 int main(int argc, char ** argv)

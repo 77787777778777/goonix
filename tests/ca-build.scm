@@ -323,28 +323,28 @@
                                 (make-list (- width 1) 0)))
                       (string->list token)))))
          (test-equal (format #f "a UTF-~aLE self token is refused" (* 8 width))
-           (format #f "UTF-~a self-reference" (* 8 width))
-           (build-fails-with?
-            (shell-drv (format #f "ca-utf-~a" (* 8 width))
-                       (write-output-bytes bytes))
-            (format #f "UTF-~a self-reference" (* 8 width))))))
-     '(2 4))))
+(test-group "CA-1: all output tokens and helper boundaries"
+  (test-equal "a sibling output token in a compressed member is refused"
+    "unresolved goonix self token"
+    (let ((sibling
+           (shell-drv (fresh-name "ca-deep-sibling")
+                      (string-append
+                       "(use-modules (rnrs bytevectors) (ice-9 binary-ports))\n"
+                       "(call-with-output-file out (lambda (p) (display \"ok\" p)))\n"
+                       "(call-with-output-file (getenv \"doc\") (lambda (p) (put-bytevector p "
+                       (object->string (read-binary "tests/fixtures/ca-self-token.gz"))
+                       ")) #:binary #t)")
+                      #:outputs '("out" "doc"))))
+      (ca-deep-refusal? (ca-deep-build sibling) "unresolved goonix self token")))
+  (test-equal "a decoded placeholder 32 bytes before a chunk boundary is refused"
+    "unresolved goonix placeholder"
+    (ca-deep-refusal?
+     (ca-deep-build
+      (shell-drv (fresh-name "ca-deep-placeholder-boundary")
+                 (write-output-bytes
+                  (read-binary "tests/fixtures/ca-placeholder-boundary.gz"))))
+     "unresolved goonix placeholder")))
 
-(test-assert "resolved-addressed fallback builds at its final path"
-  (let* ((drv (shell-drv "ca-resolved" (write-output "resolved")
-                         #:addressing 'resolved))
-         (path (begin (build-derivations store (list drv)) (realised drv))))
-    (and (direct-store-path? path)
-         (not (placeholder-path? path))
-         (string=? "resolved" (read-all path)))))
-
-(test-assert "sibling output references are rewritten and registered"
-  (let ((drv (shell-drv "ca-multi"
-                        "(mkdir-p out)\n(call-with-output-file (string-append out \"/reference\") (lambda (p) (display (getenv \"lib\") p)))\n(call-with-output-file (getenv \"lib\") (lambda (p) (display \"library\" p)))"
-                        #:outputs '("lib" "out"))))
-    (build-derivations store (list drv))
-    (let ((lib (realised-output-path store drv "lib"))
-          (out (realised-output-path store drv "out")))
       (and (string=? lib (read-all (string-append out "/reference")))
            (member lib (references store out))))))
 

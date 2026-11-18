@@ -119,12 +119,23 @@ outside a whole occurrence, UTF-16/UTF-32 token, or reserved placeholder is
 an output rejection naming the file and byte offset.  Ordinary finalisation
 permits a self token hidden in a gzip member.  The client can request the
 CA-1 policy with `set-build-options` keyword `deep-scan?`; it sends the
-per-connection `goonix-deep-scan` setting.  The daemon then streams each
-regular file's gzip, xz, bzip2 or ZIP member, retaining overlap across
-decoded chunks, and rejects the output's 32-character self token with its
-decompressed byte offset.
-It refuses a member expanding beyond 256 MiB.  Deep scanning is opt-in;
-there is no daemon-wide command-line switch.
+per-connection `goonix-deep-scan` setting, accepted from any client because
+it only makes that connection's builds stricter.  It applies to builds
+performed on that connection; an item that is already valid is not scanned
+again.  Before finalization, the daemon runs the optional libexec `goonix-ca-scan` helper with every output token of the
+derivation.  The helper, not the daemon, streams gzip, xz, bzip2 and ZIP
+members and detects known output tokens and reserved placeholder paths.
+It retains 32 bytes across decoded chunks, so the reserved pattern's `-`
+can arrive in the next read.  On a root daemon the child clears supplementary
+groups and assumes the still-held build user's UID and GID.  Under a
+non-root daemon it runs as the daemon's own user: this is no reduction of
+privilege.  Its standard input is `/dev/null`, its environment is empty, and
+inherited descriptors are closed.  It has a one-hour whole-tree backstop and
+a 256 MiB decoded-member ceiling.  Exit 0 is clean,
+exit 1 reports `self-token` or `placeholder`, file and decoded offset, and
+exit 2 is an error.  Missing helpers, crashes, timeouts, malformed results
+and every nonzero status refuse the build.  The daemon and libstore do not
+link libarchive; deep scanning is opt-in and there is no daemon-wide switch.
 Existing store items are never overwritten; a valid existing item must
 round-trip to the same hash.
 
