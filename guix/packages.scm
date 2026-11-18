@@ -41,6 +41,7 @@
   #:use-module (guix records)
   #:use-module (guix store)
   #:use-module (guix monads)
+  #:use-module (guix package-overrides)          ;goonix: lowering-time overrides
   #:use-module (guix gexp)
   #:use-module (guix base32)
   #:autoload   (guix base64) (base64-decode)
@@ -196,10 +197,6 @@
 
             package->bag
             bag->derivation
-
-            %package-overrides ;goonix: lowering-time overrides
-            package-override-key
-            with-package-overrides
             bag-direct-inputs
             bag-transitive-inputs
             bag-transitive-host-inputs
@@ -2023,67 +2020,6 @@ TARGET."
                       (derivation=? obj1 obj2))
                  (equal? obj1 obj2))))))))
 
-(define %package-overrides
-  ;; Lowering-time package replacements, consulted whenever a package becomes
-  ;; a derivation.  The value is a list of (ORIGINAL . REPLACEMENT) pairs,
-  ;; compared with 'eq?' on ORIGINAL and applied in order: the first entry
-  ;; whose original is 'eq?' to the package wins.  An empty list--the
-  ;; default--means no override at all, and lowering then proceeds exactly as
-  ;; it does without this mechanism.
-  (make-parameter '()))
-
-(define (package-override-key overrides)
-  "Return a cache-key component for OVERRIDES, or #f when OVERRIDES is empty.
-#f keeps the derivation cache keys of override-free lowering unchanged.
-Packages are identified by name and version, which is stable across the
-'eq?'-distinct copies that package-producing procedures may return."
-  (and (not (null? overrides))
-       (map (match-lambda
-              ((original . replacement)
-               (cons (cons (package-name original)
-                           (package-version original))
-                     (cons (package-name replacement)
-                           (package-version replacement)))))
-            overrides)))
-
-(define-syntax-rule (with-package-overrides overrides body ...)
-  "Lower BODY ... with OVERRIDES, a list of (ORIGINAL . REPLACEMENT) package
-pairs, installed as lowering-time overrides.  Each occurrence of ORIGINAL as
-an input, at any depth, is replaced by REPLACEMENT when it becomes a
-derivation; no package object is copied or rewritten ahead of time.
-
-REPLACEMENT's own references to ORIGINAL are exempt: while REPLACEMENT is
-being lowered, the entry replacing ORIGINAL is removed, so wrappers built on
-top of the original package keep working."
-  (let* ((new overrides)
-         (previous (%package-overrides))
-         (combined (append new previous)))
-    (state-parameterize ((%package-overrides combined))
-      (clear-object-cache)
-      (mlet %store-monad ((result (mbegin %store-monad body ...)))
-        (mbegin %store-monad
-          (clear-object-cache)
-          (return result))))))
-
-(define (apply-package-overrides package)
-  "Return the package that PACKAGE lowers to under '%package-overrides'.
-The first matching entry wins; entries are composed in order."
-  (let loop ((entries (%package-overrides)))
-    (match entries
-      (() package)
-      (((original . replacement) . rest)
-       (if (eq? original package)
-           replacement
-           (loop rest))))))
-
-(define (override-exempt-entries original replacement)
-  "Return the override entries to keep while lowering REPLACEMENT, the
-replacement of ORIGINAL: every entry except those replacing ORIGINAL.  This
-exempts REPLACEMENT's own references to ORIGINAL, so wrapping works."
-  (remove (match-lambda
-            ((candidate . _) (eq? candidate original)))
-          (%package-overrides)))
-
 (define* (bag->derivation bag #:optional context)
   "Return the derivation to build BAG for SYSTEM.  Optionally, CONTEXT can be
 a package object describing the context in which the call occurs, for improved
@@ -2161,29 +2097,6 @@ This is an internal procedure."
 (define graft-derivation*
   (store-lift graft-derivation))
 
-(define* (lower-package-derivation package system target
-                                   #:key (graft? (%graft?)))
-  "Lower PACKAGE to a derivation for SYSTEM (and TARGET when cross-building),
-without consulting '%package-overrides'.  This is the raw lowering step; the
-override-aware entry points below resolve replacements and install the
-wrapping exemption around this call."
-  (mlet* %store-monad ((bag (return (package->bag package system target
-                                                  #:graft? graft?)))
-                       (drv (bag->derivation bag package)))
-    (if graft?
-        (>>= (bag-grafts bag)
-             (match-lambda
-               (()
-                (return drv))
-               (grafts
-                (mlet %store-monad ((guile (package->derivation
-                                            (guile-for-grafts)
-                                            system #:graft? #f)))
-                  (graft-derivation* drv grafts
-                                     #:system system
-                                     #:guile guile)))))
-        (return drv))))
-
 (define* (package->derivation package
                               #:optional (system (%current-system))
                               #:key (graft? (%graft?)))
@@ -2192,35 +2105,52 @@ wrapping exemption around this call."
   ;; Compute the derivation and cache the result.  Caching is important
   ;; because some derivations, such as the implicit inputs of the GNU build
   ;; system, will be queried many, many times in a row.
-  (mcached (mlet* %store-monad ((effective -> (apply-package-overrides package)))
-             (if (eq? effective package)
-                 (lower-package-derivation package system #f #:graft? graft?)
-                 ;; Lower the replacement with the entries replacing PACKAGE
-                 ;; removed for the whole extent of its lowering, so its own
-                 ;; references to PACKAGE are exempt and wrapping works.
-                 (state-parameterize
-                     ((%package-overrides
-                       (override-exempt-entries package effective)))
-                   (lower-package-derivation effective system #f
-                                             #:graft? graft?))))
-           package system #f graft? (package-override-key (%package-overrides))))
+  (mcached (mlet* %store-monad ((bag -> (package->bag package system #f
+                                                      #:graft? graft?))
+                                (drv (bag->derivation bag package)))
+             (if graft?
+                 (>>= (bag-grafts bag)
+                      (match-lambda
+                        (()
+                         (return drv))
+                        (grafts
+                         (mlet %store-monad ((guile (package->derivation
+                                                     (guile-for-grafts)
+                                                     system #:graft? #f)))
+                           (graft-derivation* drv grafts
+                                              #:system system
+                                              #:guile guile)))))
+                 (return drv)))
+           package system #f graft?
+           (package-override-key)))               ;goonix: overrides in effect
 
 (define* (package->cross-derivation package target
                                     #:optional (system (%current-system))
                                     #:key (graft? (%graft?)))
   "Cross-build PACKAGE for TARGET (a GNU triplet) from host SYSTEM (a Guix
 system identifying string)."
-  (mcached (mlet* %store-monad ((effective -> (apply-package-overrides package)))
-             (if (eq? effective package)
-                 (lower-package-derivation package system target
-                                           #:graft? graft?)
-                 (state-parameterize
-                     ((%package-overrides
-                       (override-exempt-entries package effective)))
-                   (lower-package-derivation effective system target
-                                             #:graft? graft?))))
+  (mcached (mlet* %store-monad ((bag -> (package->bag package system target
+                                                      #:graft? graft?))
+                                (drv (bag->derivation bag package)))
+             (if graft?
+                 (>>= (bag-grafts bag)
+                      (match-lambda
+                        (()
+                         (return drv))
+                        (grafts
+                         (mlet %store-monad ((guile (package->derivation
+                                                     (guile-for-grafts)
+                                                     system #:graft? #f)))
+                           (graft-derivation* drv grafts
+                                              #:system system
+                                              #:guile guile)))))
+                 (return drv)))
            package system target graft?
-           (package-override-key (%package-overrides))))
+           (package-override-key)))               ;goonix: overrides in effect
+
+;; goonix: both heed the overrides in effect; see (guix package-overrides).
+(set! package->derivation (overridable package->derivation))
+(set! package->cross-derivation (overridable package->cross-derivation))
 
 (define* (package-output store package
                          #:optional (output "out") (system (%current-system)))

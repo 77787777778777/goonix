@@ -51,6 +51,7 @@
   #:autoload   (guix build syscalls) (terminal-columns)
   #:use-module (guix transformations)
   #:autoload   (guix pure-eval) (pure-build-derivations) ;goonix: --pure-eval
+  #:use-module (guix flakes options)              ;goonix: flake references
   #:autoload   (guix scripts flake) (flake-reference? ;goonix: DIRECTORY#NAME
                                      flake-package-derivation)
   #:export (log-url
@@ -162,6 +163,7 @@ found.  Return #f if no build log was found."
   "Display on the current output port help about the standard command-line
 options handled by 'set-build-options-from-command-line', and listed in
 '%standard-build-options'."
+  (show-flake-reference-options-help)             ;goonix: flake references
   (display (G_ "
   -L, --load-path=DIR    prepend DIR to the package module search path"))
   (display (G_ "
@@ -341,6 +343,10 @@ use '--no-offload' instead~%")))
                         (apply values (alist-cons 'max-jobs c result) rest)
                         (leave (G_ "not a number: '~a' option argument: ~a~%")
                                name arg)))))))
+
+;; goonix: the commands that build take the options of a flake reference.
+(set! %standard-build-options
+      (append %flake-reference-options %standard-build-options))
 
 (define (list-systems)
   "Print the available systems."

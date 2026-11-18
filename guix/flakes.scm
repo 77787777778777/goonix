@@ -1,4 +1,4 @@
-;;; goonix: public flake data interface.
+;;; goonix: the declarations and locks of flakes, in one module.
 ;;; GNU Guix --- Functional package management for GNU
 ;;; Copyright © 2026 goonix contributors
 ;;;
@@ -14,27 +14,26 @@
   #:use-module (guix flakes lock)
   #:use-module (guix flakes resolve)
   #:re-export (flake? flake-format flake-description flake-modules
-               flake-inputs flake-options flake-outputs-expression flake-source
+               flake-inputs flake-options flake-outputs-expression
                flake-input? flake-input-name flake-input-type flake-input-url
                flake-input-path flake-input-branch flake-input-tag
                flake-input-commit flake-input-as flake-input-worktree?
                flake-input-pinned? flake-input-follows flake-input-overrides
-               flake-input-options flake-input-introduction flake-input-same-as
+               flake-input-options flake-input-introduction
                flake-option? flake-option-name flake-option-type
                flake-option-default flake-option-description
-               read-data-file read-data-string read-flake
-               flake-lock? make-flake-lock flake-lock flake-lock-version flake-lock-inputs
-               locked-input? make-locked-input locked-input locked-input-name
-               locked-input-type locked-input-url locked-input-path
-               locked-input-branch locked-input-tag locked-input-commit
-               locked-input-tree-hash locked-input-as locked-input-worktree?
-               locked-input-dependency-path locked-input-identity
-               locked-input-authentication locked-input-introduction
-               locked-input-edges locked-input-options locked-input-checkout
-               lock-edge? make-lock-edge lock-edge lock-edge-from lock-edge-name
-               lock-edge-kind lock-edge-target lock-edge-child
-               read-flake-lock read-flake-local write-flake-lock
-               flake-lock->sexp
-               lock-flake update-flake verify-flake-lock
-               read-local-overrides effective-flake-lock flake-metadata
-               channel-inputs declared-inputs))
+               read-flake
+
+               flake-lock? flake-lock-inputs flake-lock-nodes
+               lock-node? lock-node-id lock-node-type lock-node-url
+               lock-node-path lock-node-branch lock-node-tag
+               lock-node-commit lock-node-tree-hash lock-node-worktree?
+               lock-node-authentication lock-node-inputs
+               lock-edge? lock-edge-name lock-edge-node lock-edge-kind
+               lock-edge-as lock-edge-options lock-edge-target
+               flake-lock-node flake-lock-root-edge lock-node-edge
+               read-flake-lock write-flake-lock flake-lock->string
+
+               resolve-flake-lock lock-flake effective-flake-lock
+               read-local-overrides parse-input-override
+               lock-node-tree lock-notices flake-metadata))

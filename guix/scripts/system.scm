@@ -91,12 +91,7 @@
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
-  #:autoload   (guix pure-eval) (pure-system-action) ;goonix: --pure-eval
-  #:autoload   (guix scripts flake) (flake-reference? ;goonix: flake refs
-                                     parse-flake-reference
-                                     flake-output-derivation
-                                     flake-acting-output
-                                     flake-checked-output)
+  #:autoload   (guix scripts flake) (flake-command-action) ;goonix: flakes
   #:export (guix-system
             process-action               ;goonix: for the evaluator
             read-operating-system
@@ -1311,20 +1306,6 @@ resulting from command-line parsing."
                             (G_ "both file and expression cannot be specified~%")))
                           (expr
                            (read/eval expr))
-                          ;; goonix: a flake reference resolves to a systems
-                          ;; (or images) output.  Host-changing actions gate
-                          ;; the acting object against the pure derivation.
-                          ((and file (flake-reference? file))
-                           (let* ((ref (parse-flake-reference file))
-                                  (directory (car ref))
-                                  (name (or (cdr ref) 'default))
-                                  (kind (if (eq? action 'image) 'images 'systems)))
-                             (with-store store
-                               (if (memq action '(reconfigure init))
-                                   (flake-checked-output store directory kind
-                                                         name opts)
-                                   (flake-acting-output store directory kind
-                                                        name opts)))))
                           (file
                            (load* file %user-modules
                                   #:on-error (assoc-ref opts 'on-error)))
@@ -1495,12 +1476,12 @@ argument list and OPTS is the option alist."
          (roll-back-system store))))
     ;; The following commands need to use the store, and they also
     ;; need an operating system configuration file.
-    (else (if (assoc-ref opts 'pure-eval?)        ;goonix: --pure-eval
-              (pure-system-action command args opts)
-              (process-action command args opts)))))
+    (else (process-action command args opts))))
 
 (define-command (guix-system . args)
   (synopsis "build and deploy full operating systems")
+
+  (define arguments args)                         ;goonix: as they were given
 
   (define (parse-sub-command arg result)
     ;; Parse sub-command ARG and augment RESULT accordingly.
@@ -1562,7 +1543,10 @@ argument list and OPTS is the option alist."
            (command  (assoc-ref opts 'action)))
       (parameterize ((%graft? (assoc-ref opts 'graft?)))
         (with-status-verbosity (verbosity-level opts)
-          (process-command command args opts))))))
+          ;; goonix: with '--pure-eval' or a flake reference, the
+          ;; evaluation is not done here.
+          (or (flake-command-action 'system command args opts arguments)
+              (process-command command args opts)))))))
 
 ;;; Local Variables:
 ;;; eval: (put 'with-store* 'scheme-indent-function 1)

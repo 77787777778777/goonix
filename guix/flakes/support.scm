@@ -1,8 +1,15 @@
-;;; goonix: evaluator-side vocabulary.  No host files are consulted.
+;;; goonix: what the 'outputs' procedure of a flake can use.
+;;; GNU Guix --- Functional package management for GNU
+;;; Copyright © 2026 goonix contributors
+;;;
+;;; This file is part of GNU Guix.
+;;;
+;;; GNU Guix is free software: you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation, either version 3 of the License, or
+;;; (at your option) any later version.
+
 (define-module (guix flakes support)
-  #:use-module (srfi srfi-9)
-  #:use-module (srfi srfi-1)
-  #:use-module (ice-9 match)
   #:use-module (guix packages)
   #:use-module (guix records)
   #:use-module (guix profiles)
@@ -10,95 +17,191 @@
   #:use-module (guix gexp)
   #:use-module (guix monads)
   #:use-module (guix store)
+  #:use-module (guix search-paths)
   #:use-module ((guix utils) #:select (%current-system))
-  #:export (option system target input-source input-output
-            self self-file self-revision source-set shell
-            input-handle? input-handle-path input-handle-metadata
-            handle->derivation
-            shell? shell-packages shell-inputs-from shell-environment
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  ;; 'system' is also the name of a procedure of Guile; a flake means this
+  ;; one.
+  #:replace (system)
+  #:export (option target
+            input-source input-output
+            self self-file self-revision source-set
+
+            shell shell? shell-packages shell-inputs-from shell-environment
             shell->manifest
+
             override override? override-original override-replacement
-            override-transform))
 
+            input-handle? input-handle-derivation input-handle-metadata
+            input-handle->manifest-entry
+
+            make-context %ask-host))
+
+;;; Commentary:
+;;;
+;;; This module runs in the evaluator, which may be a Guix that has never
+;;; heard of flakes: the host hands it this file as source.  It therefore
+;;; uses only what Guix has had for long.
+;;;
+;;; Code:
+
+;; What 'outputs' is called with.
+(define-record-type <context>
+  (make-context system target options source revision inputs)
+  context?
+  (system   context-system)
+  (target   context-target)
+  (options  context-options)                      ;alist
+  (source   context-source)                       ;the tree, a store item
+  (revision context-revision)                     ;commit, or #f
+  (inputs   context-inputs))                      ;((NAME AS TREE) ...)
+
+(define %ask-host
+  ;; A procedure that takes a request, an S-expression, and returns the
+  ;; answer of the host.  The evaluator sets it.
+  (make-parameter
+   (lambda (request)
+     (error "no host to ask" request))))
+
+(define (system context)
+  "Return the system that the outputs are for."
+  (context-system context))
+
+(define (target context)
+  "Return the cross-compilation target, or #f."
+  (context-target context))
+
+(define (option context name)
+  "Return the value of the option NAME of the flake."
+  (match (assq name (context-options context))
+    ((_ . value) value)
+    (#f (error "the flake declares no such option" name))))
+
+(define (input context name)
+  (or (assq name (context-inputs context))
+      (error "the flake has no such input" name)))
+
+(define (input-source context name)
+  "Return the tree of the input NAME: the name of a directory in the store."
+  (match (input context name)
+    ((_ as tree) tree)))
+
+;; An output of another flake.  Only its derivation and what a consumer
+;; needs to know about it cross from that flake's evaluator to this one.
 (define-record-type <input-handle>
-  (make-input-handle path metadata)
+  (make-input-handle derivation metadata)
   input-handle?
-  (path input-handle-path)
-  (metadata input-handle-metadata))
-
-(define (handle->derivation store handle)
-  (read-derivation-from-file (input-handle-path handle)))
+  (derivation input-handle-derivation)            ;file name
+  (metadata   input-handle-metadata))             ;alist
 
 (define-gexp-compiler input-handle-compiler <input-handle>
   compiler => (lambda (handle system target)
                 (with-monad %store-monad
-                  (return (read-derivation-from-file (input-handle-path handle)))))
-  expander => (lambda (handle drv output)
-                (derivation->output-path drv output)))
+                  (return (read-derivation-from-file
+                           (input-handle-derivation handle)))))
+  expander => (lambda (handle derivation output)
+                (derivation->output-path derivation output)))
 
-(define (option context name) (assoc-ref (assoc-ref context 'options) name))
-(define (system context) (assoc-ref context 'system))
-(define (target context) (assoc-ref context 'target))
-(define (input-source context name) (cadr (assoc-ref (assoc-ref context 'inputs) name)))
 (define (input-output context name kind output)
-  (let ((value (assoc-ref (assoc-ref context 'inputs) name)))
-    (unless value (error "unknown flake input" name))
-    (unless (eq? 'flake (car value)) (error "not a flake input" name))
-    ;; This is a request to the host; the response contains only a handle.
-    (write (list 'input-output name kind output))
-    (newline)
-    (force-output)
-    (let ((response (read)))
-      (unless (and (pair? response) (eq? 'handle (car response)))
-        (error "invalid dependency handle" response))
-      (apply make-input-handle (cdr response)))))
-(define (self context) context)
-(define (self-file context name) (string-append (assoc-ref context 'source) "/" name))
-(define (self-revision context) (assoc-ref context 'revision))
+  "Return a handle to the output OUTPUT of kind KIND of the flake input NAME.
+That flake is evaluated in a process of its own, with its own inputs."
+  (match (input context name)
+    ((_ 'flake tree)
+     (match ((%ask-host) `(input-output ,name ,kind ,output))
+       (('handle derivation metadata)
+        (make-input-handle derivation metadata))
+       (answer (error "the host gave no handle" name kind output answer))))
+    (_ (error "not a flake input; use (as flake), or 'input-source'" name))))
+
+(define* (input-handle->manifest-entry handle #:optional (output "out"))
+  "Return a manifest entry for HANDLE, with the version, the search paths
+and the propagated inputs that its flake reported."
+  (let ((metadata (input-handle-metadata handle)))
+    (manifest-entry
+      (name (or (assq-ref metadata 'name) "input"))
+      (version (or (assq-ref metadata 'version) "0"))
+      (output output)
+      (item handle)
+      (search-paths (map sexp->search-path-specification
+                         (or (assq-ref metadata 'search-paths) '())))
+      (dependencies
+       (map (match-lambda
+              ((name derivation output)
+               (manifest-entry
+                 (name name) (version "0") (output output)
+                 (item (make-input-handle derivation '())))))
+            (or (assq-ref metadata 'propagated-inputs) '()))))))
+
+(define (self context)
+  "Return the flake itself, for 'self-file', 'source-set' and
+'self-revision'."
+  context)
+
+(define (self-file context name)
+  "Return the name of the file NAME of the flake's own tree."
+  (string-append (context-source context) "/" name))
+
+(define (self-revision context)
+  "Return the commit of the flake's tree, or #f when the tree has changes
+that are not committed."
+  (context-revision context))
+
 (define (source-set context . files)
-  (write (list 'source-set files)) (newline) (force-output)
-  (let ((response (read)))
-    (unless (and (pair? response) (eq? 'source (car response)))
-      (error "invalid source-set response" response))
-    (cadr response)))
-(define-record-type* <shell> shell make-shell shell?
-  (packages shell-packages (default '()))
+  "Return a store item that holds FILES, files of the flake's own tree named
+relative to it, and nothing else: a change to any other file of the tree does
+not change it."
+  (define source (context-source context))
+
+  (define (components file)
+    (let ((parts (string-split file #\/)))
+      (when (or (string-null? file) (string-prefix? "/" file)
+                (any (lambda (part) (member part '("" "." ".."))) parts))
+        (error "source-set: not a file name relative to the tree" file))
+      parts))
+
+  (define selected
+    ;; Each file, and the directories that lead to it.  All of them must be
+    ;; directories of the tree itself: a symbolic link among them would
+    ;; lead elsewhere.
+    (append-map
+     (lambda (file)
+       (let loop ((parts (components file)) (directory source) (result '()))
+         (match parts
+           ((last)
+            (let ((name (string-append directory "/" last)))
+              (unless (false-if-exception (lstat name))
+                (error "source-set: no such file in the tree" file))
+              (cons name result)))
+           ((head . tail)
+            (let ((name (string-append directory "/" head)))
+              (unless (eq? 'directory
+                           (and=> (false-if-exception (lstat name))
+                                  stat:type))
+                (error "source-set: reached through something that is not \
+a directory of the tree" file))
+              (loop tail name (cons name result)))))))
+     files))
+
+  (define (below-selected? file)
+    ;; A selected directory is taken whole.
+    (any (lambda (name)
+           (string-prefix? (string-append name "/") file))
+         selected))
+
+  (with-store store
+    (add-to-store store "source-set" #t "sha256" source
+                  #:select? (lambda (file stat)
+                              (or (member file selected)
+                                  (below-selected? file))))))
+
+;; What 'guix shell' enters.
+(define-record-type* <shell> shell make-shell
+  shell?
+  (packages    shell-packages (default '()))
   (inputs-from shell-inputs-from (default '()))
   (environment shell-environment (default '())))
-
-(define-record-type* <override> override make-override override?
-  (original override-original)
-  (replacement override-replacement))
-
-(define-record-type <replacement>
-  (make-replacement object original overrides)
-  replacement?
-  (object replacement-object)
-  (original replacement-original)
-  (overrides replacement-overrides))
-
-(define (override-transform overrides)
-  "Replace matching package objects at lowering time, in declaration order."
-  (lambda (object)
-    (let loop ((items overrides))
-      (match items
-        (() object)
-        ((item . rest)
-         (if (eq? object (override-original item))
-             (make-replacement (override-replacement item)
-                               (override-original item) overrides)
-             (loop rest)))))))
-
-(define-gexp-compiler (replacement-compiler (value <replacement>) system target)
-  ;; A wrapper's reference to its original is exempt.  Other overrides still
-  ;; apply while its dependency graph is lowered.
-  (with-transformation
-      (let ((original (replacement-original value))
-            (overrides (replacement-overrides value))
-            (transform (override-transform (replacement-overrides value))))
-        (lambda (object)
-          (if (eq? object original) object (transform object))))
-    (lower-object (replacement-object value) system #:target target)))
 
 (define* (shell->manifest object #:optional (system (%current-system)))
   "Return the manifest of OBJECT: a shell, a manifest, or a package, which
@@ -114,6 +217,12 @@ stands for the shell that holds this one package."
     ((? package? package) (packages->manifest (list package)))
     (_ (error "not a shell, a manifest or a package" object))))
 
-(define-gexp-compiler (shell-compiler (object <shell>) system target)
-  (profile-derivation (shell->manifest object system)
-                      #:system system #:target target))
+;; One entry of the 'overrides' output: wherever ORIGINAL is lowered,
+;; REPLACEMENT is lowered in its place.
+(define-record-type <override>
+  (override original replacement)
+  override?
+  (original    override-original)
+  (replacement override-replacement))
+
+;;; support.scm ends here

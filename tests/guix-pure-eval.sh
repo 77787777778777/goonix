@@ -156,8 +156,9 @@ same -f "$project/tracked-project.scm"
 
 # The options of the command apply inside.
 same -f "$project/tracked.scm" --system=i686-linux
-test "`guix build -d --pure-eval -f "$project/tracked.scm" --system=i686-linux`" \
-     != "`guix build -d --pure-eval -f "$project/tracked.scm"`"
+other="`guix build -d --pure-eval -f "$project/tracked.scm" --system=i686-linux`"
+test -n "$other"
+test "$other" != "`guix build -d --pure-eval -f "$project/tracked.scm"`"
 same -S -f "$project/source.scm"
 guix build -d --pure-eval -S -f "$project/source.scm" \
     | grep 'pure-eval-source\.tar\.gz\.drv$'
@@ -169,8 +170,9 @@ same -m "$project/manifest.scm"
 (cd "$project"; fails guix build -d --pure-eval -e '(load "untracked.scm")')
 
 # What the project prints is not part of the result.
-test "`guix build -d --pure-eval -f "$project/noisy.scm" 2> /dev/null`" \
-     = "`guix build -d -f "$project/noisy.scm" | grep -v NOISE`"
+quiet="`guix build -d --pure-eval -f "$project/noisy.scm" 2> /dev/null`"
+test -n "$quiet"
+test "$quiet" = "`guix build -d -f "$project/noisy.scm" | grep -v NOISE`"
 
 #
 # 'guix shell': the profile is the one an ordinary evaluation makes.
@@ -210,8 +212,9 @@ cat > "$project/shell.scm" <<'END'
 END
 git -C "$project" add shell.scm
 
-test "`shell_paths -f "$project/shell.scm"`" \
-     = "`shell_paths --pure-eval -f "$project/shell.scm"`"
+impure="`shell_paths -f "$project/shell.scm"`"
+test -n "$impure"
+test "$impure" = "`shell_paths --pure-eval -f "$project/shell.scm"`"
 shell_paths --pure-eval -f "$project/shell.scm" | grep PURE_EVAL_TOOLS
 
 # The propagated input is in the profile.

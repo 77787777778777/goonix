@@ -74,7 +74,7 @@ and a file in a directory, and that holds one more file it does not track."
 
 ;; The tests below start the evaluator.
 (unless (pure-eval-supported?)
-  (test-skip 11))
+  (test-skip 12))
 
 (test-equal "a value comes back"
   '(1 "two" three (4 . #t))
@@ -110,6 +110,17 @@ and a file in a directory, and that holds one more file it does not track."
                            (and st (= (stat:ino st) ,inode)))))
        (list (primitive-eval same-file?)
              (evaluate-in-container same-file?))))))
+
+(test-equal "what the caller had buffered is written once"
+  "buffered"
+  ;; The evaluator starts as a copy of the caller, buffers included.
+  (call-with-temporary-output-file
+   (lambda (file port)
+     (setvbuf port 'block 4096)
+     (display "buffered" port)
+     (evaluate-in-container ''done)
+     (force-output port)
+     (call-with-input-file file (@ (ice-9 textual-ports) get-string-all)))))
 
 (test-equal "the host name is fixed"
   "localhost"

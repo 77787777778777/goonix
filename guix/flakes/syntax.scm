@@ -50,7 +50,9 @@
   (branch     flake-input-branch (default #f))
   (tag        flake-input-tag (default #f))
   (commit     flake-input-commit (default #f))
-  (as         flake-input-as (default 'flake))
+  ;; 'flake, 'library or 'source; #f when the declaration does not say, and
+  ;; the tree decides.
+  (as         flake-input-as (default #f))
   (worktree?  flake-input-worktree? (default #f))
   (pinned?    flake-input-pinned? (default #f))
   (follows    flake-input-follows (default '()))
@@ -76,9 +78,16 @@
       (condition (&error-location (location where)))))))
 
 (define (call-with-data-reader proc)
-  ;; Match Guix's read/safe: both read-eval and custom hash readers are off.
+  ;; Read data: '#.' is off, and of the reader extensions only those of
+  ;; G-expressions are on.  They are in the 'outputs' of most flakes, and
+  ;; all they do is to turn #~X into (gexp X) and the like.
   (with-fluids ((read-eval? #f))
-    (parameterize ((read-hash-procedures '()))
+    (parameterize ((read-hash-procedures
+                    (begin
+                      (resolve-interface '(guix gexp)) ;registers them
+                      (filter (match-lambda
+                                ((char . _) (memv char '(#\~ #\$ #\+))))
+                              (read-hash-procedures)))))
       (proc))))
 
 (define* (read-data-port port #:optional (source "data"))
@@ -185,7 +194,7 @@
             (commit (single properties 'commit #f))
             (worktree? (flag? properties 'worktree))
             (pinned? (flag? properties 'pinned))
-            (as (single properties 'as 'flake))
+            (as (single properties 'as #f))
             (same-as (let ((values (multiple properties 'same-as)))
                        (and (pair? values) values)))
             (nested (multiple properties 'inputs))
@@ -208,7 +217,7 @@
          (data-error datum "a local worktree input cannot also name a commit"))
        (when (and branch tag)
          (data-error datum "input '~a' has both a branch and a tag" name))
-       (unless (memq as '(flake library source))
+       (unless (memq as '(#f flake library source))
          (data-error datum "invalid input kind '~a'" as))
        (for-each
         (match-lambda
@@ -237,9 +246,13 @@
                                  ((their 'follows our) #f)
                                  (spec spec))
                                nested))
-        (options options)
-        (introduction (and=> (single properties 'introduction #f)
-                             sexp->introduction))
+        (options (map (match-lambda
+                        ((option value) (cons option value)))
+                      options))
+        ;; (introduction (commit COMMIT) (signer FINGERPRINT))
+        (introduction (match (multiple properties 'introduction)
+                        (() #f)
+                        (fields (sexp->introduction fields))))
         (same-as same-as)))))
 
 (define (flake-input->sexp input)
@@ -253,14 +266,16 @@
     ,@(if (flake-input-branch input) `((branch ,(flake-input-branch input))) '())
     ,@(if (flake-input-tag input) `((tag ,(flake-input-tag input))) '())
     ,@(if (flake-input-commit input) `((commit ,(flake-input-commit input))) '())
-    ,@(if (eq? 'flake (flake-input-as input)) '() `((as ,(flake-input-as input))))
+    ,@(if (flake-input-as input) `((as ,(flake-input-as input))) '())
     ,@(if (flake-input-worktree? input) '((worktree)) '())
     ,@(if (flake-input-pinned? input) '((pinned)) '())
     ,@(if (flake-input-same-as input) `((same-as ,(flake-input-same-as input))) '())
     ,@(if (flake-input-introduction input)
-          `((introduction ,(flake-input-introduction input))) '())
+          `((introduction ,@(flake-input-introduction input))) '())
     ,@(if (null? (flake-input-options input)) '()
-          `((options ,(flake-input-options input))))
+          `((options ,@(map (match-lambda
+                              ((option . value) (list option value)))
+                            (flake-input-options input)))))
     ,@(if (and (null? (flake-input-follows input))
                (null? (flake-input-overrides input))) '()
           `((inputs ,@(map (lambda (edge)

@@ -4,10 +4,12 @@
 
 MODULES +=					\
   guix/pure-eval.scm				\
+  guix/package-overrides.scm			\
   guix/ca.scm					\
   guix/flakes.scm				\
   guix/flakes/syntax.scm			\
   guix/flakes/lock.scm				\
+  guix/flakes/options.scm			\
   guix/flakes/checkout.scm			\
   guix/flakes/resolve.scm			\
   guix/flakes/evaluate.scm			\
@@ -31,7 +33,8 @@ SH_TESTS +=					\
   tests/guix-pure-eval.sh			\
   tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\
-  tests/guix-flake-shell.sh
+  tests/guix-flake-shell.sh			\
+  tests/guix-flake.sh
 
 # The hook check fails as long as upstream files hold logic of ours or
 # unmarked changes.  It is listed here so that the day it passes, the test
@@ -41,18 +44,7 @@ XFAIL_TESTS = build-aux/check-goonix-hooks.sh
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
   build-aux/goonix-upstream-base		\
-  tests/fixtures/flake-actions-app.scm	\
-  tests/fixtures/flake-actions-checks.scm	\
-  tests/fixtures/flake-actions-gate.scm	\
-  tests/fixtures/flake-actions-impure.scm	\
-  tests/fixtures/flake-actions-shell-app.scm	\
-  tests/fixtures/flake-child.scm	\
-  tests/fixtures/flake-override.scm	\
-  tests/fixtures/flake-parent.scm	\
-  tests/fixtures/flake-pinned-child.scm	\
-  tests/fixtures/flake-shell.scm	\
-  tests/fixtures/flake-shells.scm	\
-  tests/fixtures/flake-source-set.scm
+  tests/fixtures/flake-shells.scm
 
 if CAN_RUN_TESTS
 if BUILD_DAEMON

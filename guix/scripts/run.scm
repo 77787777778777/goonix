@@ -38,7 +38,6 @@ as a fallback.  ARG... is passed to the program.\n"))
   (show-build-options-help)
   (newline)
   (display (G_ "
-      --option=NAME=VALUE set a declared evaluation option
   -s, --system=SYSTEM     evaluate for SYSTEM
   -t, --target=TARGET     cross-evaluate for TARGET
   -h, --help              display this help and exit
@@ -54,15 +53,6 @@ as a fallback.  ARG... is passed to the program.\n"))
          (option '(#\V "version") #f #f
                  (lambda args
                    (show-version-and-exit "guix run")))
-         (option '("option") #t #f
-                 (lambda (opt name arg result)
-                   (let ((equal (string-index arg #\=)))
-                     (unless equal
-                       (leave (G_ "expected NAME=VALUE, got '~a'~%") arg))
-                     (alist-cons 'option
-                                 (cons (string->symbol (string-take arg equal))
-                                       (string-drop arg (+ equal 1)))
-                                 result))))
          (option '(#\s "system") #t #f
                  (lambda (opt name arg result)
                    (alist-cons 'system arg result)))
@@ -116,14 +106,6 @@ name the app explicitly~%") output))))))))
     (lambda () (eq? 'directory (stat:type (stat file))))
     (const #f)))
 
-(define (flake-output-kind-present? store directory kind opts)
-  (with-exception-handler
-      (lambda (condition) #f)
-    (lambda ()
-      (flake-acting-output store directory kind #f opts)
-      #t)
-    #:unwind? #t))
-
 (define-command (guix-run . args)
   (category development)
   (synopsis "build and run a flake app")
@@ -154,12 +136,10 @@ name the app explicitly~%") output))))))))
                                       #:use-substitutes?
                                       (assoc-ref opts 'substitutes?)
                                       #:verbosity (assoc-ref opts 'verbosity))
-                   ;; Prefer an 'apps' output; fall back to 'packages'.
-                   (let ((drv (if (flake-output-kind-present? store directory 'apps opts)
-                                  (flake-output-derivation store directory
-                                                           'apps name opts)
-                                  (flake-output-derivation store directory
-                                                           'packages name opts))))
+                   ;; An app of that name, else a package of that name.
+                   (let ((drv (flake-output-derivation store directory
+                                                       '(apps packages)
+                                                       name opts)))
                      (parameterize ((%graft? (assq-ref opts 'graft?)))
                        (build-derivations store (list drv))
                        (let* ((output (derivation->output-path drv))

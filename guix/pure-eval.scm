@@ -32,18 +32,21 @@
   #:use-module (srfi srfi-34)
   #:export (pure-eval-supported?
             import-tracked-tree
+            tracked-file-predicate
             tracked-tree-revision
-            import-source-set
-            import-guix-modules
 
             git-top-level
             import-projects
+            call-with-evaluator
             evaluate-in-container
             evaluator-main
 
             pure-build-derivations
             pure-shell-options
             pure-system-action
+            build-and-print
+            options-for-evaluator
+            answered-derivations
 
             contained-build-derivations
             contained-shell-profile
@@ -76,64 +79,19 @@ and the Guile that runs Guix can be mounted without the rest of the host."
        #t))
 
 (define (tracked-tree-revision directory)
-  "Return the commit of DIRECTORY, or #f when tracked contents have changed."
+  "Return the commit that is checked out in the Git work tree DIRECTORY, or
+#f when tracked files below it have changes that are not committed."
+  (define (git . arguments)
+    (let* ((port   (apply open-pipe* OPEN_READ %git "-C" directory arguments))
+           (output (get-string-all port)))
+      (and (zero? (close-pipe port)) output)))
+
   (and (file-exists? (string-append directory "/.git"))
-       (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
-                               "status" "--porcelain" "--untracked-files=no"
-                               "--ignore-submodules=all" "--" "."))
-              (changes (get-string-all port))
-              (status (close-pipe port)))
-         (and (zero? status) (string-null? (string-trim-both changes))
-              (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
-                                      "rev-parse" "HEAD"))
-                     (revision (get-string-all port))
-                     (status (close-pipe port)))
-                (and (zero? status) (string-trim-right revision)))))))
-
-(define (tree-files directory)
-  (let walk ((root directory) (prefix ""))
-    (append-map
-     (lambda (name)
-       (if (member name '("." ".."))
-           '()
-           (let* ((relative (if (string-null? prefix) name
-                                (string-append prefix "/" name)))
-                  (file (string-append root "/" name)))
-             (if (eq? 'directory (stat:type (lstat file)))
-                 (walk file relative)
-                 (list relative)))))
-     (scandir root))))
-
-(define (tracked-tree directory)
-  "Materialize the working contents of DIRECTORY's tracked files.
-The file names come from Git's index; contents come from the working tree.
-Untracked and ignored files are never read, and no host directory is exposed
-to the evaluator.  The caller owns the returned temporary directory."
-  (let ((temporary (mkdtemp (string-append (or (getenv "TMPDIR") "/tmp")
-                                           "/goonix-pure-tree.XXXXXX"))))
-    (dynamic-wind
-      (const #t)
-      (lambda ()
-        (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
-                                 "ls-files" "-z" "--" "."))
-               (names (string-split (get-string-all port) #\nul))
-               (status (close-pipe port)))
-          (unless (zero? status)
-            (error "cannot enumerate tracked project tree" directory))
-          (for-each
-           (lambda (name)
-             (unless (string-null? name)
-               (let ((source (string-append directory "/" name))
-                     (target (string-append temporary "/" name)))
-                 (mkdir-p (dirname target))
-                 (when (file-exists? source)
-                   (if (eq? 'symlink (stat:type (lstat source)))
-                       (symlink (readlink source) target)
-                       (begin (copy-file source target)
-                              (chmod target (stat:mode (lstat source)))))))))
-           names))
-        temporary)
-      (lambda () #f))))
+       (let ((changes (git "status" "--porcelain" "--untracked-files=no"
+                           "--ignore-submodules=all" "--" ".")))
+         (and changes
+              (string-null? (string-trim-both changes))
+              (and=> (git "rev-parse" "HEAD") string-trim-right)))))
 
 (define (tracked-files directory)
   "Return the names, relative to DIRECTORY, of the files below it that are in
@@ -146,129 +104,29 @@ Git's index."
       (error "cannot enumerate tracked project tree" directory))
     (remove string-null? names)))
 
-(define (import-tracked-tree store directory)
-  "Import into STORE the files below DIRECTORY that Git tracks, with the
-contents they have in the work tree, and return the store item.  Untracked
-and ignored files are never read.  The path of a submodule is kept as an
-empty directory."
-  (let* ((directory (canonicalize-path directory))
-         (prefix    (+ 1 (string-length directory)))
-         (selected  (make-hash-table)))
+(define (tracked-file-predicate directory)
+  "Return a predicate for 'add-to-store' and 'file-hash*' that selects, below
+DIRECTORY, the files that Git tracks and the directories that lead to them.
+DIRECTORY must be a canonical file name.  The path of a submodule is selected
+as a directory and nothing below it is."
+  (let ((prefix   (+ 1 (string-length directory)))
+        (selected (make-hash-table)))
     (for-each (lambda (name)
-                ;; Select the file and the directories that lead to it.
                 (let loop ((name name))
                   (unless (or (string=? name ".") (hash-ref selected name))
                     (hash-set! selected name #t)
                     (loop (dirname name)))))
               (tracked-files directory))
+    (lambda (file stat)
+      (hash-ref selected (string-drop file prefix)))))
+
+(define (import-tracked-tree store directory)
+  "Import into STORE the files below DIRECTORY that Git tracks, with the
+contents they have in the work tree, and return the store item.  Untracked
+and ignored files are never read."
+  (let ((directory (canonicalize-path directory)))
     (add-to-store store "pure-eval-project" #t "sha256" directory
-                  #:select? (lambda (file stat)
-                              (hash-ref selected (string-drop file prefix))))))
-
-(define (tracked-file-set directory files)
-  "Select FILES from DIRECTORY, which may already be an imported store tree."
-  (let* ((temporary (if (string-prefix? (string-append (%store-prefix) "/")
-                                        (canonicalize-path directory))
-                       #f
-                       (tracked-tree directory)))
-        (source-root (if (string-prefix? (string-append (%store-prefix) "/")
-                                        (canonicalize-path directory))
-                         (canonicalize-path directory)
-                         temporary)))
-    (for-each
-     (lambda (file)
-       (unless (and (string? file) (not (string-null? file))
-                    (not (string-prefix? "/" file))
-                    (not (member "" (string-split file #\/)))
-                    (not (member ".." (string-split file #\/)))
-                    (not (member "." (string-split file #\/))))
-         (error "invalid source-set file" file))
-       ;; Every directory on the way must be a real directory.  A tracked
-       ;; symbolic link among them would lead out of the tree, and the host
-       ;; would copy a file of the user's into the store.
-       (let loop ((directory source-root)
-                  (components (string-split file #\/)))
-         (match components
-           ((_) #t)
-           ((head . tail)
-            (let ((next (string-append directory "/" head)))
-              (unless (and (file-exists? next)
-                           (eq? 'directory (stat:type (lstat next))))
-                (error "source-set file is reached through a symbolic link"
-                       file))
-              (loop next tail)))))
-       (let ((path (string-append source-root "/" file)))
-         (unless (and (file-exists? path) (not (eq? 'directory (stat:type (lstat path)))))
-           (error "source-set file is not tracked" file))))
-     files)
-    (dynamic-wind
-      (const #t)
-      (lambda ()
-        (let ((selected (mkdtemp (string-append (or (getenv "TMPDIR") "/tmp")
-                                               "/goonix-source-set.XXXXXX"))))
-          (for-each
-           (lambda (file)
-             (let ((source (string-append source-root "/" file))
-                   (target (string-append selected "/" file)))
-               (mkdir-p (dirname target))
-               (if (eq? 'symlink (stat:type (lstat source)))
-                   (symlink (readlink source) target)
-                   (begin (copy-file source target)
-                          (chmod target (stat:mode (lstat source)))))))
-           files)
-          selected))
-      (lambda () (when temporary (delete-file-recursively temporary))))))
-
-(define (import-source-set store directory files)
-  "Import exactly the selected tracked FILES from DIRECTORY into STORE."
-  (let ((tree (tracked-file-set directory files)))
-    (dynamic-wind
-      (const #t)
-      (lambda () (add-to-store store "source-set" #t "sha256" tree))
-      (lambda () (delete-file-recursively tree)))))
-
-(define* (import-guix-modules store)
-  "Import the active Guix worktree's tracked Guix and GNU modules."
-  (let* ((module (search-path %load-path "guix/flakes/evaluator.scm"))
-         (root (if module
-                   (dirname (dirname (dirname (canonicalize-path module))))
-                   (getcwd)))
-         (temporary (mkdtemp (string-append (or (getenv "TMPDIR") "/tmp")
-                                            "/goonix-guix-modules.XXXXXX"))))
-    (dynamic-wind
-      (const #t)
-      (lambda ()
-        (let ((tree (tracked-tree root)))
-          (for-each
-           (lambda (file)
-             (when (or (member file '("guix.scm" "gnu.scm"))
-                       (string-prefix? "guix/" file)
-                       (string-prefix? "gnu/" file))
-               (let ((source (string-append root "/" file))
-                     (target (string-append temporary "/" file)))
-                 (mkdir-p (dirname target))
-                 (if (eq? 'symlink (stat:type (lstat source)))
-                     (symlink (readlink source) target)
-                     (copy-file source target))
-                 (when (string-suffix? ".scm" file)
-                   (let* ((compiled-name (string-append (dirname file) "/"
-                                                       (basename file ".scm") ".go"))
-                          (compiled (string-append root "/" compiled-name))
-                          (target-compiled (string-append temporary "/" compiled-name)))
-                     (when (file-exists? compiled)
-                       (copy-file compiled target-compiled)))))))
-           (tree-files tree))
-          (delete-file-recursively tree))
-        (for-each
-         (lambda (file)
-           (let ((source (string-append root "/" file))
-                 (target (string-append temporary "/" file)))
-             (when (file-exists? source)
-               (mkdir-p (dirname target))
-               (copy-file source target))))
-         '("guix/config.scm" "guix/config.go"))
-        (add-to-store store "pure-eval-guix-modules" #t "sha256" temporary))
-      (lambda () (delete-file-recursively temporary)))))
+                  #:select? (tracked-file-predicate directory))))
 
 (define* (mapping source #:optional (target source))
   (file-system
@@ -494,6 +352,14 @@ and the directories inside PROJECTS."
     ,(string-append "GUILE_LOAD_PATH=" (string-join (shown %load-path) ":"))
     ,(string-append "GUILE_LOAD_COMPILED_PATH="
                     (string-join (shown %load-compiled-path) ":"))
+    ;; Where a Guile that was not built by Guix finds the native parts of
+    ;; its libraries.
+    ,@(match (shown (string-tokenize (or (getenv "GUILE_EXTENSIONS_PATH") "")
+                                     (char-set-complement (char-set #\:))))
+        (() '())
+        (directories
+         (list (string-append "GUILE_EXTENSIONS_PATH="
+                              (string-join directories ":")))))
     "HOME=/tmp"
     "TMPDIR=/tmp"
     ,(string-append "NIX_STORE_DIR=" (%store-prefix))
@@ -504,72 +370,134 @@ and the directories inside PROJECTS."
          (list (string-append "GUIX_PACKAGE_PATH="
                               (string-join directories ":")))))))
 
-(define (close-other-descriptors keep)
-  "Close every file descriptor above standard error except KEEP: the
-evaluator must not inherit what the command had open."
+(define (close-other-descriptors . keep)
+  "Close every file descriptor above standard error except those in KEEP:
+the evaluator must not inherit what the command had open."
   (for-each (lambda (name)
               (let ((descriptor (string->number name)))
                 (when (and descriptor (> descriptor 2)
-                           (not (= descriptor keep)))
+                           (not (memv descriptor keep)))
                   (false-if-exception (close-fdes descriptor)))))
             (or (scandir "/proc/self/fd")
                 (map number->string (iota 1024)))))
 
 (define (evaluator-main)
-  "The entry point of the evaluator process: evaluate the expression given
-as the second argument and write (value RESULT) to the file descriptor given
-as the first."
+  "The entry point of the process that 'evaluate-in-container' starts:
+evaluate the expression given as the argument and write (value RESULT) to
+file descriptor 4."
   (match (command-line)
-    ((_ descriptor expression)
-     (let* ((port   (fdopen (string->number descriptor) "w"))
+    ((_ expression)
+     (let* ((port   (fdopen 4 "w"))
             (result (primitive-eval
                      (call-with-input-string expression read))))
        (write (list 'value result) port)
        (close-port port)))))
 
-(define* (evaluate-in-container expression
-                                #:key (projects '()) (directory (getcwd))
-                                (container? (pure-eval-supported?)))
-  "Evaluate EXPRESSION, an S-expression, in a fresh Guile process confined
-to a container, and return its value, which must have a written form that
-'read' takes back.  PROJECTS is a list of (DIRECTORY . TREE) pairs as returned
-by 'import-projects': the evaluator sees the store item TREE at DIRECTORY.
-It starts in DIRECTORY, the current directory by default.
+(define* (call-with-evaluator command proc
+                              #:key
+                              (projects '()) (directory "/") (load-path '())
+                              (container? (pure-eval-supported?))
+                              (guix? #t)
+                              acting?)
+  "Run COMMAND, a list of a program and its arguments, as an evaluator: a
+process confined to a container, with an environment made from nothing.  Call
+PROC with two ports, one that the process reads from its file descriptor 3
+and one that it writes to through its file descriptor 4, and return what PROC
+returns.  The process is ended if PROC leaves otherwise; that it ends with a
+failure after PROC returned is an error.
+
+PROJECTS is a list of (DIRECTORY . TREE) pairs as returned by
+'import-projects': the process sees the store item TREE at DIRECTORY.  It
+starts in DIRECTORY.  LOAD-PATH is a list of directories of the store that
+come first in its load path.  Without GUIX?, the load path of the Guix that
+is running is not handed down: COMMAND brings its own.
 
 Without CONTAINER?, which is the case where containers are not available (no
 user namespaces, as on the Hurd, or a Guile outside any store), the process
 runs with the same scrubbed environment on the host's file system, and a
-warning says so."
-  (define socket (daemon-socket-file))
-  (define environment (evaluator-environment socket projects))
-  (define contained? container?)
+warning says so.
 
-  (match (pipe)
-    ((input . output)
-     (let* ((response #f)
+With ACTING?, the process is not an evaluator but the same program let loose
+to act on this machine: it runs where the caller runs, with the caller's
+environment and standard output, and only LOAD-PATH put first."
+  (define socket (daemon-socket-file))
+
+  (define (with-load-path variable)
+    ;; LOAD-PATH comes before everything else.
+    (if (and (pair? load-path)
+             (string-prefix? "GUILE_LOAD_PATH=" variable))
+        (string-append "GUILE_LOAD_PATH="
+                       (string-join load-path ":") ":"
+                       (string-drop variable
+                                    (string-length "GUILE_LOAD_PATH=")))
+        variable))
+
+  (define environment
+    (if acting?
+        (let ((environment (map with-load-path (environ))))
+          (if (or (null? load-path)
+                  (any (cut string-prefix? "GUILE_LOAD_PATH=" <>)
+                       environment))
+              environment
+              (cons (string-append "GUILE_LOAD_PATH="
+                                   (string-join load-path ":"))
+                    environment)))
+        (map with-load-path
+             (if guix?
+                 (evaluator-environment socket projects)
+                 (remove (lambda (variable)
+                           (any (cut string-prefix? <> variable)
+                                '("GUILE_LOAD_PATH="
+                                  "GUILE_LOAD_COMPILED_PATH="
+                                  "GUILE_EXTENSIONS_PATH="
+                                  "GUIX_PACKAGE_PATH=")))
+                         (evaluator-environment socket projects))))))
+
+  ;; The processes made below are copies of this one, buffers included:
+  ;; leave nothing in them that a copy would write a second time.
+  (flush-all-ports)
+
+  (match (list (pipe) (pipe))
+    (((child-input . to-child) (from-child . child-output))
+     (let* ((result #f)
             (child
              (lambda ()
-               (close-port input)
-               (fcntl output F_SETFD 0)           ;survive 'exec'
-               ;; What the evaluated code prints is for the user to read,
-               ;; not part of the command's result.
-               (dup2 2 1)
-               (close-other-descriptors (fileno output))
-               (chdir (if (file-exists? directory) directory "/"))
-               (apply execle %guile environment
-                      %guile "--no-auto-compile" "-c"
-                      "((@ (guix pure-eval) evaluator-main))"
-                      (number->string (fileno output))
-                      (object->string expression)
-                      '())))
-            (receive
+               (close-port to-child)
+               (close-port from-child)
+               ;; Park both ends above the numbers they are to get, so that
+               ;; neither is in the way of the other.
+               (let ((input  (fcntl child-input F_DUPFD 10))
+                     (output (fcntl child-output F_DUPFD 10)))
+                 (dup2 input 3)
+                 (dup2 output 4)
+                 ;; What the evaluated code prints is for the user to read,
+                 ;; not part of the result.
+                 (unless acting?
+                   (dup2 2 1))
+                 (close-other-descriptors 3 4))
+               (unless acting?
+                 (chdir (if (file-exists? directory) directory "/")))
+               (apply execle (car command) environment command)))
+            (converse
              (lambda (pid)
-               ;; Let go of the write end first: an evaluator that dies
-               ;; without an answer must read as end of file.
-               (close-port output)
-               (set! response (false-if-exception (read input)))))
+               ;; Let go of the child's ends first: an evaluator that dies
+               ;; must read as end of file.
+               (close-port child-input)
+               (close-port child-output)
+               (set! result
+                     (with-exception-handler
+                         (lambda (exception)
+                           (false-if-exception (kill pid SIGKILL))
+                           (false-if-exception (waitpid pid))
+                           (raise-exception exception))
+                       (lambda ()
+                         (call-with-values
+                             (lambda () (proc to-child from-child))
+                           list))
+                       #:unwind? #t))
+               (false-if-exception (close-port to-child))))
             (status
-             (if contained?
+             (if (and container? (not acting?))
                  (call-with-container (container-mounts socket projects)
                    child
                    #:loopback-network? #f
@@ -582,28 +510,42 @@ warning says so."
                    (lambda ()
                      (sethostname "localhost")
                      (false-if-exception (mkdir-p directory)))
-                   #:process-spawned-hook receive)
+                   #:process-spawned-hook converse)
                  (begin
-                   (warning (G_ "no container can be made here; evaluating \
-with a scrubbed environment only~%"))
+                   (unless acting?
+                     (warning (G_ "no container can be made here; \
+evaluating with a scrubbed environment only~%")))
                    (match (primitive-fork)
                      (0 (dynamic-wind
                           (const #t)
                           child
                           (lambda () (primitive-_exit 127))))
-                     (pid (receive pid)
+                     (pid (converse pid)
                           (cdr (waitpid pid))))))))
-       (close-port input)
-       (match response
-         (('value value)
-          (if (zero? (exit-status status))
-              value
-              (raise (formatted-message
-                      (G_ "the evaluator failed after it answered")))))
-         (_
-          ;; The evaluator has reported what went wrong.
-          (raise (formatted-message
-                  (G_ "evaluation in the container failed")))))))))
+       (close-port from-child)
+       (unless (zero? (exit-status status))
+         ;; The evaluator has reported what went wrong.
+         (raise (formatted-message
+                 (G_ "evaluation in the container failed"))))
+       (apply values result)))))
+
+(define* (evaluate-in-container expression
+                                #:key (projects '()) (directory (getcwd))
+                                (container? (pure-eval-supported?)))
+  "Evaluate EXPRESSION, an S-expression, in a fresh Guile process (see
+'call-with-evaluator' for PROJECTS, DIRECTORY and CONTAINER?) and return its
+value, which must have a written form that 'read' takes back."
+  (match (call-with-evaluator
+          (list %guile "--no-auto-compile" "-c"
+                "((@ (guix pure-eval) evaluator-main))"
+                (object->string expression))
+          (lambda (to-evaluator from-evaluator)
+            (false-if-exception (read from-evaluator)))
+          #:projects projects #:directory directory
+          #:container? container?)
+    (('value value) value)
+    (_ (raise (formatted-message
+               (G_ "evaluation in the container failed"))))))
 
 
 ;;;
@@ -835,6 +777,27 @@ far as the derivations, and return their file names."
               lines)
     (filter derivation-path? lines)))
 
+(define (build-and-print store names opts)
+  "Build the derivations whose file names are NAMES and print what was
+built, as a command that only builds does: with '--derivation' print NAMES
+instead, with '--dry-run' say what would be built, and with '--root' register
+the first result."
+  (if (assoc-ref opts 'derivations-only?)
+      (for-each (cut format #t "~a~%" <>) names)
+      (let ((drvs (map read-derivation-from-file names)))
+        (with-build-handler (notifier opts)
+          (build-derivations store drvs)
+          (for-each (lambda (drv)
+                      (format #t "~a~%" (derivation->output-path drv)))
+                    drvs)
+          (match (assoc-ref opts 'gc-root)
+            (#f #t)
+            (root
+             ((@ (guix scripts build) register-root)
+              store
+              (list (derivation->output-path (first drvs)))
+              root)))))))
+
 (define (pure-system-action action args opts)
   "Carry out ACTION of 'guix system' on ARGS and OPTS, with the evaluation in
 the container: build what the action builds and print it."
@@ -861,18 +824,4 @@ evaluation is for the actions that only build")
                          ;; Only 'reconfigure' uses it.
                          #:optional '(validate-reconfigure)))
                     #:projects projects))))
-      (if (assoc-ref opts 'derivations-only?)
-          (for-each (cut format #t "~a~%" <>) names)
-          (let ((drvs (map read-derivation-from-file names)))
-            (with-build-handler (notifier opts)
-              (build-derivations store drvs)
-              (for-each (lambda (drv)
-                          (format #t "~a~%" (derivation->output-path drv)))
-                        drvs)
-              (match (assoc-ref opts 'gc-root)
-                (#f #t)
-                (root
-                 ((@ (guix scripts build) register-root)
-                  store
-                  (list (derivation->output-path (first drvs)))
-                  root)))))))))
+      (build-and-print store names opts))))
