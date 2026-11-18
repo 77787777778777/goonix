@@ -276,6 +276,24 @@
          (valid-path? store out)
          (verify-store store #:check-contents? #t #:repair? #f))))
 
+(define (ca-deep-build drv)
+  "Build DRV with deep scanning; return 'accepted or the captured daemon log."
+  (let ((connection (open-connection-for-tests)))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda ()
+        (let ((log (open-output-string)))
+          (set-build-options connection #:deep-scan? #t)
+          (guard (condition ((store-protocol-error? condition)
+                             (get-output-string log)))
+            (parameterize ((current-build-output-port log))
+              (build-derivations connection (list drv)))
+            'accepted)))
+      (lambda () (close-connection connection)))))
+
+(define (ca-deep-refusal? result text)
+  (and (string? result) (string-contains result text) text))
+
 (test-group "CA-1: compressed self tokens and the deep-scan setting"
   (for-each
    (lambda (format)
@@ -323,6 +341,31 @@
                                 (make-list (- width 1) 0)))
                       (string->list token)))))
          (test-equal (format #f "a UTF-~aLE self token is refused" (* 8 width))
+           (format #f "UTF-~a self-reference" (* 8 width))
+           (build-fails-with?
+            (shell-drv (format #f "ca-utf-~a" (* 8 width))
+                       (write-output-bytes bytes))
+            (format #f "UTF-~a self-reference" (* 8 width))))))
+     '(2 4))))
+
+(test-assert "resolved-addressed fallback builds at its final path"
+  (let* ((drv (shell-drv "ca-resolved" (write-output "resolved")
+                         #:addressing 'resolved))
+         (path (begin (build-derivations store (list drv)) (realised drv))))
+    (and (direct-store-path? path)
+         (not (placeholder-path? path))
+         (string=? "resolved" (read-all path)))))
+
+(test-assert "sibling output references are rewritten and registered"
+  (let ((drv (shell-drv "ca-multi"
+                        "(mkdir-p out)\n(call-with-output-file (string-append out \"/reference\") (lambda (p) (display (getenv \"lib\") p)))\n(call-with-output-file (getenv \"lib\") (lambda (p) (display \"library\" p)))"
+                        #:outputs '("lib" "out"))))
+    (build-derivations store (list drv))
+    (let ((lib (realised-output-path store drv "lib"))
+          (out (realised-output-path store drv "out")))
+      (and (string=? lib (read-all (string-append out "/reference")))
+           (member lib (references store out))))))
+
 (test-group "CA-1: all output tokens and helper boundaries"
   (test-equal "a sibling output token in a compressed member is refused"
     "unresolved goonix self token"
@@ -344,9 +387,6 @@
                  (write-output-bytes
                   (read-binary "tests/fixtures/ca-placeholder-boundary.gz"))))
      "unresolved goonix placeholder")))
-
-      (and (string=? lib (read-all (string-append out "/reference")))
-           (member lib (references store out))))))
 
 (define (partial-failure-is-clean? name)
   (let* ((resolved (failed-partial-derivation name))
