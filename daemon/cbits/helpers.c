@@ -8,6 +8,23 @@
 
 extern char **environ;
 
+int goonix_spawn_sandbox(const char *program, const char *plan,
+                        int log_fd, int *pid_out)
+{
+  int pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    /* Do not run Haskell between fork and exec.  Only this tiny C shim runs. */
+    if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+      _exit(127);
+    if (log_fd > STDERR_FILENO) close(log_fd);
+    execl(program, program, plan, (char *)NULL);
+    _exit(127);
+  }
+  *pid_out = pid;
+  return 0;
+}
+
 int goonix_spawn_helper(const char *program, const char *argument,
                         int input_fd, int output_fd, int reply_fd,
                         const char *options, int *pid_out)

@@ -11,7 +11,8 @@ module Goonix.Store.Writing
   ) where
 
 import Control.Exception (finally, throwIO)
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
+import Data.Char (toUpper)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -20,7 +21,7 @@ import qualified Data.Int
 import Data.Word (Word64)
 import Goonix.Store.Base32 (encodeBase16, encodeBase32)
 import Goonix.Store.Database
-import Goonix.Store.Derivation (parseDerivation, outputs, outputPath)
+import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo)
 import Goonix.Store.Files
 import Goonix.Store.Hash
 import Goonix.Store.Nar
@@ -116,6 +117,11 @@ registerPath store path (Hash algorithm digest) size references deriver = do
         when (B.isSuffixOf ".drv" path) $ do
           bytes <- B.readFile (C.unpack path)
           derivation <- either (throwIO . storeError) pure (parseDerivation bytes)
+          forM_ (Map.elems (outputs derivation)) $ \output ->
+            unless (B.null (outputHash output)) $ do
+              (_, algorithm, digest) <- either (throwIO . storeError) pure (parseHashInfo output)
+              when (B.length digest /= digestLength algorithm) $
+                throwIO (storeError ("invalid " ++ C.unpack (C.map toUpper (algorithmName algorithm)) ++ " hash"))
           forM_ (Map.toList (outputs derivation)) $ \(name, output) ->
             execute (database store) "insert or replace into DerivationOutputs(drv,id,path) values (?,?,?);"
               [Integer identifier, Bytes name, Bytes (outputPath output)]

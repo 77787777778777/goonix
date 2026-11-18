@@ -43,6 +43,13 @@
 #include <string>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/statvfs.h>
+#include <net/if.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -72,6 +79,21 @@ constexpr uint32_t knownFlags = setIdsFlag | setSidFlag | closeFdsFlag |
     newUserNsFlag | inheritEnvFlag | chdirFlag | stdinFileFlag |
     stdinFdFlag | clearGroupsFlag | noNewPrivsFlag | setupSuccessFlag |
     redirectLogFlag;
+constexpr uint64_t sandboxFlag = 4096;
+constexpr uint64_t mountNamespaceFlag = 8192;
+constexpr uint64_t networkNamespaceFlag = 16384;
+constexpr uint64_t pidNamespaceFlag = 32768;
+constexpr uint64_t ipcNamespaceFlag = 65536;
+constexpr uint64_t utsNamespaceFlag = 131072;
+constexpr uint64_t chrootFlag = 262144;
+constexpr uint64_t procFlag = 524288;
+constexpr uint64_t devptsFlag = 1048576;
+constexpr uint64_t lockMountsFlag = 2097152;
+constexpr uint64_t namespaceFlags = sandboxFlag | mountNamespaceFlag |
+    networkNamespaceFlag | pidNamespaceFlag | ipcNamespaceFlag | utsNamespaceFlag;
+constexpr uint64_t sandboxFlags = namespaceFlags | chrootFlag | procFlag |
+    devptsFlag | lockMountsFlag;
+constexpr uint64_t knownExtendedFlags = sandboxFlags;
 
 class Error : public std::runtime_error {
 public:
@@ -92,7 +114,8 @@ public:
 }
 
 struct Plan {
-    uint32_t flags = 0;
+    uint64_t flags = 0;
+    bool extended = false;
     Bytes program;
     std::vector<Bytes> args;
     std::vector<std::pair<Bytes, Bytes>> env;
@@ -108,6 +131,11 @@ struct Plan {
     uid_t uidMapOutside = 0;
     gid_t gidMapInside = 0;
     gid_t gidMapOutside = 0;
+    Bytes root;
+    Bytes hostname = "localhost";
+    Bytes domainname = "(none)";
+    std::vector<std::tuple<Bytes, Bytes, bool>> mounts;
+    std::vector<struct sock_filter> seccomp;
     size_t phase = 0;
 
     bool has(uint32_t flag) const { return (flags & flag) != 0; }
@@ -130,6 +158,12 @@ public:
         offset += 4;
         return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
             (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+    }
+
+    uint64_t u64()
+    {
+        uint64_t low = u32();
+        return low | (uint64_t(u32()) << 32);
     }
 
     Bytes string()
@@ -276,13 +310,24 @@ Bytes readPlan(const char * path)
    makes all subsequent fields use the same bounded u32/string primitives. */
 Plan parseFields(const Bytes & input)
 {
-    static const Bytes magic("GSP0001\0", 8);
+    static const Bytes magic1("GSP0001\0", 8);
+    static const Bytes magic2("GSP0002\0", 8);
+    const bool extended = input.size() >= magic2.size() &&
+        input.compare(0, magic2.size(), magic2) == 0;
+    const Bytes & magic = extended ? magic2 : magic1;
     if (input.size() < magic.size() || input.compare(0, magic.size(), magic) != 0)
         throw Error("invalid plan magic or version");
     PlanReader reader(input.substr(magic.size()));
     Plan plan;
-    plan.flags = reader.u32();
-    if ((plan.flags & ~knownFlags) != 0) throw Error("unknown plan flags");
+    plan.extended = extended;
+    plan.flags = extended ? reader.u64() : reader.u32();
+    if ((plan.flags & ~(extended ? uint64_t(knownFlags) | knownExtendedFlags : uint64_t(knownFlags))) != 0)
+        throw Error("unknown plan flags");
+    if (plan.has(sandboxFlag) != plan.extended)
+        throw Error("inconsistent sandbox plan version");
+    if (plan.extended && ((plan.flags & chrootFlag) == 0 ||
+                          (plan.flags & namespaceFlags) != namespaceFlags))
+        throw Error("sandbox requires all private namespaces and chroot");
     if (plan.has(stdinFileFlag) && plan.has(stdinFdFlag))
         throw Error("two stdin sources requested");
 
@@ -336,6 +381,34 @@ Plan parseFields(const Bytes & input)
     plan.uidMapOutside = uid_t(reader.u32());
     plan.gidMapInside = gid_t(reader.u32());
     plan.gidMapOutside = gid_t(reader.u32());
+    if (plan.extended) {
+        plan.root = reader.string();
+        plan.hostname = reader.string();
+        plan.domainname = reader.string();
+        if (plan.root.empty() || plan.root.front() != '/')
+            throw Error("sandbox root is not absolute");
+        const uint32_t mounts = reader.count(reader.u32());
+        for (uint32_t i = 0; i < mounts; ++i) {
+            Bytes source = reader.string();
+            Bytes target = reader.string();
+            if (source.empty() || source.front() != '/' ||
+                target.empty() || target.front() != '/')
+                throw Error("mount paths must be absolute");
+            plan.mounts.emplace_back(std::move(source), std::move(target),
+                                     reader.u32() != 0);
+        }
+        const uint32_t filters = reader.count(reader.u32());
+        for (uint32_t i = 0; i < filters; ++i) {
+            const uint32_t code = reader.u32();
+            const uint32_t jt = reader.u32();
+            const uint32_t jf = reader.u32();
+            const uint32_t k = reader.u32();
+            if (code > UINT16_MAX || jt > UINT8_MAX || jf > UINT8_MAX)
+                throw Error("seccomp instruction is out of range");
+            plan.seccomp.push_back(sock_filter {
+                uint16_t(code), uint8_t(jt), uint8_t(jf), k });
+        }
+    }
     reader.finish();
     return plan;
 }
@@ -355,6 +428,118 @@ void reap(pid_t child)
     if (result == -1) sysError("reaping user namespace map writer");
     if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS)
         throw Error("user namespace map writer failed");
+}
+
+void mkdirParents(const Bytes & path)
+{
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (path[i] != '/' && path[i] != '\0') continue;
+        const Bytes parent = path.substr(0, i);
+        if (mkdir(parent.c_str(), 0755) == -1 && errno != EEXIST)
+            sysError("creating directory " + parent);
+    }
+}
+
+void mountIntoSandbox(const Plan & plan, const Bytes & source,
+                      const Bytes & target, bool readOnly)
+{
+    const Bytes destination = plan.root + target;
+    struct stat status;
+    if (lstat(source.c_str(), &status) == -1)
+        sysError("getting attributes of mount source " + source);
+    if (S_ISDIR(status.st_mode)) {
+        mkdirParents(destination);
+    } else if (S_ISLNK(status.st_mode)) {
+        /* A bind mount would follow the link.  Preserve a symlink instead. */
+        char targetBuffer[PATH_MAX + 1];
+        const ssize_t size = readlink(source.c_str(), targetBuffer, PATH_MAX);
+        if (size < 0) sysError("reading symbolic link " + source);
+        mkdirParents(destination.substr(0, destination.rfind('/')));
+        if (symlink(Bytes(targetBuffer, size).c_str(), destination.c_str()) == -1)
+            sysError("copying symbolic link " + source);
+        return;
+    } else {
+        mkdirParents(destination.substr(0, destination.rfind('/')));
+        Fd fd(open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        if (fd.get() == -1 && errno != EEXIST)
+            sysError("creating mount destination " + destination);
+    }
+    if (mount(source.c_str(), destination.c_str(), nullptr, MS_BIND, nullptr) == -1)
+        sysError("bind mounting " + source + " to " + destination);
+    if (readOnly) {
+        struct statvfs filesystem;
+        if (statvfs(destination.c_str(), &filesystem) == -1)
+            sysError("examining bind mount " + destination);
+        unsigned long flags = MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID;
+#ifdef ST_NODEV
+        if (filesystem.f_flag & ST_NODEV) flags |= MS_NODEV;
+#endif
+#ifdef ST_NOEXEC
+        if (filesystem.f_flag & ST_NOEXEC) flags |= MS_NOEXEC;
+#endif
+        if (mount(source.c_str(), destination.c_str(), nullptr, flags, nullptr) == -1)
+            sysError("remounting read-only " + destination);
+    }
+}
+
+void setupNamespaces(Plan & plan)
+{
+    if (!plan.extended) return;
+    if (unshare(CLONE_NEWUSER) == -1) sysError("unshare(CLONE_NEWUSER)");
+    const Bytes uidMap = std::to_string(plan.uidMapInside) + " " +
+        std::to_string(plan.uidMapOutside) + " 1\n";
+    const Bytes gidMap = std::to_string(plan.gidMapInside) + " " +
+        std::to_string(plan.gidMapOutside) + " 1\n";
+    writeFile("/proc/self/uid_map", uidMap);
+    writeFile("/proc/self/setgroups", "deny");
+    writeFile("/proc/self/gid_map", gidMap);
+    const int flags = CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID |
+        CLONE_NEWIPC | CLONE_NEWUTS;
+    if (unshare(flags) == -1) sysError("creating sandbox namespaces");
+    plan.uid = plan.uidMapInside;
+    plan.gid = plan.gidMapInside;
+}
+
+void enterSandbox(Plan & plan)
+{
+    if (!plan.extended) return;
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1)
+        sysError("making mounts private");
+    if (sethostname(plan.hostname.c_str(), plan.hostname.size()) == -1 ||
+        setdomainname(plan.domainname.c_str(), plan.domainname.size()) == -1)
+        sysError("setting sandbox hostname");
+    if (mount(nullptr, plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1)
+        sysError("making sandbox root a mount point");
+    for (const auto & [source, target, readOnly] : plan.mounts)
+        mountIntoSandbox(plan, source, target, readOnly);
+    if (plan.has(procFlag)) {
+        mkdirParents(plan.root + "/proc");
+        if (mount("proc", (plan.root + "/proc").c_str(), "proc", 0, nullptr) == -1)
+            sysError("mounting /proc");
+    }
+    if (plan.has(devptsFlag)) {
+        mkdirParents(plan.root + "/dev/pts");
+        if (mount("devpts", (plan.root + "/dev/pts").c_str(), "devpts", 0,
+                  "newinstance,mode=0620,ptmxmode=0666") == -1)
+            sysError("mounting /dev/pts");
+        if (symlink("/dev/pts/ptmx", (plan.root + "/dev/ptmx").c_str()) == -1)
+            sysError("linking /dev/ptmx");
+    }
+    if (chdir(plan.root.c_str()) == -1 || mkdir("real-root", 0700) == -1 ||
+        syscall(SYS_pivot_root, ".", "real-root") == -1 ||
+        chroot(".") == -1 || umount2("real-root", MNT_DETACH) == -1 ||
+        rmdir("real-root") == -1)
+        sysError("entering sandbox root");
+    if (chmod("/", 0555) == -1) sysError("making sandbox root read-only");
+    Fd socketFd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (socketFd.get() == -1) sysError("opening loopback socket");
+    struct ifreq interfaceRequest {};
+    std::strncpy(interfaceRequest.ifr_name, "lo", IFNAMSIZ - 1);
+    interfaceRequest.ifr_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+    if (ioctl(socketFd.get(), SIOCSIFFLAGS, &interfaceRequest) == -1)
+        sysError("bringing up loopback");
+    plan.uid = plan.uidMapInside;
+    plan.gid = plan.gidMapInside;
 }
 
 /* Retain spawn.cc's external map-writer handshake.  No daemon code runs
@@ -468,8 +653,16 @@ void closeMostFdsAction(Plan & plan)
 void setIdsAction(Plan & plan)
 {
     if (plan.has(clearGroupsFlag) || plan.has(setIdsFlag)) {
-        if (setgroups(plan.supplementaryGroups.size(),
-                      plan.supplementaryGroups.data()) == -1)
+        /* Unprivileged UID/GID mapping writes "deny" to setgroups.  The
+           inherited supplementary groups are then inaccessible and cannot
+           be set again; no groups are requested by the sandbox plan. */
+        Fd groupsFile(open("/proc/self/setgroups", O_RDONLY | O_CLOEXEC));
+        char setting[16] = {};
+        const bool denied = plan.extended && groupsFile.get() >= 0 &&
+            read(groupsFile.get(), setting, sizeof(setting) - 1) > 0 &&
+            Bytes(setting).compare(0, 4, "deny") == 0;
+        if (!denied && setgroups(plan.supplementaryGroups.size(),
+                                 plan.supplementaryGroups.data()) == -1)
             sysError("cannot set supplementary groups");
     }
     if (plan.has(setIdsFlag)) {
@@ -485,6 +678,16 @@ void setNoNewPrivsAction(Plan & plan)
     /* Upstream passes zero here; PR_SET_NO_NEW_PRIVS requires arg2 == 1. */
     if (plan.has(noNewPrivsFlag) && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1)
         sysError("setting PR_SET_NO_NEW_PRIVS");
+}
+
+void addSeccompFilterAction(Plan & plan)
+{
+    if (plan.seccomp.empty()) return;
+    if (plan.seccomp.size() > USHRT_MAX) throw Error("seccomp filter is too large");
+    struct sock_fprog program {
+        static_cast<unsigned short>(plan.seccomp.size()), plan.seccomp.data() };
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == -1)
+        sysError("installing seccomp filter");
 }
 
 void restoreSigpipeAction(Plan &)
@@ -536,8 +739,29 @@ void execAction(Plan & plan)
     sysError("executing " + plan.program);
 }
 
+void enterPidNamespace(Plan & plan)
+{
+    if (!plan.extended) return;
+    const pid_t child = fork();
+    if (child == -1) sysError("entering PID namespace");
+    if (child == 0) return;
+    int status = 0;
+    pid_t result;
+    do { result = waitpid(child, &status, 0); } while (result == -1 && errno == EINTR);
+    if (result == -1) sysError("waiting for sandbox child");
+    if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) {
+        signal(WTERMSIG(status), SIG_DFL);
+        raise(WTERMSIG(status));
+    }
+    _exit(1);
+}
+
 const std::vector<Phase> phases = {
     { "unshareAndInitUserns", [](Plan & p) { if (p.has(newUserNsFlag)) unshareAndInitUserns(p); } },
+    { "setupNamespaces", setupNamespaces },
+    { "enterPidNamespace", enterPidNamespace },
+    { "enterSandbox", enterSandbox },
     { "usernsSetIDs", usernsSetIdsAction },
     { "setsid", setsidAction },
     { "earlyIOSetup", earlyIoSetupAction },
@@ -545,6 +769,7 @@ const std::vector<Phase> phases = {
     { "closeMostFDs", closeMostFdsAction },
     { "setIDs", setIdsAction },
     { "setNoNewPrivs", setNoNewPrivsAction },
+    { "addSeccompFilter", addSeccompFilterAction },
     { "restoreSIGPIPE", restoreSigpipeAction },
     { "setupSuccess", setupSuccessAction },
     { "exec", execAction },

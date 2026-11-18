@@ -15,8 +15,10 @@ module Goonix.Build.Engine
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (finally, throwIO)
-import Control.Monad (forM_, replicateM_, unless, void, when)
+import Control.Exception (SomeException, bracket, catch, finally, fromException, throwIO)
+import Control.Monad (foldM, forM, forM_, replicateM_, unless, void, when)
+import Data.Bits ((.|.))
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -39,11 +41,19 @@ import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import System.Exit (ExitCode (ExitSuccess))
 import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
-import System.Process (CreateProcess (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
-import System.Posix.Process (getProcessID)
+import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
+import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited))
+import System.Environment (lookupEnv)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
+import System.Posix.User (getRealGroupID, getRealUserID)
 import System.FilePath (takeDirectory)
-import System.Posix.Types (Fd)
+import System.Posix.Types (CPid (..), Fd (..))
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt (..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek)
+import Goonix.Build.Sandbox
 import System.Environment (getEnvironment)
 import System.Posix.Env.ByteString (getEnv)
 
@@ -64,9 +74,17 @@ buildThingsWithConfig config = buildThingsInternal (Just config)
 
 buildThingsInternal :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
 buildThingsInternal config rootFd store settings trace things mode = do
-  unless (not (settingBool "build-use-sandbox" True settings)) $
-    throwIO (storeError "sandboxed builds are not implemented")
-  mapM_ buildOne things
+  failure <- newIORef Nothing
+  forM_ things $ \thing ->
+    catch (buildOne thing) $ \(exception :: SomeException) ->
+      if keepGoing settings
+        then do
+          previous <- readIORef failure
+          when (previous == Nothing) $ writeIORef failure . Just =<< case fromException exception of
+            Just (StoreError message _) -> pure (StoreError message 100)
+            Nothing -> pure (StoreError (C.pack (show exception)) 100)
+        else throwIO exception
+  readIORef failure >>= mapM_ throwIO
   where
     buildOne thing
       | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace mode thing
@@ -163,6 +181,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   mapM_ (appendTempRoot rootFd) outPaths
   mapM_ deleteTree redirected
   work <- makeBuildDirectory store
+  prepareReferenceGraphs store work drv
   env <- builderEnvironment store settings work actualDrv
   logPath <- buildLogPath store drvPath
   mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
@@ -174,14 +193,18 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   let command = if "builtin:" `B.isPrefixOf` builder drv
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs drv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (_, _, _, process) <- createProcess command
-    { cwd = Just (C.unpack work), env = Just env, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
-  childPid <- maybe 0 fromIntegral <$> getPid process
+  (childPid, wait) <- if settingBool "build-use-sandbox" True settings
+    then spawnSandboxedBuilder store work actualDrv command env writeFd
+    else do
+      (_, _, _, process) <- createProcess command
+        { cwd = Just (C.unpack work), env = Just env, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle }
+      pid <- maybe 0 fromIntegral <$> getPid process
+      pure (pid, waitForProcess process)
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
   drained <- newEmptyMVar
   _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace `finally` putMVar drained ()
-  status <- waitForProcess process
+  status <- withWritableStore (storeDirectory store) wait
   takeMVar drained
   hClose readHandle
   hClose logHandle
@@ -200,6 +223,98 @@ runBuilder rootFd store settings trace mode drvPath drv = do
         then pure ()
         else removeBuildDirectory work
       throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed"))
+
+foreign import ccall unsafe "goonix_spawn_sandbox"
+  c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
+
+spawnSandboxedBuilder :: Store -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode)
+spawnSandboxedBuilder store work drv command env (Fd logFd) = do
+  helper <- maybe (storeDirectory store <> "/../guix-sandbox") id <$> getEnv "GUIX_SANDBOX"
+  root <- makeSandboxRoot store
+  uid <- fromIntegral <$> getRealUserID
+  gid <- fromIntegral <$> getRealGroupID
+  inputs <- foldM derivationInputs Set.empty [drv]
+  let directOutputs = Set.fromList (map outputPath (Map.elems (outputs drv)))
+      writableInputs = Set.fromList [work, storeDirectory store]
+  forM_ (Map.elems (outputs drv)) $ \output -> do
+    let path = outputPath output
+    deleteTree path
+    if outputHashAlgo output `elem` ["r:sha256", "r:sha1", "r:sha512", "r:md5"]
+      then Dir.createDirectory path 0o755
+      else B.writeFile (C.unpack path) B.empty
+  closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
+  let sandboxWork = "/tmp/goonix-build"
+      program = case cmdspec command of
+        RawCommand executable _ -> C.pack executable
+        ShellCommand _ -> throwIO (storeError "shell builders are not supported") `seq` B.empty
+      arguments = case cmdspec command of
+        RawCommand executable args -> C.pack executable : map C.pack args
+        ShellCommand _ -> []
+      environment = map (\(name, value) -> (C.pack name, C.pack value)) env
+      replaceWork path = if work `B.isPrefixOf` path then sandboxWork <> B.drop (B.length work) path else path
+      environment' = map (\(name, value) -> (name, replaceWork value)) (Map.toList (Map.fromList environment))
+      mountInputs = [BindMount path path (not (Set.member path writableInputs)) | path <- Set.toList closure]
+      mountOutputs = [BindMount (storeDirectory store) (storeDirectory store) True] ++
+        [BindMount path path False | path <- Set.toList directOutputs, path `Set.notMember` closure]
+      mountWork = [BindMount work sandboxWork False]
+      devices = [BindMount path path False | path <- ["/dev/null", "/dev/full", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"]]
+      plan = SandboxPlan
+        { planFlags = sandboxFlagUserNamespace .|. sandboxFlagMountNamespace .|.
+          sandboxFlagNetworkNamespace .|. sandboxFlagPidNamespace .|. sandboxFlagIpcNamespace .|.
+          sandboxFlagUtsNamespace .|. sandboxFlagChroot .|. sandboxFlagProc .|. sandboxFlagDevpts .|.
+          sandboxFlagLockMounts .|. sandboxFlagSetSid .|. sandboxFlagCloseFds .|.
+          sandboxFlagChdir .|. sandboxFlagStdinFile .|. sandboxFlagClearGroups .|.
+          sandboxFlagNoNewPrivs
+        , planProgram = program, planArguments = arguments, planEnvironment = environment'
+        , planWorkingDirectory = sandboxWork, planStdinFile = "/dev/null"
+        , planUid = 30001, planGid = 30000, planStdinFd = maxBound, planLogFd = maxBound
+        , planGroups = [], planCloseFds = []
+        , planUidMapInside = 30001, planUidMapOutside = uid
+        , planGidMapInside = 30000, planGidMapOutside = gid
+        , planRoot = root, planHostname = "localhost", planDomainname = "(none)"
+        , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ devices
+        , planSeccomp = []
+        }
+      planPath = root <> ".plan"
+  mkdirParents (root <> "/etc")
+  B.writeFile (C.unpack (root <> "/etc/passwd"))
+    "nixbld:x:30001:30000:Nix build user:/:/noshell\nnobody:x:65534:65534:Nobody:/:/noshell\n"
+  B.writeFile (C.unpack (root <> "/etc/group")) "nixbld:!:30000:\n"
+  B.writeFile (C.unpack (root <> "/etc/hosts")) "127.0.0.1 localhost\n::1 localhost\n"
+  B.writeFile (C.unpack planPath) (encodeSandboxPlan plan)
+  withCString (C.unpack helper) $ \program' -> withCString (C.unpack planPath) $ \path' -> alloca $ \pidPointer -> do
+    result <- c_spawn_sandbox program' path' logFd pidPointer
+    if result < 0 then throwIO (storeError "cannot spawn sandbox helper") else do
+      pid <- fromIntegral <$> peek pidPointer
+      pure (pid, waitForSandbox pid)
+  where
+    derivationInputs seen current
+      | Set.member (builder current) seen = pure seen
+      | otherwise = do
+          let direct = Set.insert (builder current) (inputSrcs current)
+          foldM derivationInputs direct =<< mapM readStoreDerivation (Map.keys (inputDrvs current))
+    readStoreDerivation path = do
+      bytes <- B.readFile (C.unpack path)
+      either (throwIO . storeError) pure (parseDerivation bytes)
+
+waitForSandbox :: Int -> IO ExitCode
+waitForSandbox pid = do
+  status <- getProcessStatus True False (fromIntegral pid)
+  case status of
+    Just (Exited code) -> pure code
+    Just _ -> waitForSandbox pid
+    Nothing -> throwIO (storeError "cannot wait for sandbox helper")
+
+makeSandboxRoot :: Store -> IO RawFilePath
+makeSandboxRoot store = do
+  let parent = maybe "/tmp" (<> "/build") (storeStateDirectory store)
+  mkdirParents parent
+  pid <- getProcessID
+  stamp <- getPOSIXTime
+  let path = parent <> "/goonix-sandbox-" <> C.pack (show pid) <> "-" <> C.pack (show (floor stamp :: Integer))
+  deleteTree path
+  Dir.createDirectory path 0o755
+  pure path
 
 redirectOutput :: Store -> ByteString -> RawFilePath -> RawFilePath
 redirectOutput store drvPath path =
@@ -278,29 +393,93 @@ registerBuiltOutputs :: Store -> ByteString -> Derivation -> IO ()
 registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \output -> do
   let path = outputPath output
   exists <- Files.fileExist path
-  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' did not produce output `" ++ C.unpack path ++ "'"))
+  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
   _ <- canonicaliseAndHash store path
   when (not (B.null (outputHash output))) $ verifyFixedOutput output path
   deduplicateTree (storeDirectory store) path
   (refs, hash) <- scanOutputReferences store path
+  enforceReferencePolicy store drv path refs
   size <- fromIntegral . B.length <$> dumpNar path
-  registerPath store path hash size refs drvPath
+  registerPath store path hash size (filter (/= path) refs) drvPath
   where
     scanOutputReferences store path = do
       valid <- queryAllValidPaths store
-      (found, hash) <- scanReferences path valid
-      pure (Set.toList (Set.delete path found), hash)
+      (found, hash) <- scanReferences path (path : valid)
+      pure (Set.toList found, hash)
 
 verifyFixedOutput :: DerivationOutput -> RawFilePath -> IO ()
 verifyFixedOutput output path = do
   algorithm <- either (throwIO . storeError) pure (algorithmFromName (if "r:" `B.isPrefixOf` outputHashAlgo output then B.drop 2 (outputHashAlgo output) else outputHashAlgo output))
-  when (algorithm /= SHA256) $ throwIO (storeError "only SHA-256 fixed-output checks are implemented")
+  expected <- case decodeBase16 (outputHash output) of
+    Right digest | B.length digest == digestLength algorithm -> pure digest
+    _ -> throwIO (storeError ("invalid " ++ C.unpack (C.map toUpperAscii (algorithmName algorithm)) ++ " hash"))
   hash <- if outputHashAlgo output == "r:sha256"
     then hashNar path
-    else hashFile SHA256 path
-  expected <- either (throwIO . storeError) pure (decodeBase16 (outputHash output))
+    else hashFile algorithm path
   when (hashDigest hash /= expected) $
     throwIO (storeError ("output `" ++ C.unpack path ++ "' has the wrong hash"))
+  where
+    toUpperAscii character
+      | character >= 'a' && character <= 'z' = toEnum (fromEnum character - 32)
+      | otherwise = character
+
+withWritableStore :: RawFilePath -> IO a -> IO a
+withWritableStore store = bracket prepare restore . const
+  where
+    prepare = do
+      status <- Files.getSymbolicLinkStatus store
+      Files.setFileMode store (Files.fileMode status .|. 0o700)
+      pure (Files.fileMode status)
+    restore = Files.setFileMode store
+
+prepareReferenceGraphs :: Store -> RawFilePath -> Derivation -> IO ()
+prepareReferenceGraphs store work drv =
+  case Map.lookup "exportReferencesGraph" (environment drv) of
+    Nothing -> pure ()
+    Just fields -> go (C.words fields)
+      where
+        go [] = pure ()
+        go (name:path:rest) = do
+          closure <- referenceClosure store path
+          entries <- forM closure $ \item -> do
+            info <- queryPathInfo store item
+            pure (item <> "\n\n" <> C.pack (show (length (infoReferences info))) <> "\n"
+                  <> B.intercalate "\n" (infoReferences info)
+                  <> if null (infoReferences info) then "" else "\n")
+          B.writeFile (C.unpack (work <> "/" <> name)) (B.concat entries)
+          go rest
+        go _ = throwIO (storeError "odd number of tokens in exportReferencesGraph")
+
+referenceClosure :: Store -> RawFilePath -> IO [RawFilePath]
+referenceClosure store root = go Set.empty [root]
+  where
+    go seen [] = pure (Set.toAscList seen)
+    go seen (path:rest)
+      | Set.member path seen = go seen rest
+      | otherwise = do
+          references <- queryReferences store path
+          go (Set.insert path seen) (rest ++ references)
+
+enforceReferencePolicy :: Store -> Derivation -> RawFilePath -> [RawFilePath] -> IO ()
+enforceReferencePolicy store drv path references = do
+  forM_ ["allowedReferences", "allowedRequisites", "disallowedReferences", "disallowedRequisites"] $ \attribute ->
+    forM_ (Map.lookup attribute (environment drv)) $ \specification -> do
+      let allowed = attribute `elem` ["allowedReferences", "allowedRequisites"]
+          recursive = attribute `elem` ["allowedRequisites", "disallowedRequisites"]
+      specified <- foldM expand Set.empty (C.words specification)
+      used <- if recursive
+        then Set.fromList . concat <$> mapM (referenceClosure store) references
+        else pure (Set.fromList references)
+      forM_ (Set.toList used) $ \reference ->
+        when (Set.member reference specified /= allowed) $
+          throwIO (storeError ("output (`" ++ C.unpack path ++ "') is not allowed to refer to path `" ++ C.unpack reference ++ "'"))
+  where
+    expand specified token
+      | token `elem` Map.keys (outputs drv) = pure (Set.insert (outputPath (outputs drv Map.! token)) specified)
+      | otherwise = do
+          valid <- isValidPath store token
+          if valid then pure (Set.insert token specified)
+            else throwIO (storeError "invalid reference specifier")
 
 
 makeBuildDirectory :: Store -> IO RawFilePath
