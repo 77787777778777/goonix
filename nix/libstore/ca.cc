@@ -202,10 +202,11 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
         blank.env[output.first] = "";
     }
     const string bytes = unparseDerivation(blank);
-    Derivation resolved = blank;
+    Derivation resolved = drv;
+    resolved.env.erase("goonixResolved");
     for (auto & output : resolved.outputs) {
         if (!output.second.hash.empty()) continue;
-        string outputName = name + (output.first == "out" ? "" : "-" + output.first);
+        string outputName = storePathToName(output.second.path);
         output.second.path = tokenPath(output.first, outputName);
         resolved.env[output.first] = output.second.path;
     }
@@ -655,7 +656,12 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
        different tree at the same address is a collision or corruption and
        is refused rather than clobbered. */
     if (pathExists(final)) {
-        if (!store.isValidPath(final))
+        /* A final path produced by an earlier output of this same build is
+           not registered until the whole output set is checked. */
+        bool stagedSibling = false;
+        for (auto & sibling : finalOutputs)
+            stagedSibling = stagedSibling || sibling.second == final;
+        if (!store.isValidPath(final) && !stagedSibling)
             throw BuildError(std::format(
                 "CA final path `{0}' exists but is not a valid store item", final));
         bool same = sameContent(final, final, token, built, finalOutputs);
