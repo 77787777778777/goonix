@@ -1,4 +1,4 @@
-;;; goonix: tracked Git trees and cached checkouts, with no store writes.
+;;; goonix: the trees of flake inputs.
 ;;; GNU Guix --- Functional package management for GNU
 ;;; Copyright © 2026 goonix contributors
 ;;;
@@ -11,181 +11,194 @@
 
 (define-module (guix flakes checkout)
   #:use-module (guix base32)
-  #:use-module (guix build utils)
+  #:use-module (guix diagnostics)
+  #:use-module (guix i18n)
   #:use-module (guix git)
-  #:use-module (guix hash)
+  #:use-module ((guix hash) #:select (file-hash*))
+  #:use-module ((guix openpgp) #:select (openpgp-fingerprint->bytevector))
+  #:use-module ((guix pure-eval) #:select (git-top-level
+                                           tracked-file-predicate
+                                           tracked-tree-revision))
+  #:use-module ((guix flakes syntax) #:select (read-data-file))
   #:use-module (guix records)
-  #:use-module ((guix config) #:select (%git))
-  #:use-module (guix serialization)
-  #:use-module (guix utils)
-  #:use-module ((gcrypt hash) #:select (sha256))
-  #:use-module (rnrs bytevectors)
-  #:use-module ((rnrs io ports) #:select (get-bytevector-n put-bytevector))
-  #:use-module (ice-9 ftw)
+  #:use-module (guix store)
+  #:autoload   (git oid) (string->oid)
+  #:autoload   (guix git-authenticate) (authenticate-repository)
   #:use-module (ice-9 match)
-  #:use-module (ice-9 popen)
-  #:use-module (ice-9 textual-ports)
-  #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
-  #:export (tree-snapshot? tree-snapshot-directory tree-snapshot-commit
-            tree-snapshot-hash tree-snapshot-dirty? tree-snapshot-source
-            tracked-tree verify-tree-snapshot resolve-git-input))
+  #:use-module (srfi srfi-34)
+  #:export (tree tree? tree-directory tree-select? tree-commit tree-hash
+            tree-worktree? tree-repository
 
-(define-record-type* <tree-snapshot> tree-snapshot make-tree-snapshot
-  tree-snapshot?
-  (directory tree-snapshot-directory)
-  (commit    tree-snapshot-commit)
-  (hash      tree-snapshot-hash)
-  (dirty?    tree-snapshot-dirty? (default #f))
-  ;; The repository the snapshot was taken from, for local-change notices.
-  ;; Runtime information; never serialized.
-  (source    tree-snapshot-source (default #f)))
+            fetch-git-tree fetch-local-tree
+            regular-file tree-file import-tree authenticate-tree
+            local-checkout-state))
 
-(define (git-output directory . arguments)
-  "Run read-only git inspection in DIRECTORY; never execute repository hooks."
-  (let* ((port (apply open-pipe* OPEN_READ %git
-                      "-c" "core.hooksPath=/dev/null"
-                      "-c" "protocol.file.allow=always"
-                      "-C" directory arguments))
-         (output (get-string-all port))
-         (status (close-pipe port)))
-    (unless (zero? status)
-      (error "git inspection failed" directory arguments output))
-    (string-trim-right output)))
+;;; Commentary:
+;;;
+;;; A tree is the set of tracked files of one input at one commit, somewhere
+;;; on disk, with the hash that names it.
+;;;
+;;; A Git input lives in the cache that 'guix pull' uses, one checkout per
+;;; URL.  That checkout is shared and moves with every fetch, so a tree is
+;;; good only until the next fetch of its URL: whoever fetches reads what it
+;;; needs at once, and whoever imports checks the result against the hash.
+;;; A local input that is not a work tree goes through the same cache, so
+;;; that what is used is the commit and not the state of the directory.
+;;;
+;;; Code:
 
-(define (tracked-tree-hash file directory)
-  "Hash FILE in DIRECTORY as a tracked file, preserving symlinks and exec bits."
-  (let ((path (string-append directory "/" file)))
-    (bytevector->nix-base32-string
-     (file-hash* path #:recursive? #t
-                 #:select? (const #t)))))
+(define-record-type* <tree> tree make-tree
+  tree?
+  (directory  tree-directory)             ;where the files are
+  (select?    tree-select?)               ;which of them belong to the tree
+  (commit     tree-commit)                ;full commit ID
+  ;; NAR SHA-256 in nix-base32, or #f for a work tree.
+  (hash       tree-hash (default #f))
+  (worktree?  tree-worktree? (default #f))
+  ;; The repository that has the history, for authentication.
+  (repository tree-repository (default #f)))
 
-(define (tracked-content-hash directory files)
-  "Hash the canonical list of tracked FILES.  The tree hash is versioned.
-This is a locking fingerprint until the CA tree-hash format is available;
-the lock records the format name separately in later versions."
+(define (not-dot-git? file stat)
+  (not (string=? ".git" (basename file))))
+
+(define (nar-hash directory select?)
   (bytevector->nix-base32-string
-   (sha256
-    (string->utf8
-     (string-append
-      "goonix-tracked-tree-v1\0"
-      (string-join
-       (map (lambda (file)
-              (string-append file "\0" (tracked-tree-hash file directory) "\0"))
-            (sort files string<?))
-       ""))))))
+   (file-hash* directory #:recursive? #t #:select? select?)))
 
-(define (tree-files directory)
-  (let walk ((root directory) (prefix ""))
-    (append-map
-     (lambda (name)
-       (if (member name '("." "..")) '()
-           (let* ((relative (if (string-null? prefix) name
-                                (string-append prefix "/" name)))
-                  (file (string-append root "/" name)))
-             (if (eq? 'directory (stat:type (lstat file)))
-                 (walk file relative)
-                 (list relative)))))
-     (scandir root))))
+(define* (fetch-git-tree url #:key branch tag commit (subdirectory ""))
+  "Bring the cached checkout of URL to COMMIT, else to TAG, else to BRANCH,
+else to the default branch of the remote, and return the tree found there, or
+below SUBDIRECTORY of it.  A reference that is a commit ID is not looked up
+on the network when the cache has it."
+  (let-values (((checkout commit relation)
+                (update-cached-checkout url
+                                        #:ref (cond (commit `(commit . ,commit))
+                                                    (tag `(tag . ,tag))
+                                                    (branch `(branch . ,branch))
+                                                    (else '())))))
+    (let ((directory (if (string-null? subdirectory)
+                         checkout
+                         (string-append checkout "/" subdirectory))))
+      (unless (file-exists? directory)
+        (raise (formatted-message
+                (G_ "commit ~a of '~a' has no directory '~a'")
+                commit url subdirectory)))
+      (tree (directory directory)
+            (select? not-dot-git?)
+            (commit commit)
+            (hash (nar-hash directory not-dot-git?))
+            (repository checkout)))))
 
-(define (export-tracked-tree directory commit worktree? destination)
-  "Copy only Git-tracked content to DESTINATION, without project evaluation.
-For WORKTREE? use the index plus working-tree modifications; otherwise export
-COMMIT exactly.  git archive invokes no repository-defined code."
-  (mkdir-p destination)
-  (if worktree?
-      (let ((files (string-split (git-output directory "ls-files" "-z" "--" ".") #\nul)))
-        (for-each
-         (lambda (file)
-           (unless (string-null? file)
-             (let ((source (string-append directory "/" file))
-                   (target (string-append destination "/" file)))
-               (mkdir-p (dirname target))
-               (when (file-exists? source)
-                 (if (eq? 'symlink (stat:type (lstat source)))
-                     (symlink (readlink source) target)
-                     (begin
-                       (copy-file source target)
-                       (chmod target (stat:mode (lstat source)))))))))
-         files))
-      (let ((archive (open-pipe* OPEN_READ %git
-                                 "-c" "core.hooksPath=/dev/null"
-                                 "-C" directory "archive" "--format=tar"
-                                 commit)))
-        ;; Consume the archive with tar; both processes receive fixed arguments.
-        (let ((status (with-directory-excursion destination
-                        (let ((input (open-pipe* OPEN_WRITE "tar" "-xf" "-")))
-                          (let loop ((buffer (get-bytevector-n archive 65536)))
-                            (unless (eof-object? buffer)
-                              (put-bytevector input buffer)
-                              (loop (get-bytevector-n archive 65536))))
-                          (close-pipe input)))))
-          (close-pipe archive)
-          (unless (zero? status)
-            (error "cannot export tracked tree" directory commit)))))
-  destination)
+(define* (fetch-local-tree path #:key commit worktree?)
+  "Return the tree of the checkout at PATH: its tracked files as they are
+when WORKTREE?, and otherwise those of COMMIT, or of the commit that is
+checked out.  PATH may be a directory inside a checkout."
+  (let* ((path (canonicalize-path path))
+         (top  (or (git-top-level path)
+                   (raise (formatted-message
+                           (G_ "local input '~a' is not in a Git checkout")
+                           path)))))
+    (let-values (((_ head reference) (repository-info top)))
+      (unless head
+        (raise (formatted-message
+                (G_ "the checkout '~a' has no commit yet") top)))
+      (if worktree?
+          (tree (directory path)
+                (select? (tracked-file-predicate path))
+                (commit head)
+                (worktree? #t)
+                (repository top))
+          (fetch-git-tree top
+                          #:commit (or commit head)
+                          #:subdirectory
+                          (if (string=? path top)
+                              ""
+                              (string-drop path
+                                           (+ 1 (string-length top)))))))))
 
-(define* (tracked-tree directory #:key (worktree? #t) commit)
-  "Snapshot DIRECTORY's tracked files and return their content fingerprint.
-When COMMIT is given, export exactly that commit; otherwise use HEAD or the
-tracked worktree according to WORKTREE?."
-  (let* ((directory (canonicalize-path directory))
-         (requested-commit commit)
-         (commit (if requested-commit
-                     (git-output directory "rev-parse"
-                                 (string-append requested-commit "^{commit}"))
-                     (git-output directory "rev-parse" "HEAD")))
-         (dirty? (and worktree? (not requested-commit)
-                      (not (string-null?
-                            (git-output directory "status" "--porcelain" "--untracked-files=no"
-                                        "--ignore-submodules=all" "--" ".")))))
-         (temporary (mkdtemp "/tmp/goonix-tracked.XXXXXX")))
-    (export-tracked-tree directory commit worktree? temporary)
-    (tree-snapshot
-     (directory temporary) (commit commit) (dirty? dirty?)
-     (source directory)
-     (hash (tracked-content-hash
-            temporary
-            (tree-files temporary))))))
+(define (regular-file directory name)
+  "Return the name of the regular file NAME of DIRECTORY, or #f if there is
+none.  Raise an error if NAME is a symbolic link: the host reads these files,
+and a link could lead it anywhere."
+  (let* ((file (string-append directory "/" name))
+         (stat (false-if-exception (lstat file))))
+    (match (and stat (stat:type stat))
+      ('regular file)
+      ('symlink
+       (raise (formatted-message
+               (G_ "'~a' is a symbolic link; it must be a file") file)))
+      (_ #f))))
 
-(define (verify-tree-snapshot snapshot)
-  "Recompute SNAPSHOT's tracked hash; refuse any modified tracked content."
-  (let ((files (let walk ((root (tree-snapshot-directory snapshot))
-                            (prefix ""))
-                   (append-map
-                    (lambda (name)
-                      (if (member name '("." "..")) '()
-                          (let* ((relative (if (string-null? prefix) name
-                                               (string-append prefix "/" name)))
-                                 (file (string-append root "/" name)))
-                            (if (eq? 'directory (stat:type (lstat file)))
-                                (walk file relative)
-                                (list relative)))))
-                    (scandir root)))))
-      (let ((actual (tracked-content-hash (tree-snapshot-directory snapshot)
-                                          (sort files string<?))))
-        (unless (string=? actual (tree-snapshot-hash snapshot))
-          (error "tampered tracked checkout"
-                 (tree-snapshot-directory snapshot)
-                 (tree-snapshot-hash snapshot) actual))
-        #t)))
+(define (tree-file tree name)
+  "Return the name of the regular file NAME of TREE, or #f if TREE has no
+such file.  Raise an error if it is a symbolic link."
+  (let ((file (regular-file (tree-directory tree) name)))
+    (and file
+         ((tree-select? tree) file (lstat file))
+         file)))
 
-(define* (resolve-git-input url #:key branch tag commit worktree?
-                            (repository-cache-directory
-                             (%repository-cache-directory)))
-  "Resolve URL to a cached checkout, then export the resolved commit to a
-pristine tree.  A named COMMIT is always authoritative.  The snapshot never
-points into the mutable cache: its content is exactly the locked commit."
-  (let ((ref (cond (commit `(tag-or-commit . ,commit))
-                   (tag `(tag . ,tag))
-                   (branch `(branch . ,branch))
-                   (else '()))))
-    (let-values (((directory resolved relation)
-                  ;; Each URL has its own directory below the cache root;
-                  ;; passing the root itself would make all URLs share one
-                  ;; repository.
-                  (update-cached-checkout url #:ref ref
-                                          #:cache-directory
-                                          (url-cache-directory
-                                           url repository-cache-directory))))
-      (tracked-tree directory #:commit resolved #:worktree? #f))))
+(define* (import-tree store tree #:optional (name "flake-input"))
+  "Add the files of TREE to STORE and return the store item.  When TREE has a
+hash, the item is the one the hash names; a checkout that no longer holds
+what was hashed is refused."
+  (let* ((name (string-append name "-" (string-take (tree-commit tree) 7)))
+         (item (add-to-store store name #t "sha256" (tree-directory tree)
+                             #:select? (tree-select? tree))))
+    (when (and (tree-hash tree)
+               (not (string=? item
+                              (fixed-output-path
+                               name
+                               (nix-base32-string->bytevector
+                                (tree-hash tree))
+                               #:recursive? #t))))
+      (raise (formatted-message
+              (G_ "the files of '~a' are not those of the recorded tree ~a")
+              (tree-directory tree) (tree-hash tree))))
+    item))
+
+(define (keyring-reference tree)
+  "Return the name of the branch that holds the OpenPGP keys of TREE's
+repository: the one its '.guix-channel' names, as for a channel, or
+\"keyring\"."
+  (or (and=> (tree-file tree ".guix-channel")
+             (lambda (file)
+               (match (read-data-file file)
+                 (('channel . properties)
+                  (match (assq 'keyring-reference properties)
+                    ((_ (? string? reference)) reference)
+                    (_ #f)))
+                 (_ #f))))
+      "keyring"))
+
+(define (authenticate-tree tree introduction)
+  "Authenticate the history of TREE's repository from INTRODUCTION, a list
+((commit COMMIT) (signer FINGERPRINT)), to the commit of TREE, the way
+channels are authenticated.  Raise an error if that fails."
+  (match introduction
+    ((('commit start) ('signer signer))
+     (let ((reference (string-append
+                       ;; In the cache the branches are the remote's.
+                       (if (tree-worktree? tree) "" "origin/")
+                       (keyring-reference tree))))
+       (with-repository (tree-repository tree) repository
+         (authenticate-repository repository
+                                  (string->oid start)
+                                  (openpgp-fingerprint->bytevector signer)
+                                  #:end (string->oid (tree-commit tree))
+                                  #:keyring-reference reference
+                                  ;; What was authenticated for one signer
+                                  ;; says nothing about another.
+                                  #:cache-key
+                                  (string-append "flakes/" start "-"
+                                                 (string-delete #\space
+                                                                signer))))))))
+
+(define (local-checkout-state path)
+  "Return two values for the checkout at PATH: the commit that is checked
+out, and whether tracked files have changes that are not committed."
+  (let ((top (git-top-level (canonicalize-path path))))
+    (let-values (((_ head reference) (repository-info top)))
+      (values head (not (tracked-tree-revision top))))))
+
+;;; checkout.scm ends here

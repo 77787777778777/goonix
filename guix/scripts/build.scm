@@ -50,9 +50,12 @@
   #:use-module ((guix progress) #:select (current-terminal-columns))
   #:autoload   (guix build syscalls) (terminal-columns)
   #:use-module (guix transformations)
-  #:autoload   (guix pure-eval) (load-file-purely)
-  #:autoload   (guix flakes evaluate) (evaluate-flake)
+  #:autoload   (guix pure-eval) (pure-build-derivations) ;goonix: --pure-eval
+  #:use-module (guix flakes options)              ;goonix: flake references
+  #:autoload   (guix scripts flake) (flake-reference? ;goonix: DIRECTORY#NAME
+                                     flake-package-derivation)
   #:export (log-url
+            options->derivations         ;goonix: for the evaluator
 
             %standard-build-options
             %standard-cross-build-options
@@ -160,6 +163,7 @@ found.  Return #f if no build log was found."
   "Display on the current output port help about the standard command-line
 options handled by 'set-build-options-from-command-line', and listed in
 '%standard-build-options'."
+  (show-flake-reference-options-help)             ;goonix: flake references
   (display (G_ "
   -L, --load-path=DIR    prepend DIR to the package module search path"))
   (display (G_ "
@@ -340,6 +344,10 @@ use '--no-offload' instead~%")))
                         (leave (G_ "not a number: '~a' option argument: ~a~%")
                                name arg)))))))
 
+;; goonix: the commands that build take the options of a flake reference.
+(set! %standard-build-options
+      (append %flake-reference-options %standard-build-options))
+
 (define (list-systems)
   "Print the available systems."
   (display (G_ "The available systems are:\n"))
@@ -445,7 +453,7 @@ Build the given PACKAGE-OR-DERIVATION and return their output paths.\n"))
   -m, --manifest=FILE    build the packages that the manifest given in FILE
                          evaluates to"))
   (display (G_ "
-      --pure-eval        evaluate FILE from its tracked tree in a container")) ;goonix: CLI hook
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
   (display (G_ "
   -D, --development      build the inputs of the following package"))
   (display (G_ "
@@ -536,7 +544,7 @@ must be one of 'package', 'all', or 'transitive'~%")
          (option '(#\m "manifest") #t #f
                  (lambda (opt name arg result)
                    (alist-cons 'manifest arg result)))
-         (option '("pure-eval") #f #f
+         (option '("pure-eval") #f #f              ;goonix: CLI hook
                  (lambda (opt name arg result)
                    (alist-cons 'pure-eval? #t result)))
          (option '(#\D "development") #f #f
@@ -603,28 +611,6 @@ must be one of 'package', 'all', or 'transitive'~%")
       (mlet %store-monad ((edges (node-back-edges %bag-node-type (all-packages))))
         (return (get-dependents packages edges))))))
 
-(define (flake-reference? spec)
-  (let ((hash (string-index spec #\#)))
-    (and hash (> hash 0) (< hash (- (string-length spec) 1))
-         (let ((path (string-take spec hash)))
-           (or (string=? path ".") (string=? path "..")
-               (string-prefix? "/" path)
-               (string-prefix? "./" path)
-               (string-prefix? "../" path))))))
-
-(define (flake-reference->derivation store spec opts)
-  (let* ((hash (string-index spec #\#))
-         (path (string-take spec hash))
-         (name (string->symbol (string-drop spec (+ hash 1))))
-         (directory (canonicalize-path path))
-         (options (filter-map (match-lambda
-                               (('option . pair) pair)
-                               (_ #f)) opts)))
-    (evaluate-flake store directory 'packages name
-                    #:options options
-                    #:system (or (assoc-ref opts 'system) (%current-system))
-                    #:target (assoc-ref opts 'target))))
-
 (define (options->things-to-build store opts)
   "Read the arguments from OPTS and return a list of high-level objects to
 build---packages, gexps, derivations, and so on."
@@ -665,8 +651,6 @@ values.")))))))))
       (raise (formatted-message (G_ "file '~a' does not return a manifest")
                                 file)))
     x)
-
-  (define pure-eval? (assoc-ref opts 'pure-eval?))
 
   (define system
     (or (assoc-ref opts 'system) (%current-system)))
@@ -722,13 +706,12 @@ values.")))))))))
                  ;; Nothing to do; maybe for --log-file.
                  (loop tail type result))
                 (else
-                 (if (flake-reference? spec)
-                     (loop tail 'regular
-                           (cons (flake-reference->derivation store spec opts)
-                                 result))
-                     (loop tail 'regular
-                           (append (for-type (specification->package spec))
-                                   result))))))
+                 (loop tail 'regular
+                       (append (if (flake-reference? spec) ;goonix: DIRECTORY#NAME
+                                   (list (flake-package-derivation store spec
+                                                                   opts))
+                                   (for-type (specification->package spec)))
+                               result)))))
          (('argument . (? derivation? drv))
           (loop tail 'regular (cons drv result)))
          (('file . file)
@@ -738,11 +721,7 @@ values.")))))))))
             (loop tail 'regular
                   (append (append-map
                            for-type
-                           (ensure-list
-                            (if pure-eval?
-                                (map read-derivation-from-file
-                                     (load-file-purely store file))
-                                (load* file '()))))
+                           (ensure-list (load* file '())))
                           result))))
          (('manifest . manifest)
           ;; Otherwise '--system' is ignored.
@@ -909,7 +888,9 @@ needed."
                          ;; calls 'gexp->derivation').
                          (%graft?                  graft?))
             (let* ((mode  (assoc-ref opts 'build-mode))
-                   (drv   (options->derivations store opts))
+                   (drv   (if (assoc-ref opts 'pure-eval?) ;goonix: --pure-eval
+                              (pure-build-derivations store opts)
+                              (options->derivations store opts)))
                    (items (filter-map (match-lambda
                                         (('argument . (? store-path? file))
                                          ;; If FILE is a .drv that's not in

@@ -91,13 +91,9 @@
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
-  #:autoload   (guix pure-eval) (load-file-purely) ;goonix: contained files
-  #:autoload   (guix scripts flake) (flake-reference? ;goonix: flake refs
-                                     parse-flake-reference
-                                     flake-output-derivation
-                                     flake-acting-output
-                                     flake-checked-output)
+  #:autoload   (guix scripts flake) (flake-command-action) ;goonix: flakes
   #:export (guix-system
+            process-action               ;goonix: for the evaluator
             read-operating-system
 
             profile-boot-parameters
@@ -1018,7 +1014,7 @@ Some ACTIONS support additional ARGS.\n"))
   (display (G_ "
   -d, --derivation       return the derivation of the given system"))
   (display (G_ "
-      --pure-eval        evaluate FILE from its tracked tree in a container"))
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
   (display (G_ "
   -e, --expression=EXPR  consider the operating-system EXPR evaluates to
                          instead of reading FILE, when applicable"))
@@ -1116,7 +1112,7 @@ Some ACTIONS support additional ARGS.\n"))
          (option '(#\d "derivation") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'derivations-only? #t result)))
-         (option '("pure-eval") #f #f
+         (option '("pure-eval") #f #f              ;goonix: CLI hook
                  (lambda (opt name arg result)
                    (alist-cons 'pure-eval? #t result)))
          (option '("allow-downgrades") #f #f
@@ -1283,32 +1279,7 @@ resulting from command-line parsing."
     (or (assoc-ref opts 'save-provenance?)
         (memq action '(init reconfigure))))
 
-  ;; goonix: with --pure-eval the file is evaluated in a container and only
-  ;; a derivation comes back, so only 'build' can be carried out.
-  (if (assoc-ref opts 'pure-eval?)
-      (let ((file (match args
-                    ((file . _) file)
-                    (() (leave (G_ "--pure-eval needs a configuration file~%"))))))
-        (unless (eq? action 'build)
-          (leave (G_ "--pure-eval supports only the 'build' action~%")))
-        (when (assoc-ref opts 'expression)
-          (leave (G_ "--pure-eval cannot be combined with --expression~%")))
-        (with-store store
-          (set-build-options-from-command-line store opts)
-          (match (load-file-purely store file #:kind 'system
-                                   #:system (assoc-ref opts 'system)
-                                   #:target (assoc-ref opts 'target))
-            ((drv output)
-             (if (assoc-ref opts 'derivations-only?)
-                 (display (string-append drv "\n"))
-                 (begin
-                   (build-derivations store
-                                      (list (read-derivation-from-file drv)))
-                   (when (assoc-ref opts 'gc-root)
-                     (register-root store (list output)
-                                    (assoc-ref opts 'gc-root)))
-                   (display (string-append output "\n"))))))))
-      (let* ((file        (match args
+  (let* ((file        (match args
                         (() #f)
                         ((x . _) x)))
          (expr        (assoc-ref opts 'expression))
@@ -1335,20 +1306,6 @@ resulting from command-line parsing."
                             (G_ "both file and expression cannot be specified~%")))
                           (expr
                            (read/eval expr))
-                          ;; goonix: a flake reference resolves to a systems
-                          ;; (or images) output.  Host-changing actions gate
-                          ;; the acting object against the pure derivation.
-                          ((and file (flake-reference? file))
-                           (let* ((ref (parse-flake-reference file))
-                                  (directory (car ref))
-                                  (name (or (cdr ref) 'default))
-                                  (kind (if (eq? action 'image) 'images 'systems)))
-                             (with-store store
-                               (if (memq action '(reconfigure init))
-                                   (flake-checked-output store directory kind
-                                                         name opts)
-                                   (flake-acting-output store directory kind
-                                                        name opts)))))
                           (file
                            (load* file %user-modules
                                   #:on-error (assoc-ref opts 'on-error)))
@@ -1448,7 +1405,7 @@ resulting from command-line parsing."
                                #:gc-root (assoc-ref opts 'gc-root)))))
           #:target target
           #:system system)))
-    (warn-about-disk-space))))
+    (warn-about-disk-space)))
 
 (define (resolve-subcommand name)
   (let ((module (resolve-interface
@@ -1524,6 +1481,8 @@ argument list and OPTS is the option alist."
 (define-command (guix-system . args)
   (synopsis "build and deploy full operating systems")
 
+  (define arguments args)                         ;goonix: as they were given
+
   (define (parse-sub-command arg result)
     ;; Parse sub-command ARG and augment RESULT accordingly.
     (cond ((assoc-ref result 'action)
@@ -1584,7 +1543,10 @@ argument list and OPTS is the option alist."
            (command  (assoc-ref opts 'action)))
       (parameterize ((%graft? (assoc-ref opts 'graft?)))
         (with-status-verbosity (verbosity-level opts)
-          (process-command command args opts))))))
+          ;; goonix: with '--pure-eval' or a flake reference, the
+          ;; evaluation is not done here.
+          (or (flake-command-action 'system command args opts arguments)
+              (process-command command args opts)))))))
 
 ;;; Local Variables:
 ;;; eval: (put 'with-store* 'scheme-indent-function 1)

@@ -35,7 +35,6 @@
   #:autoload   (guix channels) (guix-channel? channel-commit)
   #:use-module (guix scripts)
   #:use-module (guix scripts build)
-  #:autoload   (guix pure-eval) (load-file-purely) ;goonix: --pure-eval
   #:autoload   (guix scripts pack) (symlink-spec-option-parser)
   #:use-module (guix transformations)
   #:autoload   (ice-9 ftw) (scandir)
@@ -64,6 +63,8 @@
   #:use-module (srfi srfi-37)
   #:use-module (srfi srfi-98)
   #:export (assert-container-features
+            options/resolve-packages     ;goonix: for the evaluator
+            manifest->derivation         ;goonix: for the evaluator
             load-manifest
             launch-environment/container
             guix-environment
@@ -113,8 +114,6 @@ shell'."
   -C, --container        run command within an isolated container"))
   (display (G_ "
   -N, --network          allow containers to access the network"))
-  (display (G_ "
-      --pure-eval        evaluate project files in an isolated container")) ;goonix: CLI hook
   (display (G_ "
   -P, --link-profile     link environment profile to ~/.guix-profile within
                          an isolated container"))
@@ -215,10 +214,6 @@ COMMAND or an interactive shell in that environment.\n"))
          (option '("pure") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'pure #t result)))
-         ;; goonix: evaluate files in a container.
-         (option '("pure-eval") #f #f
-                 (lambda (opt name arg result)
-                   (alist-cons 'pure-eval? #t result)))
          (option '(#\E "preserve") #t #f
                  (lambda (opt name arg result)
                    (let ((=-index (string-index arg #\=)))
@@ -332,21 +327,6 @@ use '--preserve' instead~%"))
             (_ memo)))
         '() alist))
 
-;; goonix: --pure-eval.
-(define (pure-file->manifest store file)
-  "Return a manifest reconstructed from the derivations of a pure evaluation.
-Scheme package and service values never cross the evaluator boundary."
-  (manifest
-   (map (lambda (description)
-          (match description
-            ((name version file output)
-             (let ((drv (read-derivation-from-file file)))
-               (manifest-entry
-                (name name) (version version)
-                (output output)
-                (item drv))))))
-        (load-file-purely store file #:kind 'environment))))
-
 (define (load-manifest file)                      ;TODO: factorize
   "Load the user-profile manifest (Scheme code) from FILE and return it."
   (let ((modules '((guix profiles) (gnu))))
@@ -399,16 +379,9 @@ for the corresponding packages."
                    (packages->outputs (read/eval str) mode))
                   (('load mode file)
                    ;; Add all the outputs of the package defined in FILE.
-                   ;; goonix: --pure-eval.
-                   (if (assoc-ref opts 'pure-eval?)
-                       (manifest-entries (pure-file->manifest store file))
-                       (packages->outputs (load* file '()) mode)))
+                   (packages->outputs (load* file '()) mode))
                   (('manifest . file)
-                   ;; goonix: --pure-eval.
-                   (manifest-entries
-                    (if (assoc-ref opts 'pure-eval?)
-                        (pure-file->manifest store file)
-                        (load-manifest file))))
+                   (manifest-entries (load-manifest file)))
                   (('nesting? . #t)
                    (if (assoc-ref opts 'profile)
                        '()
