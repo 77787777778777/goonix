@@ -267,6 +267,11 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
   22 -> queryOnePath $ \_ path -> encodeStrings <$> queryDerivationOutputs store path
   23 -> queryAll $ \_ -> encodeStrings <$> queryAllValidPaths store
   24 -> queryAll $ \_ -> encodeStrings <$> queryFailedPaths store
+  25 -> do
+    paths <- readStorePathsSocket client
+    clearFailedPaths store paths
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
   26 -> queryOnePath $ \_ path -> do
     info <- queryPathInfo store path
     pure (encodeString (infoDeriver info) <> encodeString (encodeBase16 (infoHash info))

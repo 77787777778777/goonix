@@ -29,8 +29,10 @@ if test -n "${WATCHDOG_PID:-}"; then
 fi
 # Use a clean compiled-module path for generated bootstrap Guile programs.
 unset GUILE_LOAD_COMPILED_PATH
+# Extra options are for isolated test daemons, never the host daemon.
 "$root/pre-inst-env" "$daemon" --disable-chroot --allow-aslr \
   --substitute-urls="$GUIX_BINARY_SUBSTITUTE_URL" \
+  ${GOONIX_DAEMON_OPTIONS:-} \
   --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1 &
 pid=$!
 cleanup() {

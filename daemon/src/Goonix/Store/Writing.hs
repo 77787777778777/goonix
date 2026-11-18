@@ -8,6 +8,8 @@ module Goonix.Store.Writing
   , registerPath
   , addIndirectRoot
   , canonicaliseAndHash
+  , registerFailedPath
+  , clearFailedPaths
   ) where
 
 import Control.Exception (finally, throwIO)
@@ -139,3 +141,14 @@ encodeBase32Short = encodeBase32 . compressHash 20
 
 epochTimeSeconds :: IO Data.Int.Int64
 epochTimeSeconds = floor <$> getPOSIXTime
+
+registerFailedPath :: Store -> ByteString -> IO ()
+registerFailedPath store path = do
+  now <- epochTimeSeconds
+  execute (database store) "insert or replace into FailedPaths(path,time) values (?,?);"
+    [Bytes path, Integer now]
+
+clearFailedPaths :: Store -> [ByteString] -> IO ()
+clearFailedPaths store paths = withTransaction (database store) $
+  forM_ paths $ \path ->
+    execute (database store) "delete from FailedPaths where path = ?;" [Bytes path]

@@ -116,6 +116,12 @@ buildDerivation config rootFd store settings trace mode drvPath = do
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
   ready <- allOutputsValid store drv
+  failed <- if mode == Normal && not ready && settingBool "build-cache-failures" False settings
+    then or <$> mapM (hasPathFailed store . outputPath) (Map.elems (outputs drv))
+    else pure False
+  when failed $ do
+    traceFailed trace drvPath "cached"
+    throwIO (storeError ("build of `" ++ C.unpack drvPath ++ "' failed previously (cached)"))
   substituted <- case config of
     Just serverConfig | mode /= Check && not ready && settingBool "build-use-substitutes" False settings ->
       or <$> mapM (trySubstitute serverConfig rootFd store settings trace . outputPath) (Map.elems (outputs drv))
@@ -229,6 +235,11 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   where
     buildFailed work = do
       traceFailed trace drvPath "builder failed"
+      forM_ sandboxRoot $ \root -> do
+        Files.setFileMode root 0o755
+        deleteTree root
+      when (mode == Normal && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
+        mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
       if keepFailed settings
         then pure ()
         else removeBuildDirectory work
