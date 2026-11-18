@@ -3290,7 +3290,11 @@ void DerivationGoal::registerOutputs()
 
     auto goonixOutputOrder = addressingOf(drv) == Addressing::content &&
         resolvedDerivation(drv)
-        ? contentOutputOrder(drv, allPaths, useChroot ? chrootRootDir : "")
+        ? contentOutputOrder(drv, [&] {
+            PathSet paths = allPaths;
+            for (auto & output : drv.outputs) paths.insert(output.second.path);
+            return paths;
+          }(), useChroot ? chrootRootDir : "")
         : std::vector<std::pair<string, Path>>{};
     if (goonixOutputOrder.empty())
         for (auto & output : drv.outputs)

@@ -691,7 +691,8 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
            not registered until the whole output set is checked. */
         bool stagedSibling = false;
         for (auto & sibling : finalOutputs)
-            stagedSibling = stagedSibling || sibling.second == final;
+            stagedSibling = stagedSibling || sibling.second == final ||
+                (physical == sibling.first && final == sibling.second);
         if (!store.isValidPath(final) && !stagedSibling)
             throw BuildError(std::format(
                 "CA final path `{0}' exists but is not a valid store item", final));
