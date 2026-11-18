@@ -11,14 +11,36 @@
 (define-module (test-ca)
   #:use-module (guix ca)
   #:use-module (guix base16)
+  #:use-module (guix derivations)
   #:use-module (guix store)
   #:use-module (ice-9 match)
+  #:use-module (ice-9 binary-ports)
+  #:use-module (ice-9 textual-ports)
+  #:use-module (json parser)
+  #:use-module ((gcrypt hash) #:select (sha256))
   #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-34)
   #:use-module (srfi srfi-64)
   #:use-module (rnrs bytevectors))
 
 (test-begin "ca")
+
+(define vectors
+  (let ((file (or (search-path (or (and=> (getenv "srcdir") list)
+                                   '("."))
+                               "tests/ca-vectors.json")
+                  "tests/ca-vectors.json")))
+    (call-with-input-file file json->scm)))
+
+(define (field object name)
+  (or (assoc-ref object name)
+      (error "missing CA vector field" name)))
+
+(define (list-field object name)
+  (let ((value (field object name)))
+    (unless (vector? value)
+      (error "CA vector field is not a JSON array" name))
+    (vector->list value)))
 
 (test-group "tokens and placeholders"
   (test-assert "self token is deterministic and reserved"
@@ -34,16 +56,20 @@
   (test-assert "placeholders have store shape"
     (placeholder-path? (placeholder (string->utf8 "drv bytes")
                                     "out" "hello-1.0")))
-  (test-equal "token vector matches the daemon"
-    "ttteoeueuuottuuotutetetooueeoutu"
+  (test-equal "token vector matches the shared vectors"
+    (field (field vectors "tokens") "out")
     (self-token "out"))
-  (test-equal "lib token vector matches the daemon"
-    "teuttuuueeuttoototeeeutooeeeuout"
+  (test-equal "lib token vector matches the shared vectors"
+    (field (field vectors "tokens") "lib")
     (self-token "lib"))
-  (test-equal "placeholder vector matches the daemon"
-    "eutuotetteeuuottttouuuteeutttuut"
-    (substring (basename (placeholder (string->utf8 "drv bytes")
-                                     "out" "hello-1.0")) 0 32))
+  (test-equal "placeholder vector matches the shared vectors"
+    (field (field vectors "placeholder") "hash")
+    (let ((vector (field vectors "placeholder")))
+      (substring (basename
+                  (placeholder
+                   (string->utf8 (field vector "derivationBytes"))
+                   (field vector "output") (field vector "name")))
+                 0 32)))
   (test-assert "self tokens are not placeholders"
     (not (placeholder-path? (token-path "out" "hello-1.0"))))
   (test-equal "placeholder identity is verified"
@@ -52,57 +78,119 @@
                                        "out" "hello-1.0")
                           (string->utf8 "drv bytes") "out" "hello-1.0"))
   (test-assert "invalid token text is rejected"
-    (guard (condition (else #t))
-      (validate-token-path "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")
-      #f))
+    (parameterize ((%store-prefix "/gnu/store"))
+      (guard (condition (else #t))
+        (validate-token-path "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")
+        #f)))
   (test-assert "unknown reserved token is rejected"
-    (guard (condition (else #t))
-      (validate-token-path "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hello")
-      #f))
+    (parameterize ((%store-prefix "/gnu/store"))
+      (guard (condition (else #t))
+        (validate-token-path "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hello")
+        #f)))
   (test-assert "real paths do not pass reserved validation"
+    (parameterize ((%store-prefix "/gnu/store"))
+      (guard (condition (else #t))
+        (validate-token-path "/gnu/store/00000000000000000000000000000000-hello")
+        #f)))
+  (test-assert "a known token at the active store prefix is accepted"
+    (string=? (token-path "out" "hello-1.0")
+              (validate-token-path (token-path "out" "hello-1.0"))))
+  (test-assert "a known placeholder is rejected"
     (guard (condition (else #t))
-      (validate-token-path "/gnu/store/00000000000000000000000000000000-hello")
+      (validate-token-path (placeholder (string->utf8 "drv bytes")
+                                        "out" "hello-1.0"))
       #f)))
 
 (test-group "tree and content vectors"
   (let ((root (mkdtemp "/tmp/ca-vectors.XXXXXX")))
-    (call-with-output-file (string-append root "/empty") (lambda (port) #t))
-    (chmod (string-append root "/empty") #o444)
-    (test-equal "empty file tree hash"
-      "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2"
-      (bytevector->base16-string (tree-hash (string-append root "/empty"))))
-    (symlink "target" (string-append root "/link"))
-    (test-equal "symlink tree hash"
-      "5ef2f8b90d0ca186d4b49cc6bbf69533d7bfe13bdc86bd4e7a2ef354ffb6812c"
-      (bytevector->base16-string (tree-hash (string-append root "/link"))))
-    (mkdir (string-append root "/dir"))
-    (call-with-output-file (string-append root "/dir/empty") (lambda (port) #t))
-    (chmod (string-append root "/dir/empty") #o444)
-    (test-equal "directory tree hash"
-      "4d906c085e9d72c6732872daeafd12323257f240329e76da0e9550d1ec24a2dd"
-      (bytevector->base16-string (tree-hash (string-append root "/dir"))))
-    (test-equal "content path"
-      "/gnu/store/kq0f52qvhdwr2a7a5ycvrra8b124sdw4-hello"
+    (for-each
+     (lambda (vector)
+       (let ((name (field vector "name"))
+             (kind (field vector "kind")))
+         (let ((path (string-append root "/" name)))
+           (match kind
+             ("regular"
+              (call-with-output-file path
+                (lambda (port)
+                  (put-bytevector port (u8-list->bytevector
+                                        (list-field vector "bytes"))))
+                #:binary #t)
+              (chmod path (if (= 1 (field vector "executable")) #o555 #o444)))
+             ("symlink" (symlink (field vector "target") path))
+             ("directory"
+              (mkdir path)
+              (for-each
+               (lambda (entry)
+                 (let ((child (string-append path "/" (field entry "name"))))
+                   (call-with-output-file child
+                     (lambda (port)
+                       (put-bytevector port
+                                       (u8-list->bytevector
+                                        (list-field entry "bytes"))))
+                     #:binary #t)
+                   (chmod child #o444)))
+               (list-field vector "entries"))))
+           (test-equal (string-append "shared tree vector: " name)
+             (field vector "sha256")
+             (bytevector->base16-string (tree-hash path))))))
+     (list-field vectors "trees"))
+    (let ((ordered (string-append root "/ordered")))
+      (mkdir ordered)
+      (for-each
+       (lambda (pair)
+         (call-with-output-file (string-append ordered "/" (car pair))
+           (lambda (port) (display (cdr pair) port))))
+       '(("z-last" . "z") ("a-first" . "a")))
+      (symlink "m-target" (string-append ordered "/m-link"))
+      (test-equal "shared directory entry ordering"
+        (field (field vectors "orderedDirectory") "sha256")
+        (bytevector->base16-string (tree-hash ordered))))
+    (let* ((content (field vectors "contentPaths"))
+           (trees (list-field vectors "trees"))
+           (tree (base16-string->bytevector (field (car trees) "sha256"))))
+      (test-equal "shared content path"
+        (field content "withoutReferences")
+        (parameterize ((%store-prefix "/gnu/store"))
+          (content-addressed-path "out" "hello" tree '())))
+      (test-equal "shared content path with sorted references"
+        (field content "withReferences")
+        (parameterize ((%store-prefix "/gnu/store"))
+          (content-addressed-path "out" "hello" tree
+                                  (reverse (list-field content "references")))))))
+  (let* ((resolved (field vectors "resolvedDerivation"))
+         (bytes (string->utf8 (field resolved "bytes")))
+         (drv (call-with-input-file
+                  (begin
+                    (let ((file (string-append (mkdtemp "/tmp/ca-drv.XXXXXX")
+                                               "/resolved.drv")))
+                      (call-with-output-file file
+                        (lambda (port) (display (field resolved "bytes") port)))
+                      file))
+                read-derivation)))
+    (test-equal "shared canonical resolved derivation bytes"
+      bytes (derivation->bytevector drv))
+    (test-equal "shared resolved-addressed path"
+      (field resolved "resolvedPath")
       (parameterize ((%store-prefix "/gnu/store"))
-        (content-addressed-path
-         "out" "hello"
-         (base16-string->bytevector
-          "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2")
-         '())))))
+        (resolved-addressed-path "out" "hello" bytes)))
+    (test-equal "shared resolved-addressed sibling path"
+      (field resolved "resolvedLibPath")
+      (parameterize ((%store-prefix "/gnu/store"))
+        (resolved-addressed-path "lib" "hello-lib" bytes)))))
 
 (test-group "build record canonical payload"
-  ;; These literal vectors are shared with the daemon's C++ records-test; the
-  ;; two implementations must agree byte-for-byte (plan CA-0, CA-5).
-  (test-equal "record payload matches the daemon vector"
-    "da6009a94a97ea3c50f7528283ec6cc5f0f8d35ff413e0f5b0b562fa561a5002"
-    (bytevector->base16-string
-     (build-record-content-hash "resolved" "derivation" "out" "path" "origin"
-                                #:relocation-checked? #t)))
-  (test-equal "record payload length matches the daemon vector"
-    104
-    (bytevector-length
-     (canonical-build-record-payload "resolved" "derivation" "out" "path"
-                                     "origin" #:relocation-checked? #t)))
+  (let* ((vector (field vectors "record"))
+         (payload (canonical-build-record-payload
+                   (field vector "resolvedHash") (field vector "derivation")
+                   (field vector "output") (field vector "path")
+                   (field vector "origin")
+                   #:relocation-checked?
+                   (= 1 (field vector "relocationChecked")))))
+    (test-equal "record payload bytes match the shared vectors"
+      (u8-list->bytevector (list-field vector "payload")) payload)
+    (test-equal "record payload hash matches the shared vectors"
+      (field vector "sha256")
+      (bytevector->base16-string (sha256 payload))))
   (test-assert "record payload is field-framed, not concatenated"
     (not (equal? (canonical-build-record-payload "resolved" "derivation"
                                                  "ou" "tpath" "origin")

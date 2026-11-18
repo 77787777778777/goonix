@@ -31,6 +31,7 @@
             validate-token-path
             tree-hash
             content-addressed-path
+            resolved-addressed-path
             canonical-build-record-payload
             build-record-content-hash))
 
@@ -231,21 +232,35 @@ Read regular files in bounded chunks and never follow symbolic links."
     (for-each (lambda (reference) (put-length-prefixed port reference))
               (sort references string<?))
     (force-output port)
-    (let* ((name-hash (digest))
-           (input (string->utf8
-                   (string-append "goonix-content:" output ":sha256:"
-                                  (bytevector->base16-string name-hash) ":"
-                                  (%store-prefix) ":" name)))
-           (hash (sha256 input))
-           (compressed (make-bytevector 20 0)))
+    (let ((name-hash (digest)))
       (close-port port)
-      (do ((i 0 (+ i 1))) ((= i (bytevector-length hash)))
-        (let ((j (modulo i 20)))
-          (bytevector-u8-set! compressed j
-                              (logxor (bytevector-u8-ref compressed j)
-                                      (bytevector-u8-ref hash i)))))
-      (string-append (%store-prefix) "/"
-                     (bytevector->nix-base32-string compressed) "-" name))))
+      (ca-store-path (string-append "goonix-content:" output)
+                     name-hash name))))
+
+(define (ca-store-path type name-hash name)
+  "Apply Guix's compressed store-path formula to TYPE and NAME-HASH."
+  (let* ((input (string->utf8
+                 (string-append type ":sha256:"
+                                (bytevector->base16-string name-hash) ":"
+                                (%store-prefix) ":" name)))
+         (hash (sha256 input))
+         (compressed (make-bytevector 20 0)))
+    (do ((i 0 (+ i 1))) ((= i (bytevector-length hash)))
+      (let ((j (modulo i 20)))
+        (bytevector-u8-set! compressed j
+                            (logxor (bytevector-u8-ref compressed j)
+                                    (bytevector-u8-ref hash i)))))
+    (string-append (%store-prefix) "/"
+                   (bytevector->nix-base32-string compressed) "-" name)))
+
+(define (resolved-addressed-path output name resolved-bytes)
+  "Return the resolved-addressed store path for canonical RESOLVED-BYTES."
+  (check-name name)
+  (unless (and (string? output) (valid-name? output)
+               (bytevector? resolved-bytes))
+    (error "invalid resolved-addressed path inputs" output resolved-bytes))
+  (ca-store-path (string-append "goonix-resolved:" output)
+                 (sha256 resolved-bytes) name))
 
 (define* (canonical-build-record-payload resolved-hash derivation output
                                          path origin

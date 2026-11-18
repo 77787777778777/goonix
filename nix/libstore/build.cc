@@ -754,6 +754,7 @@ private:
     void outputsSubstituted();
     void closureRepaired();
     void inputsRealised();
+    /* goonix: common fixed-output and repeat initialization. */
     void initialiseBuildKind();
     void tryToBuild();
     void buildDone();
@@ -1257,8 +1258,8 @@ void DerivationGoal::inputsRealised()
 
     allPaths.insert(inputPaths.begin(), inputPaths.end());
 
-    /* Fixed-output properties and repeat count are common to input- and
-       resolved-addressed build paths. Keep them in one place so resolved
+    /* goonix: fixed-output properties and repeat count are common to input-
+       and resolved-addressed build paths. Keep them in one place so resolved
        fixed outputs retain impureEnvVars, network setup and one-round
        behavior. */
     initialiseBuildKind();
@@ -1272,9 +1273,9 @@ void DerivationGoal::inputsRealised()
 
 void DerivationGoal::initialiseBuildKind()
 {
-    /* All declared outputs must have a hash for the derivation to use the
-       fixed-output environment and network setup. Fixed outputs are checked
-       by their declared hash and need no repeat rounds. */
+    /* goonix: all declared outputs must have a hash for the derivation to
+       use the fixed-output environment and network setup. Fixed outputs are
+       checked by their declared hash and need no repeat rounds. */
     fixedOutput = true;
     for (auto & output : drv.outputs)
         if (output.second.hash.empty()) fixedOutput = false;

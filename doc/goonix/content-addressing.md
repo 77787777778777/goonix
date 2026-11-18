@@ -123,8 +123,13 @@ round-trip to the same hash.
 
 ## Vectors
 
-`tests/ca-vectors.json` is generated only as a review convenience; the
-independent C++ and Scheme tests contain literal expected values and do not
-call one another.  The vectors cover empty files and directories,
-executable bits, symbolic links, arbitrary-byte file contents, directory
-entry ordering, self tokens, placeholders, content paths and resolution.
+`tests/ca-vectors.json` is the shared input and expected-output set for the
+independent C++ and Scheme implementations. Each side constructs the same
+filesystem fixtures and parses the same canonical derivation and record
+bytes; neither calls the other. The C++ side runs as
+`nix/ca-test --shared-vectors` from `make check`; the Scheme side is
+`tests/ca.scm`. The vectors cover empty files and directories, executable
+bits, symbolic links, arbitrary-byte file contents, directory entry
+ordering, self tokens, placeholders, content paths with sorted references,
+resolved derivation serialization and paths, and canonical record payload
+bytes and hashes.

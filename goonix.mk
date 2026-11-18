@@ -75,8 +75,11 @@ goonix_ca_store_checks =			\
 # suite's own state directory and a 'guix' that runs from the build tree.
 check-local:
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test
-	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --tree-vectors
-	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --placeholder-vector
+	$(AM_V_at)directory=`mktemp -d` || exit 1; \
+	  $(abs_top_builddir)/nix/ca-test --shared-vectors \
+	    $(abs_top_srcdir)/tests/ca-vectors.json "$$directory"; \
+	  status=$$?; chmod -R u+w "$$directory"; rm -rf "$$directory"; \
+	  test $$status -eq 0 || exit $$status
 	$(AM_V_at)for check in $(goonix_ca_store_checks); do		\
 	  directory=`mktemp -d` || exit 1;				\
 	  $(abs_top_builddir)/nix/ca-test --$$check "$$directory";	\

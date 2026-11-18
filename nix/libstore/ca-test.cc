@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <format>
+#include <variant>
+#include <stdexcept>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -44,6 +46,166 @@ static void configureIsolatedStore(const Path & root)
     settings.nixDaemonSocketFile = root + "/socket";
     settings.buildUsersGroup = "";
 }
+
+/* A small, strict JSON reader for the shared vectors. It is test code only;
+   the daemon itself does not acquire a JSON dependency. */
+struct JSON;
+using JSONArray = std::vector<JSON>;
+using JSONObject = std::map<string, JSON>;
+struct JSON : std::variant<std::nullptr_t, bool, uint64_t, string,
+    JSONArray, JSONObject>
+{
+    using variant::variant;
+    const JSON & at(const string & key) const
+    {
+        auto object = std::get_if<JSONObject>(this);
+        if (!object) throw std::runtime_error("expected JSON object");
+        auto found = object->find(key);
+        if (found == object->end())
+            throw std::runtime_error("missing JSON vector field: " + key);
+        return found->second;
+    }
+    const string & text() const
+    {
+        auto value = std::get_if<string>(this);
+        if (!value) throw std::runtime_error("expected JSON string");
+        return *value;
+    }
+    uint64_t number() const
+    {
+        auto value = std::get_if<uint64_t>(this);
+        if (!value) throw std::runtime_error("expected JSON integer");
+        return *value;
+    }
+    const JSONArray & array() const
+    {
+        auto value = std::get_if<JSONArray>(this);
+        if (!value) throw std::runtime_error("expected JSON array");
+        return *value;
+    }
+};
+
+class JSONParser
+{
+    const string input;
+    size_t at = 0;
+    void whitespace()
+    {
+        while (at < input.size() &&
+            (input[at] == ' ' || input[at] == '\n' ||
+             input[at] == '\r' || input[at] == '\t')) ++at;
+    }
+    bool consume(char c)
+    {
+        whitespace();
+        if (at < input.size() && input[at] == c) { ++at; return true; }
+        return false;
+    }
+    void literal(const char * text)
+    {
+        size_t length = strlen(text);
+        if (input.compare(at, length, text) != 0)
+            throw std::runtime_error("invalid JSON literal");
+        at += length;
+    }
+    static void utf8(string & out, unsigned codepoint)
+    {
+        if (codepoint <= 0x7f) out.push_back(codepoint);
+        else if (codepoint <= 0x7ff) {
+            out.push_back(0xc0 | (codepoint >> 6));
+            out.push_back(0x80 | (codepoint & 0x3f));
+        } else {
+            if (codepoint >= 0xd800 && codepoint <= 0xdfff)
+                throw std::runtime_error("unpaired JSON surrogate");
+            out.push_back(0xe0 | (codepoint >> 12));
+            out.push_back(0x80 | ((codepoint >> 6) & 0x3f));
+            out.push_back(0x80 | (codepoint & 0x3f));
+        }
+    }
+    string parseString()
+    {
+        whitespace();
+        if (at >= input.size() || input[at++] != '"')
+            throw std::runtime_error("expected JSON string");
+        string result;
+        while (at < input.size()) {
+            unsigned char c = input[at++];
+            if (c == '"') return result;
+            if (c < 0x20) throw std::runtime_error("control byte in JSON string");
+            if (c != '\\') { result.push_back(c); continue; }
+            if (at == input.size()) throw std::runtime_error("truncated JSON escape");
+            char escape = input[at++];
+            switch (escape) {
+                case '"': case '\\': case '/': result.push_back(escape); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                case 'u': {
+                    if (at + 4 > input.size())
+                        throw std::runtime_error("truncated JSON Unicode escape");
+                    unsigned value = 0;
+                    for (unsigned i = 0; i < 4; ++i) {
+                        char digit = input[at++];
+                        value <<= 4;
+                        if (digit >= '0' && digit <= '9') value += digit - '0';
+                        else if (digit >= 'a' && digit <= 'f') value += digit - 'a' + 10;
+                        else if (digit >= 'A' && digit <= 'F') value += digit - 'A' + 10;
+                        else throw std::runtime_error("invalid JSON Unicode escape");
+                    }
+                    utf8(result, value);
+                    break;
+                }
+                default: throw std::runtime_error("unknown JSON escape");
+            }
+        }
+        throw std::runtime_error("unterminated JSON string");
+    }
+    JSON value()
+    {
+        whitespace();
+        if (at == input.size()) throw std::runtime_error("missing JSON value");
+        if (consume('{')) {
+            JSONObject object;
+            if (consume('}')) return object;
+            while (true) {
+                string key = parseString();
+                if (!consume(':')) throw std::runtime_error("expected JSON colon");
+                if (!object.emplace(key, value()).second)
+                    throw std::runtime_error("duplicate JSON vector field: " + key);
+                if (consume('}')) return object;
+                if (!consume(',')) throw std::runtime_error("expected JSON comma");
+            }
+        }
+        if (consume('[')) {
+            JSONArray array;
+            if (consume(']')) return array;
+            while (true) {
+                array.push_back(value());
+                if (consume(']')) return array;
+                if (!consume(',')) throw std::runtime_error("expected JSON comma");
+            }
+        }
+        if (input[at] == '"') return parseString();
+        if (input.compare(at, 4, "true") == 0) { literal("true"); return true; }
+        if (input.compare(at, 5, "false") == 0) { literal("false"); return false; }
+        if (input.compare(at, 4, "null") == 0) { literal("null"); return nullptr; }
+        size_t start = at;
+        while (at < input.size() && input[at] >= '0' && input[at] <= '9') ++at;
+        if (start == at) throw std::runtime_error("invalid JSON number");
+        return std::stoull(input.substr(start, at - start));
+    }
+public:
+    explicit JSONParser(const Path & file) : input(readFile(file)) { }
+    JSON parse()
+    {
+        JSON result = value();
+        whitespace();
+        if (at != input.size()) throw std::runtime_error("trailing JSON input");
+        return result;
+    }
+};
 
 static void checkOutputPathValidation(const Path & root)
 {
@@ -355,50 +517,108 @@ static void checkFinalRootBeforeExistence(const Path & root)
         "rooted final tree is intact after the lock handoff");
 }
 
-static void checkPlaceholderVector()
+static void checkSharedVectors(const Path & file, const Path & root)
 {
-    Derivation drv;
-    drv.platform = "x86_64-linux";
-    drv.builder = "/bin/sh";
-    drv.env["goonixAddressing"] = "content";
-    drv.outputs["lib"] = DerivationOutput("", "", "");
-    drv.outputs["out"] = DerivationOutput("", "", "");
-    drv.env["lib"] = "";
-    drv.env["out"] = "";
     settings.nixStore = "/gnu/store";
-    const string bytes = unparseDerivation(drv);
-    Path actual = makePlaceholder(bytes, "lib", "ca-multi-lib");
-    const Path expected = "/gnu/store/eeoeooettuoueuuooetuooteouteeooe-ca-multi-lib";
-    if (actual != expected) std::cerr << "actual placeholder=" << actual << "\n";
-    check(actual == expected,
-        "placeholder bytes match the Scheme serializer");
-}
+    JSON vectors = JSONParser(file).parse();
+    check(vectors.at("format").number() == 1, "shared vector format is 1");
+    auto field = [&](const JSON & object, const string & name) {
+        return object.at(name).text();
+    };
+    auto tokens = vectors.at("tokens");
+    auto out = field(tokens, "out");
+    auto lib = field(tokens, "lib");
+    check(selfToken("out") == out, "shared self token vector");
+    check(selfToken("lib") == lib, "shared lib token vector");
+    check(tokenPath("out", "hello-1.0") ==
+        "/gnu/store/" + out + "-hello-1.0", "shared token path vector");
+    auto placeholder = vectors.at("placeholder");
+    Path placeholderPath = makePlaceholder(field(placeholder, "derivationBytes"),
+        field(placeholder, "output"), field(placeholder, "name"));
+    check(placeholderPath == "/gnu/store/" + field(placeholder, "hash") + "-" +
+        field(placeholder, "name"), "shared placeholder vector");
 
-static void checkTreeVectors()
-{
-    Path root = "/tmp/goonix-ca-vectors";
     if (pathExists(root)) deletePath(root);
     createDirs(root);
-    writeFile(root + "/empty", "");
-    chmod((root + "/empty").c_str(), 0444);
-    Hash empty = treeHash(root + "/empty");
-    check(printHash(empty) ==
-        "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2",
-        "empty file tree vector");
-    createSymlink("target", root + "/link");
-    check(printHash(treeHash(root + "/link")) ==
-        "5ef2f8b90d0ca186d4b49cc6bbf69533d7bfe13bdc86bd4e7a2ef354ffb6812c",
-        "symlink tree vector");
-    createDirs(root + "/dir");
-    writeFile(root + "/dir/empty", "");
-    chmod((root + "/dir/empty").c_str(), 0444);
-    check(printHash(treeHash(root + "/dir")) ==
-        "4d906c085e9d72c6732872daeafd12323257f240329e76da0e9550d1ec24a2dd",
-        "directory tree vector");
-    Path actualContent = contentAddressedPath("out", "hello", empty, {});
-    check(actualContent ==
-        "/gnu/store/kq0f52qvhdwr2a7a5ycvrra8b124sdw4-hello",
-        "content path vector");
+    auto trees = vectors.at("trees");
+    for (auto & vector : trees.array()) {
+        auto name = field(vector, "name");
+        auto kind = field(vector, "kind");
+        Path path = root + "/" + name;
+        if (kind == "regular") {
+            string bytes;
+            for (auto & byte : vector.at("bytes").array())
+                bytes.push_back((char) byte.number());
+            writeFile(path, bytes);
+            chmod(path.c_str(), vector.at("executable").number() ? 0555 : 0444);
+        } else if (kind == "symlink")
+            createSymlink(field(vector, "target"), path);
+        else if (kind == "directory") {
+            createDirs(path);
+            for (auto & entry : vector.at("entries").array()) {
+                string bytes;
+                for (auto & byte : entry.at("bytes").array())
+                    bytes.push_back((char) byte.number());
+                Path child = path + "/" + field(entry, "name");
+                writeFile(child, bytes);
+                chmod(child.c_str(), 0444);
+            }
+        }
+        else throw Error("unknown shared tree vector kind");
+        check(printHash(treeHash(path)) == field(vector, "sha256"),
+            "shared tree vector: " + name);
+    }
+    /* Create these in reverse lexical order: the expected digest must come
+       from the specified byte ordering, not from directory insertion order. */
+    Path ordered = root + "/ordered";
+    createDirs(ordered);
+    writeFile(ordered + "/z-last", "z");
+    writeFile(ordered + "/a-first", "a");
+    createSymlink("m-target", ordered + "/m-link");
+    for (auto & file : {ordered + "/z-last", ordered + "/a-first"})
+        chmod(file.c_str(), 0444);
+    check(printHash(treeHash(ordered)) ==
+        field(vectors.at("orderedDirectory"), "sha256"),
+        "shared directory entry ordering vector");
+
+    auto content = vectors.at("contentPaths");
+    Hash empty = parseHash(htSHA256,
+        field(trees.array().front(), "sha256"));
+    PathSet references;
+    for (auto & reference : content.at("references").array())
+        references.insert(reference.text());
+    check(contentAddressedPath("out", "hello", empty, {}) ==
+        field(content, "withoutReferences"), "shared content path vector");
+    check(contentAddressedPath("out", "hello", empty, references) ==
+        field(content, "withReferences"),
+        "shared content path with sorted references vector");
+
+    auto resolved = vectors.at("resolvedDerivation");
+    string bytes = field(resolved, "bytes");
+    Derivation parsed = parseDerivationText(bytes);
+    check(unparseDerivation(parsed) == bytes,
+        "shared resolved derivation canonical bytes");
+    check(resolvedAddressedPath("out", "hello", bytes) ==
+        field(resolved, "resolvedPath"), "shared resolved-addressed path vector");
+    check(resolvedAddressedPath("lib", "hello-lib", bytes) ==
+        field(resolved, "resolvedLibPath"),
+        "shared resolved-addressed sibling path vector");
+
+    auto recordVector = vectors.at("record");
+    BuildRecord record;
+    record.resolvedHash = field(recordVector, "resolvedHash");
+    record.resolvedDerivation = field(recordVector, "derivation");
+    record.output = field(recordVector, "output");
+    record.path = field(recordVector, "path");
+    record.origin = field(recordVector, "origin");
+    record.relocationChecked = recordVector.at("relocationChecked").number();
+    string payload = canonicalBuildRecordPayload(record);
+    string expectedPayload;
+    for (auto & byte : recordVector.at("payload").array())
+        expectedPayload.push_back((char) byte.number());
+    check(payload == expectedPayload, "shared canonical record payload bytes");
+    check(printHash(hashString(htSHA256, payload)) == field(recordVector, "sha256"),
+        "shared canonical record payload hash");
 }
 
 static void checkStagedToken(const Path & root)
@@ -490,13 +710,8 @@ int main(int argc, char ** argv)
         checkStagedToken(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
-    if (argc == 2 && string(argv[1]) == "--tree-vectors") {
-        settings.nixStore = "/gnu/store";
-        checkTreeVectors();
-        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-    if (argc == 2 && string(argv[1]) == "--placeholder-vector") {
-        checkPlaceholderVector();
+    if (argc == 4 && string(argv[1]) == "--shared-vectors") {
+        checkSharedVectors(argv[2], argv[3]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--leftover") {
@@ -535,9 +750,6 @@ int main(int argc, char ** argv)
     settings.nixStore = "/gnu/store";
 
     auto out = selfToken("out");
-    check(out == "ttteoeueuuottuuotutetetooueeoutu", "self token vector");
-    check(selfToken("lib") == "teuttuuueeuttoototeeeutooeeeuout", "lib token vector");
-    check(tokenPath("out", "hello-1.0") == "/gnu/store/ttteoeueuuottuuotutetetooueeoutu-hello-1.0", "token path vector");
     check(out.size() == 32 && out[0] != 'e'
         && out.find_first_not_of("eout") == std::string::npos
         && out == selfToken("out"), "self token shape and determinism");
@@ -545,7 +757,6 @@ int main(int argc, char ** argv)
     check(isTokenStorePath(tokenPath("out", "hello-1.0")),
         "token path has store shape");
     auto placeholder = makePlaceholder("drv bytes", "out", "hello-1.0");
-    check(placeholder == "/gnu/store/eutuotetteeuuottttouuuteeutttuut-hello-1.0", "placeholder vector");
     check(isPlaceholderPath(placeholder), "placeholder has store shape");
     check(!isPlaceholderPath(tokenPath("out", "hello-1.0")),
         "self token is not placeholder");
