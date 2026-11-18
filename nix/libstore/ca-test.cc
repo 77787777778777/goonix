@@ -193,6 +193,28 @@ static void checkExistingItemIsUntouched(const Path & root)
         "existing self-reference remains in final form");
     check(readFile(witness + "/linked") == final,
         "hard-linked content is not rewritten");
+
+    /* Put a token-form tree at the valid final address.  The old inverse
+       check hashes that tree on disk and accepts it; the fixed check must
+       refuse it without touching the item or a hard link to its contents. */
+    if (chmod((final + "/reference").c_str(), 0600) ||
+        chmod((witness + "/linked").c_str(), 0600))
+        throw SysError("preparing the same-address collision fixture");
+    writeFile(final + "/reference", againToken);
+    check(readFile(witness + "/linked") == againToken,
+        "collision fixture changed the linked existing item");
+    bool collision = throws([&] {
+        PathSet ignoredReferences;
+        Hash ignoredNAR;
+        uint64_t ignoredSize = 0;
+        finaliseContentOutput(store, againToken, "out", "existing-output",
+            PathSet{againToken}, ignoredReferences, ignoredNAR, ignoredSize);
+    });
+    check(collision, "corrupt tree at a claimed content address is refused");
+    check(readFile(witness + "/linked") == againToken,
+        "failed early-cutoff comparison leaves the linked item untouched");
+    check(readFile(final + "/reference") == againToken,
+        "failed early-cutoff comparison leaves the existing item untouched");
 }
 
 static void checkSiblingOutputReferences(const Path & root)

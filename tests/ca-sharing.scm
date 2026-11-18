@@ -153,6 +153,20 @@
        #:use-substitutes? #f #:settings '(("gc-keep-outputs" . "false")))
       (->bool alive))))
 
+(test-assert "--check preserves a self-referencing result and its choice"
+  (let* ((drv (ca-drv "rec-check-self"
+                      (string-append
+                       "(call-with-output-file (getenv \"out\") "
+                       "(lambda (p) (display (getenv \"out\") p)))")))
+         (out (begin (build-derivations store (list drv)) (realised drv)))
+         (hash (resolved-hash drv)))
+    (build-derivations store (list drv) (build-mode check))
+    (and (string=? out (read-all out))
+         (string=? out (realised drv))
+         (valid-path? store out)
+         (= 1 (length (build-records hash "out")))
+         (verify-store store #:check-contents? #t #:repair? #f))))
+
 (test-assert "--check stores a second record for a non-reproducible result"
   (let* ((drv (ca-drv "rec-nonrepro"
                       "(call-with-output-file (getenv \"out\") (lambda (p) (display (gettimeofday) p)))"))
