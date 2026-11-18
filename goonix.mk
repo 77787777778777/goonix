@@ -26,6 +26,7 @@ SCM_TESTS +=					\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
   tests/flake-actions.scm			\
+  tests/goonix-builders.scm			\
   tests/pure-eval.scm				\
   tests/store-path-check.scm
 

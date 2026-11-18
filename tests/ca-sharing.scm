@@ -55,7 +55,7 @@
    (sha256 (call-with-input-file (resolved-derivation drv) get-bytevector-all))))
 
 (define (build-records hash output)
-  (query-build-records store (base16-string->bytevector hash) output))
+  ((@ (guix ca) build-records) store (base16-string->bytevector hash) output))
 
 (define (record-paths hash output)
   (map (lambda (r) (list-ref r 2)) (build-records hash output)))

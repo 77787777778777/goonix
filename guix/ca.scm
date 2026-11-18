@@ -18,8 +18,10 @@
   #:use-module (rnrs io ports)
   #:use-module ((guix base16) #:select (bytevector->base16-string))
   #:use-module ((guix base32) #:select (bytevector->nix-base32-string))
-  #:use-module ((guix store) #:select (%store-prefix))
-  #:export (%ca-store-directory
+  #:use-module ((guix store) #:select (%store-prefix query-build-records))
+  #:use-module (ice-9 match)
+  #:export (build-records
+            %ca-store-directory
             self-token
             token-path
             token-store-path?
@@ -269,3 +271,23 @@ agree byte-for-byte with the daemon's canonicalBuildRecordPayload."
                                           path origin
                                           #:relocation-checked?
                                           relocation-checked?)))
+
+(define (build-records store resolved-hash output)
+  "Return the signed records that the daemon behind STORE has for OUTPUT of
+the resolved derivation whose hash is RESOLVED-HASH, a bytevector.  Each is a
+list: the resolved derivation, the output, the realised path, the origin,
+1 or 0 for whether the relocation was checked, and the signature."
+  (let loop ((fields  (query-build-records store resolved-hash output))
+             (records '()))
+    (match fields
+      (()
+       (reverse records))
+      ((derivation output path origin checked signature . rest)
+       (loop rest
+             (cons (list derivation output path origin
+                         (if (string=? checked "1") 1 0)
+                         signature)
+                   records)))
+      (_
+       (error "the daemon sent build records that are not six fields each"
+              fields)))))
