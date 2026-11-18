@@ -6,6 +6,7 @@ MODULES +=					\
   guix/pure-eval.scm				\
   guix/package-overrides.scm			\
   guix/ca.scm					\
+  guix/download-cache.scm			\
   guix/flakes.scm				\
   guix/flakes/syntax.scm			\
   guix/flakes/lock.scm				\
@@ -26,6 +27,7 @@ SCM_TESTS +=					\
   tests/ca-references.scm			\
   tests/ca-rewrite.scm				\
   tests/ca-sharing.scm				\
+  tests/download-cache.scm			\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
   tests/flake-actions.scm			\
