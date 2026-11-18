@@ -1,3 +1,4 @@
+// goonix: content-addressing tokens, tree hash, resolution and finalisation.
 #pragma once
 
 #include "types.hh"
@@ -28,6 +29,17 @@ enum class Addressing { input, content, resolved };
 Addressing addressingOf(const Derivation & drv);
 bool goonixAddressed(const Derivation & drv);
 bool resolvedDerivation(const Derivation & drv);
+
+/* CA-4 mixed-policy safety (plan 3.1): an input-addressed derivation may
+   have only input-addressed and fixed-output inputs.  As soon as one input
+   is content- or resolved-addressed, the dependent must be too.  Throws if
+   an input-addressed derivation directly references a CA derivation. */
+void checkInputAddressedPolicy(class LocalStore & store, const Derivation & drv);
+
+/* Validate the shape of a resolved derivation before it is registered:
+   marked resolved, no floating inputs, outputs are self tokens (content)
+   or strict final paths (resolved/fixed), environment agrees. */
+void checkResolvedDerivation(const Derivation & drv);
 
 /* Resolve every original derivation/output through daemon-owned choices.
    The resulting derivation contains only realised paths and self tokens. */

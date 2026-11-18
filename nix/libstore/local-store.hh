@@ -149,6 +149,21 @@ public:
         bool relocationChecked, const string & signature);
     std::vector<BuildRecord> queryGoonixBuildRecords(const string & hash,
         const string & output);
+    std::vector<BuildRecord> queryGoonixRecordsByPath(const Path & path);
+    std::vector<BuildRecord> queryGoonixRecordsByResolved(const Path & resolved);
+    std::vector<RecordConflict> queryGoonixConflicts(const string & hash,
+        const string & output);
+    /* Record-driven reachability: an output keeps every derivation whose
+       records name it, and vice versa (plan 10).  Several derivers. */
+    PathSet goonixDerivationsForPath(const Path & path);
+    PathSet goonixOriginalsForPath(const Path & path);
+    PathSet goonixChosenPaths(const Path & unresolved);
+    /* Set this machine's choice from a record for a resolved derivation.
+       Keeps a valid existing choice (default policy), records any
+       disagreement, and repairs a collected choice.  `adopt' forces the
+       given path even over a valid choice (explicit policy). */
+    Path selectGoonixOutput(const Path & unresolved, const string & output,
+        const string & resolvedHash, const Path & preferred, bool adopt);
     void chooseGoonixOutput(const Path & unresolved, const string & output,
         const Path & realised);
     Path chosenGoonixOutput(const Path & unresolved, const string & output);

@@ -21,7 +21,9 @@
             placeholder
             placeholder-path?
             placeholder-identity
-            validate-token-path))
+            validate-token-path
+            canonical-build-record-payload
+            build-record-content-hash))
 
 (define %ca-store-directory "/gnu/store")
 (define %reserved-alphabet "eotu")
@@ -125,3 +127,45 @@
         ((placeholder-path? path)
          (error "unresolved CA placeholder" path))
         (else (error "not a valid CA token or placeholder" path))))
+
+;;;
+;;; Build records: the Scheme mirror of the daemon's canonical signed payload.
+;;; Format 1 (doc/goonix/content-addressing.md): domain string, version, then
+;;; each field as a 64-bit little-endian length followed by its UTF-8 bytes,
+;;; then the relocation-checked flag as a 64-bit integer.
+;;;
+
+(define (put-u64-le port value)
+  (let ((bytes (make-bytevector 8 0)))
+    (bytevector-u64-set! bytes 0 value (endianness little))
+    (put-bytevector port bytes)))
+
+(define (put-length-prefixed port text)
+  (let ((bytes (string->utf8 text)))
+    (put-u64-le port (bytevector-length bytes))
+    (put-bytevector port bytes)))
+
+(define* (canonical-build-record-payload resolved-hash derivation output
+                                         path origin
+                                         #:key (relocation-checked? #f))
+  "Return the canonical bytes signed for a goonix build record.  This must
+agree byte-for-byte with the daemon's canonicalBuildRecordPayload."
+  (let-values (((port get-content) (open-bytevector-output-port)))
+    (put-bytevector port (string->utf8 "goonix-record-v1"))
+    (put-u8 port 0)
+    (put-u64-le port 1)
+    (for-each (lambda (field) (put-length-prefixed port field))
+              (list resolved-hash derivation output path origin))
+    (put-u64-le port (if relocation-checked? 1 0))
+    (let ((bytes (get-content)))
+      (close-port port)
+      bytes)))
+
+(define* (build-record-content-hash resolved-hash derivation output
+                                    path origin
+                                    #:key (relocation-checked? #f))
+  "Return the SHA-256 (as a bytevector) of the canonical record payload."
+  (sha256 (canonical-build-record-payload resolved-hash derivation output
+                                          path origin
+                                          #:relocation-checked?
+                                          relocation-checked?)))

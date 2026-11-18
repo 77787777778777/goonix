@@ -951,33 +951,30 @@ void DerivationGoal::haveDerivation()
         for (auto & choice : worker.store.choices(originalDrvPath))
             worker.store.addTempRoot(choice.second);
         if (resolvedDerivation(drv)) {
+            // goonix: the choice is authoritative (plan 3.3).  Use a valid
+            // existing choice first; only repair a collected choice from a
+            // permanent fact.  Never silently switch to another build.
+            auto & local = dynamic_cast<LocalStore &>(worker.store);
+            const string resolvedHash = printHash(hashString(htSHA256,
+                unparseDerivation(drv)));
+            bool allRealised = true;
             for (auto & output : drv.outputs) {
-                auto chosen = worker.store.choices(originalDrvPath);
-                auto it = chosen.find({originalDrvPath, output.first});
-                if (it != chosen.end() && worker.store.isValidPath(it->second))
-                    output.second.path = it->second;
-                worker.store.addTempRoot(output.second.path);
+                Path selected = local.selectGoonixOutput(originalDrvPath,
+                    output.first, resolvedHash, "", false);
+                if (!selected.empty()) {
+                    output.second.path = selected;
+                    worker.store.addTempRoot(selected);
+                } else {
+                    worker.store.addTempRoot(output.second.path);
+                    allRealised = false;
+                }
+                /* Keep the builder's environment consistent with the path we
+                   will actually build/use (matters for resolved outputs). */
+                drv.env[output.first] = output.second.path;
             }
-            if (buildMode == bmNormal) {
-                auto records = dynamic_cast<LocalStore &>(worker.store)
-                    .queryGoonixBuildRecords(
-                        printHash(hashString(htSHA256, unparseDerivation(drv))), "");
-                bool allRealised = true;
-                for (auto & output : drv.outputs) {
-                    bool found = false;
-                    for (auto & record : records)
-                        if (record.output == output.first &&
-                            worker.store.isValidPath(record.path)) {
-                            output.second.path = record.path;
-                            found = true;
-                            break;
-                        }
-                    allRealised = allRealised && found;
-                }
-                if (allRealised) {
-                    done(BuildResult::AlreadyValid);
-                    return;
-                }
+            if (buildMode == bmNormal && allRealised) {
+                done(BuildResult::AlreadyValid);
+                return;
             }
             for (auto & source : drv.inputSrcs)
                 computeFSClosure(worker.store, source, inputPaths);
@@ -996,6 +993,10 @@ void DerivationGoal::haveDerivation()
         worker.wakeUp(shared_from_this());
         return;
     }
+
+    // goonix: mixed policy - refuse to build an input-addressed derivation
+    // that depends on a content/resolved-addressed input (plan 3.1).
+    checkInputAddressedPolicy(dynamic_cast<LocalStore &>(worker.store), drv);
 
     for (auto& i : drv.outputs)
         worker.store.addTempRoot(i.second.path);
@@ -1045,6 +1046,24 @@ void DerivationGoal::outputsSubstituted()
     if (needRestart) {
         needRestart = false;
         haveDerivation();
+        return;
+    }
+
+    /* goonix: an unresolved CA derivation has placeholder outputs that are
+       never valid store paths; their realisation is decided by resolution
+       and records, not by output substitution.  Skip the historical
+       output-validity checks (including the --check "missing outputs"
+       guard) and go straight to realising the inputs. */
+    if (goonixCA && !resolvedDerivation(drv)) {
+        wantedOutputs = PathSet();
+        for (auto& i : drv.inputDrvs)
+            addWaitee(worker.makeDerivationGoal(i.first, i.second, bmNormal));
+        for (auto& i : drv.inputSrcs)
+            addWaitee(worker.makeSubstitutionGoal(i));
+        if (waitees.empty())
+            inputsRealised();
+        else
+            state = &DerivationGoal::inputsRealised;
         return;
     }
 
@@ -1160,18 +1179,19 @@ void DerivationGoal::inputsRealised()
         resolvedDrvPath = writeResolvedDerivation(worker.store,
             originalDrvPath, drv);
         drvPath = resolvedDrvPath;
+        worker.store.addTempRoot(resolvedDrvPath);
         auto & local = dynamic_cast<LocalStore &>(worker.store);
-        auto records = local.queryGoonixBuildRecords(
-            printHash(hashString(htSHA256, unparseDerivation(drv))), "");
-        for (auto & record : records)
-            if (local.isValidPath(record.path))
-                local.chooseOutput(originalDrvPath, record.output, record.path);
+        const string resolvedHash = printHash(hashString(htSHA256,
+            unparseDerivation(drv)));
+        /* Set this machine's choice from the facts for R, keeping any valid
+           existing choice (plan 3.3).  A collected choice is repaired from a
+           record; a disagreement is stored, not silently adopted. */
         for (auto & output : originalDrv.outputs) {
-            Path chosen = local.chosenOutput(originalDrvPath, output.first);
-            if (!chosen.empty() && local.isValidPath(chosen))
-                drv.outputs[output.first].path = chosen;
-            else
-                drv.outputs[output.first].path = output.second.path;
+            Path selected = local.selectGoonixOutput(originalDrvPath,
+                output.first, resolvedHash, "", false);
+            if (!selected.empty())
+                drv.outputs[output.first].path = selected;
+            /* else keep the token/final path so the output is built. */
         }
         /* Resolution has no pending waitees: enter the resolved-output state
            directly and schedule the continuation. */
@@ -3277,6 +3297,28 @@ void DerivationGoal::registerOutputs()
             // goonix: canonicalise before hashing; final path is tree-derived.
             canonicalisePathMetaData(actualPath,
                 buildUser.enabled() ? buildUser.getUID() : -1, inodesSeen);
+            auto & localStore = dynamic_cast<LocalStore &>(worker.store);
+            if (buildMode == bmCheck) {
+                /* --check builds again and compares content addresses.  A
+                   different result is stored as a second record for the same
+                   resolved derivation: two records ARE the reproducibility
+                   detection (plan 3.3, 10).  The choice is left untouched. */
+                ValidPathInfo checkInfo;
+                Path checkFinal = finaliseContentOutput(worker.store, actualPath,
+                    i.first, storePathToName(path), allPaths, checkInfo.references,
+                    checkInfo.hash, checkInfo.narSize);
+                checkInfo.path = checkFinal;
+                checkInfo.deriver = drvPath;
+                if (!worker.store.isValidPath(checkFinal))
+                    worker.store.registerValidPath(checkInfo);
+                localStore.recordBuild(drvPath, i.first, checkFinal, "local-check", false);
+                Path chosen = localStore.chosenOutput(originalDrvPath, i.first);
+                if (checkFinal != chosen)
+                    printMsg(lvlError, std::format(
+                        "goonix: `{0}' is not reproducible: output `{1}' rebuilt to `{2}', choice is `{3}' (second record stored)",
+                        originalDrvPath, i.first, checkFinal, chosen));
+                continue;
+            }
             ValidPathInfo info;
             info.path = path;
             Path final = finaliseContentOutput(worker.store, actualPath,
@@ -3285,7 +3327,6 @@ void DerivationGoal::registerOutputs()
             info.path = final;
             info.deriver = drvPath;
             infos.push_back(info);
-            auto & localStore = dynamic_cast<LocalStore &>(worker.store);
             localStore.recordBuild(drvPath, i.first, final, "local", false);
             localStore.chooseOutput(originalDrvPath, i.first, final);
             continue;

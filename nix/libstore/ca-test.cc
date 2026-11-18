@@ -1,3 +1,4 @@
+// goonix: test vectors for tokens, placeholders and reserved paths.
 #include "ca.hh"
 #include "globals.hh"
 #include <cstdlib>

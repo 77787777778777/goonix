@@ -1,3 +1,4 @@
+// goonix: adversarial tests of record signing, selection and import.
 #include "records.hh"
 #include "local-store.hh"
 #include "globals.hh"
@@ -184,6 +185,83 @@ int main(int argc, char ** argv)
     } catch (const AuthenticationError &) {
         std::cout << "goonix resolved content binding: PASS\n";
         std::cout.flush();
+    }
+
+    /* Selection policy: a valid choice is kept, a collected choice is
+       repaired from a fact, and an explicit adoption replaces it.  Use a
+       fresh resolved derivation so earlier import tests do not add facts. */
+    {
+        Path outA = store.addTextToStore("sel-a", "result-a", PathSet());
+        Path outB = store.addTextToStore("sel-b", "result-b", PathSet());
+        const string selText = "Derive([(\"out\",\"" + settings.nixStore +
+            "/ttteoeueuuottuuotutetetooueeoutu-selection\",\"\",\"\")],[],[]," +
+            "\"x86_64-linux\",\"/bin/sh\",[],[(\"goonixAddressing\",\"content\"),(" +
+            "\"goonixResolved\",\"1\")])";
+        Path selDrv = store.addTextToStore("selection.drv", selText, PathSet());
+        const string selHash = printHash(hashString(htSHA256, selText));
+        const Path original = settings.nixStore +
+            "/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-selection.drv";
+        store.recordBuild(selDrv, "out", outA, "local-test", false);
+        /* First selection picks the valid offered path. */
+        Path chosen = store.selectGoonixOutput(original, "out", selHash, outA, false);
+        if (chosen != outA) {
+            std::cerr << "goonix selection first choice: FAIL\n";
+            return 1;
+        }
+        /* A second, different fact is stored; the local choice is kept. */
+        store.recordBuild(selDrv, "out", outB, "server-test", false);
+        chosen = store.selectGoonixOutput(original, "out", selHash, outB, false);
+        if (chosen != outA) {
+            std::cerr << "goonix selection keeps local choice: FAIL\n";
+            return 1;
+        }
+        if (store.queryGoonixBuildRecords(selHash, "out").size() != 2) {
+            std::cerr << "goonix selection stores both facts: FAIL\n";
+            return 1;
+        }
+        if (store.queryGoonixConflicts(selHash, "out").empty()) {
+            std::cerr << "goonix selection records disagreement: FAIL\n";
+            return 1;
+        }
+        /* Explicit adoption switches the choice. */
+        chosen = store.selectGoonixOutput(original, "out", selHash, outB, true);
+        if (chosen != outB || store.chosenGoonixOutput(original, "out") != outB) {
+            std::cerr << "goonix selection adopt policy: FAIL\n";
+            return 1;
+        }
+        std::cout << "goonix selection policy and conflicts: PASS\n";
+        std::cout.flush();
+    }
+
+    /* A record must name a strict, non-reserved store path.  Sign the
+       mutated fields so the path check (not the signature check) is what
+       refuses the record. */
+    {
+        auto bad = records.at(0);
+        bad.path = settings.nixStore +
+            "/ttteoeueuuottuuotutetetooueeoutu-token";
+        bad.signature = store.signBuildRecord(canonicalBuildRecordPayload(bad));
+        try {
+            store.recordGoonixBuild(bad.resolvedDerivation, bad.output,
+                bad.path, bad.resolvedHash, bad.origin,
+                bad.relocationChecked, bad.signature);
+            std::cerr << "goonix record reserved path: FAIL (accepted)\n";
+            return 1;
+        } catch (const AuthenticationError &) {
+            std::cout << "goonix record reserved path refused: PASS\n";
+        }
+        bad.path = "/etc/passwd";
+        bad.signature = store.signBuildRecord(canonicalBuildRecordPayload(bad));
+        try {
+            store.recordGoonixBuild(bad.resolvedDerivation, bad.output,
+                bad.path, bad.resolvedHash, bad.origin,
+                bad.relocationChecked, bad.signature);
+            std::cerr << "goonix record non-store path: FAIL (accepted)\n";
+            return 1;
+        } catch (const AuthenticationError &) {
+            std::cout << "goonix record non-store path refused: PASS\n";
+            std::cout.flush();
+        }
     }
 
     settings.nixStateDir += "/unauthorized";

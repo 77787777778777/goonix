@@ -109,6 +109,86 @@ bool resolvedDerivation(const Derivation & drv)
     return it != drv.env.end() && it->second == "1";
 }
 
+/* CA-4 mixed policy (plan 3.1): an input-addressed derivation has only
+   input-addressed and fixed-output inputs.  A direct content/resolved input
+   would make its output path unknowable before the build, so refuse it
+   loudly rather than silently producing an unbuildable derivation. */
+void checkInputAddressedPolicy(LocalStore & store, const Derivation & drv)
+{
+    if (goonixAddressed(drv)) return;
+    for (auto & input : drv.inputDrvs) {
+        /* Only judge inputs we can actually read; an absent input is caught
+           by the normal validity machinery, not by the addressing policy. */
+        if (!store.isValidPath(input.first)) continue;
+        auto inDrv = derivationFromPath(store, input.first);
+        if (goonixAddressed(inDrv))
+            throw Error(std::format(
+                "input-addressed derivation depends on content/resolved-addressed `{0}'; "
+                "mark the dependent as content-addressed too (goonix mixed policy)",
+                input.first));
+    }
+}
+
+/* A resolved derivation is a pure function of the machine's choices: every
+   input is a realised store path, outputs are self tokens (content) or final
+   paths (resolved/fixed), and the environment names each output. */
+void checkResolvedDerivation(const Derivation & drv)
+{
+    if (!resolvedDerivation(drv))
+        throw Error("goonix: derivation is not marked resolved");
+    if (!drv.inputDrvs.empty())
+        throw Error("goonix: resolved derivation still has floating inputs");
+    Addressing addressing = addressingOf(drv);
+    for (auto & output : drv.outputs) {
+        const Path & path = output.second.path;
+        bool fixed = !output.second.hash.empty();
+        if (fixed) {
+            if (!isStorePathStrict(path))
+                throw Error(std::format("goonix: invalid fixed output `{0}'", path));
+        } else if (addressing == Addressing::content) {
+            if (!isTokenStorePath(path))
+                throw Error(std::format(
+                    "goonix: content output `{0}' is not a self token", path));
+        } else if (addressing == Addressing::resolved) {
+            if (!isStorePathStrict(path))
+                throw Error(std::format(
+                    "goonix: resolved output `{0}' is not a final store path", path));
+        } else
+            throw Error("goonix: resolved derivation has input addressing");
+        /* If an environment entry names this output it must agree; the
+           builder environment is synchronised to the chosen paths at build
+           time, so a stored resolved derivation may omit it. */
+        auto env = drv.env.find(output.first);
+        if (env != drv.env.end() && env->second != path)
+            throw Error(std::format(
+                "goonix: resolved output `{0}' disagrees with its environment",
+                output.first));
+    }
+    /* No placeholder may survive resolution, anywhere it could leak. */
+    const string storePrefix = settings.nixStore + "/";
+    auto scan = [&](const string & value) {
+        size_t at = 0;
+        while ((at = value.find(storePrefix, at)) != string::npos) {
+            size_t end = at + storePrefix.size();
+            while (end < value.size() && value[end] != '/' &&
+                   value[end] != '"' && value[end] != '\'' &&
+                   value[end] != ' ' && value[end] != '\n' &&
+                   value[end] != '\t' && value[end] != ')' &&
+                   value[end] != '(' && value[end] != ',')
+                ++end;
+            Path candidate = value.substr(at, end - at);
+            if (isPlaceholderPath(candidate))
+                throw Error(std::format(
+                    "goonix: unresolved placeholder `{0}' in resolved derivation",
+                    candidate));
+            at = end;
+        }
+    };
+    scan(drv.builder);
+    for (auto & arg : drv.args) scan(arg);
+    for (auto & entry : drv.env) scan(entry.second);
+}
+
 static void put64(string & out, uint64_t value)
 {
     for (unsigned i = 0; i < 8; ++i) out.push_back((value >> (i * 8)) & 0xff);
@@ -205,12 +285,15 @@ static string replaceWhole(string input, const string & from, const string & to,
         input.replace(at, from.size(), to);
         at += to.size();
     }
-    /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable. */
+    /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable.
+       Name the file and the byte offset of the offending fragment (plan 4.2). */
     for (size_t i = 0; i + 8 <= from.size(); ++i) {
         auto fragment = from.substr(i, 8);
-        if (input.find(fragment) != string::npos)
-            throw BuildError(std::format("opaque self-reference fragment in `{}' near `{}'",
-                file, fragment));
+        auto at = input.find(fragment);
+        if (at != string::npos)
+            throw BuildError(std::format(
+                "opaque self-reference fragment `{0}' in `{1}' at byte {2}",
+                fragment, file, at));
     }
     for (unsigned width : {2, 4}) {
         string encoded;
@@ -317,6 +400,31 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     Path final = contentAddressedPath(output, name, built, namingReferences);
     string oldHash = baseNameOf(token).substr(0, 32);
     string newHash = baseNameOf(final).substr(0, 32);
+
+    /* An existing store item is never overwritten (plan: finalisation).
+       A content address names its content, so an identical result is the
+       same item: verify the round trip against it and reuse it.  A
+       different tree at the same address is a collision or corruption and
+       is refused rather than clobbered. */
+    if (pathExists(final)) {
+        if (!store.isValidPath(final))
+            throw BuildError(std::format(
+                "CA final path `{0}' exists but is not a valid store item", final));
+        rewriteTree(final, newHash, oldHash);
+        bool same = treeHash(final) == built;
+        rewriteTree(final, oldHash, newHash);
+        if (!same)
+            throw BuildError(std::format(
+                "CA content address collision at `{0}': existing item differs", final));
+        deletePath(token);
+        HashResult existingNAR;
+        references = scanForReferences(final, allPaths, existingNAR);
+        auto result = hashPath(htSHA256, final);
+        narHash = result.first;
+        narSize = result.second;
+        return final;
+    }
+
     rewriteTree(token, oldHash, newHash);
     /* Renaming self references necessarily changes this tree's hash.
        Verification is the inverse mapping performed below. */
@@ -368,20 +476,27 @@ Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
     resolved.inputDrvs.clear();
     const string provisional = unparseDerivation(resolved);
     for (auto & output : resolved.outputs) {
+        /* A fixed output keeps the path its stated hash already determines. */
+        if (!output.second.hash.empty()) continue;
         string name = storePathToName(output.second.path);
         if (addressingOf(unresolved) == Addressing::content)
             output.second.path = tokenPath(output.first, name);
         else
             output.second.path = resolvedAddressedPath(output.first, name, provisional);
     }
-    resolved.env["out"] = resolved.outputs["out"].path;
+    /* Every output's environment entry names its resolved path, not just
+       `out'; multi-output derivations must stay consistent. */
+    for (auto & output : resolved.outputs)
+        resolved.env[output.first] = output.second.path;
     resolved.env["goonixResolved"] = "1";
+    checkResolvedDerivation(resolved);
     return resolved;
 }
 
 Path writeResolvedDerivation(LocalStore & store, const Path & originalPath,
     const Derivation & resolved)
 {
+    checkResolvedDerivation(resolved);
     return writeDerivation(store, resolved, storePathToName(originalPath));
 }
 
