@@ -695,6 +695,21 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (!store.isValidPath(final) && !stagedSibling)
             throw BuildError(std::format(
                 "CA final path `{0}' exists but is not a valid store item", final));
+        if (stagedSibling && !store.isValidPath(final)) {
+            /* A previous output of this build already produced this path.
+               Verify it and leave registration to the output-set commit. */
+            bool same = sameContent(final, final, token, built, finalOutputs);
+            if (!same)
+                throw BuildError(std::format(
+                    "CA content address collision at `{0}': existing item differs", final));
+            deletePath(physical);
+            HashResult existingNAR;
+            references = scanForReferences(final, allPaths, existingNAR);
+            auto result = hashPath(htSHA256, final);
+            narHash = result.first;
+            narSize = result.second;
+            return final;
+        }
         bool same = sameContent(final, final, token, built, finalOutputs);
         if (!same)
             throw BuildError(std::format(
