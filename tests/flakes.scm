@@ -288,6 +288,34 @@
                                               "/value.txt")
                              get-string-all)))))))))
 
+;; Each URL has its own cached checkout: a second repository must never be
+;; resolved from, or locked at a commit of, the first one.
+(test-assert "two git repositories are resolved independently"
+  (with-temporary-git-repository first
+      '((add "name.txt" "first") (commit "first"))
+    (with-temporary-git-repository second
+        '((add "name.txt" "second") (commit "second"))
+      (call-with-temporary-directory
+       (lambda (cache)
+         (parameterize ((%repository-cache-directory cache))
+           (let* ((branch (lambda (directory)
+                            (invoke-git directory "rev-parse"
+                                        "--abbrev-ref" "HEAD")))
+                  (contents (lambda (snapshot)
+                              (call-with-input-file
+                                  (string-append
+                                   (tree-snapshot-directory snapshot)
+                                   "/name.txt")
+                                get-string-all)))
+                  (one (resolve-git-input first #:branch (branch first)))
+                  (two (resolve-git-input second #:branch (branch second))))
+             (and (string=? (invoke-git first "rev-parse" "HEAD")
+                            (tree-snapshot-commit one))
+                  (string=? (invoke-git second "rev-parse" "HEAD")
+                            (tree-snapshot-commit two))
+                  (string=? "first" (contents one))
+                  (string=? "second" (contents two))))))))))
+
 (test-assert "pinned dependencies retain their own transitive pins"
   (with-temporary-git-repository shared
       '((add "value.txt" "old") (commit "old"))

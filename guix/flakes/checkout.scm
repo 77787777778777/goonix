@@ -181,6 +181,11 @@ points into the mutable cache: its content is exactly the locked commit."
                    (branch `(branch . ,branch))
                    (else '()))))
     (let-values (((directory resolved relation)
+                  ;; Each URL has its own directory below the cache root;
+                  ;; passing the root itself would make all URLs share one
+                  ;; repository.
                   (update-cached-checkout url #:ref ref
-                                          #:cache-directory repository-cache-directory)))
+                                          #:cache-directory
+                                          (url-cache-directory
+                                           url repository-cache-directory))))
       (tracked-tree directory #:commit resolved #:worktree? #f))))
