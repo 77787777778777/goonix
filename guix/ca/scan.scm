@@ -12,6 +12,7 @@
 (define-module (guix ca scan)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-34)
   #:use-module (ice-9 binary-ports)
   #:use-module (ice-9 ftw)
   #:use-module (ice-9 iconv)
@@ -71,10 +72,6 @@
     (bytevector-copy! bytes start result 0 length)
     result))
 
-(define (increment key result amount)
-  (cons (cons key (+ amount (or (assoc-ref result key) 0)))
-        (assoc-remove! result key)))
-
 (define (utf16-le-bytes hash)
   "Return the 32 ASCII characters of HASH in UTF-16LE, without a BOM."
   (let ((result (make-bytevector 64)))
@@ -89,85 +86,90 @@
 (define (latin1 bytes)
   (bytevector->string bytes "ISO-8859-1"))
 
-(define (count-after needle haystack pending-length)
-  "Count NEEDLE in Latin-1 HAYSTACK, excluding the retained prefix."
-  (let loop ((start 0) (count 0))
-    (let ((at (string-contains haystack needle start)))
-      (if (not at)
-          count
-          (loop (+ at 1)
-                (if (>= (+ at (string-length needle)) pending-length)
-                    (+ count 1) count))))))
+(define (append-bytes first second)
+  "Return a bytevector holding FIRST followed by SECOND."
+  (let* ((size (bytevector-length first))
+         (result (make-bytevector (+ size (bytevector-length second)))))
+    (bytevector-copy! first 0 result 0 size)
+    (bytevector-copy! second 0 result size (bytevector-length second))
+    result))
 
-(define* (scan-bytes hash bytes #:optional (pending-length 0))
-  "Count self references using native searches over arbitrary binary bytes."
-  (let* ((text (latin1 bytes))
-         (hash-text (latin1 hash))
-         (full (count-after hash-text text pending-length))
-         (encoded (count-after (latin1 (utf16-le-bytes hash)) text
-                               pending-length))
-         (windows
-          (let loop ((offset 0) (result '()))
-            (if (> offset (- (string-length hash-text) 8))
-                (reverse result)
-                (loop (+ offset 1)
-                      (cons (cons offset
-                                  (substring hash-text offset (+ offset 8)))
-                            result))))))
-    (define (fragment-count window total)
-      (let ((offset (car window))
-            (needle (cdr window)))
-        (let loop ((start 0) (count 0))
-          (let ((at (string-contains text needle start)))
-            (if (not at)
-                (+ total count)
-                (let ((whole (- at offset)))
-                  (loop (+ at 1)
-                        (+ count
-                           (if (and (>= (+ at 8) pending-length)
-                                    (or (< whole 0)
-                                        (> (+ whole 32) (string-length text))
-                                        (not (string=? hash-text
-                                                       (substring text whole (+ whole 32))))))
-                               1 0)))))))))
-    (let ((fragments (fold fragment-count 0 windows)))
-      (list (cons 'full full)
-            (cons 'fragments fragments)
-            (cons 'utf16 encoded)))))
+(define (add-counts totals counts)
+  "Return the alist TOTALS with the numbers of the alist COUNTS added."
+  (fold (lambda (entry totals)
+          (let ((old (or (assq-ref totals (car entry)) 0)))
+            (alist-cons (car entry) (+ old (cdr entry))
+                        (alist-delete (car entry) totals eq?))))
+        totals
+        counts))
 
-(define (scan-port hash port limit)
-  "Read PORT in bounded chunks, retaining HASH's largest encoded suffix."
-  (let ((width 128)                       ;UTF-32LE: 32 characters
-        (chunk-size (* 128 1024)))
-    (let loop ((pending #vu8()) (result '()) (consumed 0))
-      (let* ((chunk (get-bytevector-n port chunk-size))
-             (eof? (eof-object? chunk))
-             (chunk (if eof? #vu8() chunk))
-             (limit? (>= (+ consumed (bytevector-length chunk)) limit))
-             (chunk (if limit?
-                        (substring-bytes chunk 0
-                                         (max 0 (- limit consumed))) chunk)))
-        (if (and (or eof? limit?) (zero? (bytevector-length chunk)))
-            result
-            (let* ((pending-length (bytevector-length pending))
-                   (bytes (let ((combined (make-bytevector
-                                           (+ pending-length
-                                              (bytevector-length chunk)))))
-                            (bytevector-copy! pending 0 combined 0 pending-length)
-                            (bytevector-copy! chunk 0 combined pending-length
-                                              (bytevector-length chunk))
-                            combined))
-                   (result (fold (lambda (entry result)
-                                   (increment (car entry) result (cdr entry)))
-                                 result (scan-bytes hash bytes pending-length))))
-              (if (or eof? limit?)
-                  result
-                  (loop (substring-bytes bytes
-                                         (max 0 (- (bytevector-length bytes)
-                                                   (- width 1)))
-                                         (min (- width 1)
-                                              (bytevector-length bytes)))
-                        result (+ consumed (bytevector-length chunk))))))))))
+(define (occurrence-ends text needle)
+  "Return the offset just past each occurrence of NEEDLE in TEXT."
+  (let ((size (string-length needle)))
+    (let loop ((start 0) (ends '()))
+      (let ((at (string-contains text needle start)))
+        (if at
+            (loop (+ at 1) (cons (+ at size) ends))
+            ends)))))
+
+(define (whole-hash-at? text hash-text start)
+  "Return true if HASH-TEXT lies at offset START of TEXT."
+  (and (>= start 0)
+       (<= (+ start 32) (string-length text))
+       (string-prefix? hash-text text 0 32 start (+ start 32))))
+
+;; An 8-character window of the hash is a fragment unless the whole hash
+;; lies around it.  Deciding that takes up to this many bytes after the
+;; window.
+(define %right-context 24)
+
+;; Bytes kept from one read to the next: the longest needle (the hash in
+;; UTF-16LE), the right context, and the left context of a window.
+(define %retained 127)
+
+(define* (scan-bytes hash bytes
+                     #:optional (from 0) (to (bytevector-length bytes)))
+  "Count the self references in BYTES that end after offset FROM and not
+after offset TO.  Return an alist with the keys full, fragments and utf16.
+Every occurrence counts, also one that overlaps the one before."
+  (define text (latin1 bytes))
+  (define hash-text (latin1 hash))
+  (define (owned needle)
+    (filter (lambda (end) (and (> end from) (<= end to)))
+            (occurrence-ends text needle)))
+  (define (fragments offset)
+    (count (lambda (end)
+             (not (whole-hash-at? text hash-text (- end 8 offset))))
+           (owned (substring hash-text offset (+ offset 8)))))
+  (list (cons 'full (length (owned hash-text)))
+        (cons 'fragments (apply + (map fragments (iota 25))))
+        (cons 'utf16 (length (owned (latin1 (utf16-le-bytes hash)))))))
+
+(define* (scan-port hash port limit #:key (chunk-size (* 128 1024)))
+  "Read at most LIMIT bytes from PORT, CHUNK-SIZE at a time, and return what
+'scan-bytes' returns for all of them at once.
+
+Each round scans the retained bytes followed by the new ones.  A round that
+is not the last one leaves the occurrences that end in its last
+%RIGHT-CONTEXT bytes to the next round, which has the bytes after them;
+DECIDED is the offset up to which occurrences are already counted."
+  (let loop ((retained #vu8()) (decided 0) (remaining limit) (totals '()))
+    (let* ((wanted (min chunk-size remaining))
+           (chunk (if (zero? wanted)
+                      (eof-object)
+                      (get-bytevector-n port wanted)))
+           (last? (eof-object? chunk))
+           (bytes (if last? retained (append-bytes retained chunk)))
+           (size (bytevector-length bytes))
+           (to (if last? size (max decided (- size %right-context))))
+           (totals (add-counts totals (scan-bytes hash bytes decided to))))
+      (if last?
+          totals
+          (let ((keep (min size %retained)))
+            (loop (substring-bytes bytes (- size keep) keep)
+                  (- to (- size keep))
+                  (- remaining (bytevector-length chunk))
+                  totals))))))
 
 (define (compressed-kind file)
   (cond ((string-suffix? ".gz" file) 'gzip)
@@ -178,35 +180,40 @@
          'unsupported-zip)
         (else #f)))
 
-(define (scan-compressed hash file)
-  "Return the hidden self-reference count or an unsupported/error counter."
+(define (open-decoder file kind)
+  "Open FILE's decoder after resolving its module; installation errors escape."
+  (resolve-interface (case kind ((gzip) '(zlib)) ((xz) '(lzma))))
+  (let ((port (open-file file "r0")))
+    (case kind
+      ((gzip) (make-gzip-input-port port))
+      ((xz) (make-xz-input-port port #:close? #t)))))
+
+(define (scan-decoded hash input limit)
+  "Scan INPUT and report whether decompression exceeded LIMIT."
+  (let* ((counts (scan-port hash input limit))
+         (extra (get-bytevector-n input 1)))
+    (append (list (cons 'hidden (or (assq-ref counts 'full) 0)))
+            (if (eof-object? extra) '() '((unsupported . 1))))))
+
+(define* (scan-compressed hash file #:optional (limit (* 64 1024 1024)))
+  "Return hidden self references, or a decoder/limit coverage counter."
   (let ((kind (compressed-kind file)))
-    (cond ((not kind) '())
-          ((eq? kind 'gzip)
-           (catch #t
-             (lambda ()
-               (let* ((file-port (open-file file "r0"))
-                      (input (make-gzip-input-port file-port)))
-                 (dynamic-wind
-                   (const #f)
-                   (lambda ()
-                     (let ((result (scan-port hash input (* 64 1024 1024))))
-                       (list (cons 'hidden (or (assoc-ref result 'full) 0)))))
-                   (lambda () (close-port input) (close-port file-port)))))
-             (lambda _ (list (cons 'undecodable 1)))))
-          ((eq? kind 'xz)
-           (catch #t
-             (lambda ()
-               (let* ((file-port (open-file file "r0"))
-                      (input (make-xz-input-port file-port)))
-                 (dynamic-wind
-                   (const #f)
-                   (lambda ()
-                     (let ((result (scan-port hash input (* 64 1024 1024))))
-                       (list (cons 'hidden (or (assoc-ref result 'full) 0)))))
-                   (lambda () (close-port input) (close-port file-port)))))
-             (lambda _ (list (cons 'undecodable 1)))))
-          (else (list (cons 'unsupported 1))))))
+    (if (memq kind '(gzip xz))
+        (let ((input (open-decoder file kind)))
+          (dynamic-wind
+            (const #f)
+            (lambda ()
+              (if (eq? kind 'gzip)
+                  (catch 'zlib-error
+                    (lambda () (scan-decoded hash input limit))
+                    (lambda _ '((undecodable . 1))))
+                  (guard (condition
+                          (((module-ref (resolve-interface '(lzma))
+                                        'lzma-error?) condition)
+                           '((undecodable . 1))))
+                    (scan-decoded hash input limit))))
+            (lambda () (close-port input))))
+        (if kind '((unsupported . 1)) '()))))
 
 (define (store-directory-items directory)
   "Return sorted directory store items below DIRECTORY, without following links."
@@ -219,6 +226,12 @@
                   name)))
          (scandir directory))
         string<?))
+
+(define (file-count entry)
+  "Normalize a regular file's UTF-16 occurrence count to a presence count."
+  (if (and (eq? (car entry) 'utf16) (> (cdr entry) 0))
+      (cons 'utf16 1)
+      entry))
 
 (define (scan-store-item item)
   "Read ITEM's tree and return its self-reference report.  ITEM is a store
@@ -233,18 +246,26 @@ item name or a full path; no file is modified and no symlink is followed."
     (define (add! key amount)
       (let ((index (list-index (lambda (candidate) (eq? key candidate)) keys)))
         (vector-set! counters index (+ amount (vector-ref counters index)))))
+    (define (add-file-counts! counts)
+      (for-each (lambda (entry)
+                  (add! (car entry) (cdr entry)))
+                (map file-count counts)))
     (define (visit path depth)
       (let ((stat (lstat path)))
+        (when (and (> depth 0)
+                   (string-contains (basename path) (utf8->string hash)))
+          (add! 'names 1))
         (case (stat:type stat)
           ((regular)
-           (add! 'files 1)
+           (unless (zero? (stat:size stat))
+             (add! 'files 1))
            (add! 'bytes (stat:size stat))
            (let ((file-port (open-file path "r0")))
              (dynamic-wind
                (const #f)
                (lambda ()
-                 (for-each (lambda (entry) (add! (car entry) (cdr entry)))
-                           (scan-port hash file-port (stat:size stat))))
+                 (add-file-counts!
+                  (scan-port hash file-port (stat:size stat))))
                (lambda () (close-port file-port))))
            (for-each (lambda (entry) (add! (car entry) (cdr entry)))
                      (scan-compressed hash path)))
@@ -252,9 +273,6 @@ item name or a full path; no file is modified and no symlink is followed."
            (when (string-contains (readlink path) (utf8->string hash))
              (add! 'links 1)))
           ((directory)
-           (when (and (> depth 0)
-                      (string-contains (basename path) (utf8->string hash)))
-             (add! 'names 1))
            (for-each (lambda (entry)
                        (visit (string-append path "/" entry) (+ depth 1)))
                      (sort (scandir path

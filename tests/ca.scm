@@ -22,7 +22,9 @@
   #:use-module (json parser)
   #:use-module ((gcrypt hash) #:select (sha256))
   #:use-module ((zlib) #:select (call-with-gzip-output-port))
+  #:use-module ((lzma) #:select (call-with-xz-output-port))
   #:use-module (srfi srfi-26)
+  #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-34)
   #:use-module (srfi srfi-64)
   #:use-module (rnrs bytevectors))
@@ -199,6 +201,14 @@
                               (field unresolved "name")))
        0 32))))
 
+(define scan-port-for-test (@@ (guix ca scan) scan-port))
+(define scan-bytes-for-test (@@ (guix ca scan) scan-bytes))
+
+(define (sorted-counts counts)
+  (sort counts (lambda (a b)
+                 (string<? (symbol->string (car a))
+                           (symbol->string (car b))))))
+
 (test-group "CA store scanning"
   (call-with-temporary-directory
    (lambda (root)
@@ -227,6 +237,43 @@
            1 (scan-report-names report))))))
   (call-with-temporary-directory
    (lambda (root)
+     (let* ((hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (item (string-append root "/" hash "-entries"))
+            (named (string-append hash "-named")))
+       (mkdir item)
+       (call-with-output-file (string-append item "/" named)
+         (lambda (port) (display "data" port)))
+       (symlink "target" (string-append item "/" hash "-link"))
+       (mkdir (string-append item "/" hash "-directory"))
+       (test-equal "scanner counts regular, symlink and directory names"
+         3 (scan-report-names (scan-store-item item))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (item (string-append root "/" hash "-empty")))
+       (mkdir item)
+       (call-with-output-file (string-append item "/empty") (const #t))
+       (call-with-output-file (string-append item "/one")
+         (lambda (port) (display "x" port)))
+       (let ((report (scan-store-item item)))
+         (test-equal "scanner excludes empty files from the file counter"
+           1 (scan-report-files report))
+         (test-equal "scanner still counts empty file bytes as zero"
+           1 (scan-report-bytes report))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (item (string-append root "/" hash "-utf16"))
+            (encoded (string->utf16 hash (endianness little))))
+       (mkdir item)
+       (call-with-output-file (string-append item "/twice")
+         (lambda (port) (put-bytevector port encoded)
+                 (put-bytevector port encoded))
+         #:binary #t)
+       (test-equal "scanner counts a UTF-16-containing file once"
+         1 (scan-report-utf16 (scan-store-item item))))))
+  (call-with-temporary-directory
+   (lambda (root)
      (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-boundary"))
             (hash "0123456789abcdfghijklmnpqrsvwxyz")
             (prefix (make-string (- (* 128 1024) 4) #\x)))
@@ -235,6 +282,33 @@
          (lambda (port) (display (string-append prefix hash) port)))
        (test-equal "scanner retains a self reference across a read boundary"
          1 (scan-report-full (scan-store-item item))))))
+  (let* ((hash "0123456789abcdfghijklmnpqrsvwxyz")
+         (bytes (string->utf8 hash))
+         (encoded (string->utf16 hash (endianness little)))
+         (fragment (string->utf8 (substring hash 3 15)))
+         (payload (u8-list->bytevector
+                   `(3 0 255
+                     ,@(bytevector->u8-list bytes) 7
+                     ,@(bytevector->u8-list fragment) 11
+                     ,@(bytevector->u8-list encoded) 13
+                     ,@(bytevector->u8-list bytes)
+                     ,@(bytevector->u8-list fragment) 17
+                     ,@(make-list 201 90))))
+         (expected (sorted-counts
+                    (scan-bytes-for-test (string->utf8 hash) payload))))
+    (test-equal "stream scan matches whole-content scan for every small read size"
+      '()
+      (filter-map
+       (lambda (chunk-size)
+         (let ((actual (sorted-counts
+                        (scan-port-for-test
+                         (string->utf8 hash)
+                         (open-bytevector-input-port payload)
+                         (bytevector-length payload)
+                         #:chunk-size chunk-size))))
+           (and (not (equal? expected actual))
+                (cons chunk-size actual))))
+       (iota 400 1))))
   (call-with-temporary-directory
    (lambda (root)
      (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-binary"))
@@ -263,6 +337,60 @@
              (lambda (output) (display hash output)))))
        (test-equal "scanner reports a self reference in a gzip member"
          1 (scan-report-hidden (scan-store-item item))))))
+  (call-with-temporary-directory
+   (lambda (root)
+     (let* ((item (string-append root "/0123456789abcdfghijklmnpqrsvwxyz-xz"))
+            (hash "0123456789abcdfghijklmnpqrsvwxyz")
+            (compressed (string-append item "/member.xz")))
+       (mkdir item)
+       (call-with-output-file compressed
+         (lambda (port)
+           (call-with-xz-output-port port
+             (lambda (output) (display hash output)))))
+       (test-equal "scanner reports a self reference in an xz member"
+         1 (scan-report-hidden (scan-store-item item))))))
+  (let ((scan-compressed (@@ (guix ca scan) scan-compressed))
+        (hash (string->utf8 "0123456789abcdfghijklmnpqrsvwxyz")))
+    (test-equal "compressed data beyond the scan limit is not silently clean"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (string-append root "/long.gz")))
+           (call-with-output-file file
+             (lambda (port)
+               (call-with-gzip-output-port port
+                 (lambda (output)
+                   (display (make-string 128 #\x) output)))))
+           (assq-ref (scan-compressed hash file 16) 'unsupported)))))
+    (test-equal "a zlib decoder error is counted as undecodable"
+      '((undecodable . 1))
+      (let ((saved (module-ref (resolve-module '(guix ca scan))
+                               'scan-decoded)))
+        (module-set! (resolve-module '(guix ca scan)) 'scan-decoded
+                     (lambda _ (throw 'zlib-error)))
+        (let ((result
+               (call-with-temporary-directory
+                (lambda (root)
+                  (let ((file (string-append root "/valid.gz")))
+                    (call-with-output-file file
+                      (lambda (port)
+                        (call-with-gzip-output-port port
+                          (lambda (output) (display "valid" output)))))
+                    (scan-compressed hash file))))))
+          (module-set! (resolve-module '(guix ca scan)) 'scan-decoded saved)
+          result)))
+    (test-equal "a missing compression module is not undecodable data"
+      'missing-module
+      (let ((saved (module-ref (resolve-module '(guix ca scan))
+                               'open-decoder)))
+        (module-set! (resolve-module '(guix ca scan)) 'open-decoder
+                     (lambda args (throw 'missing-module)))
+        (let ((result
+               (catch 'missing-module
+                 (lambda () (scan-compressed hash "/dev/null.gz") #f)
+                 (lambda _ 'missing-module))))
+          (module-set! (resolve-module '(guix ca scan)) 'open-decoder saved)
+          result))))
   (call-with-temporary-directory
    (lambda (root)
      (let ((name "0123456789abcdfghijklmnpqrsvwxyz-cli"))

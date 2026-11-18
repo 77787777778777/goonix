@@ -141,11 +141,20 @@ canonical record payload bytes and hashes.
 whole plain self references, 8-character fragments outside whole occurrences,
 UTF-16LE self references, self references in gzip or xz members, file names,
 and symbolic-link targets. It reads regular files in bounded chunks and
-retains enough overlap for a token crossing a read boundary. `--format=jsonl`
-emits one object per item; the default `summary` format prints the same
-counters in a readable line. `--directory=DIR` selects another store tree.
+retains enough overlap for a token crossing a read boundary. The counters
+match the reference measurement: `files` excludes empty regular files,
+`utf16` counts files containing at least one UTF-16LE hash, and `names`
+counts every non-root entry name, including regular files and symlinks.
+Whole plain occurrences are counted even when they overlap; the reference
+skips 32 bytes after each match, which matters only for self-overlapping
+hashes. `--format=jsonl` emits one object per item; the default `summary`
+format prints the same counters in a readable line. `--directory=DIR` selects another store tree.
 `--jobs=N` scans at most N items concurrently (three by default), while
 retaining input order in the output.
 Unsupported compressed members and decoding failures are counted separately;
-they are not silently treated as clean. The scan is a measurement tool, not
-the daemon's build finaliser or its deep-scanning policy.
+they are not silently treated as clean. A gzip or xz member with more than
+64 MiB of decompressed data is marked `unsupported`. The gzip library can
+report EOF for some truncated or malformed members; such a stream is not
+provably clean and this command does not claim to detect all corruption.
+The scan is a measurement tool, not the daemon's build finaliser or its
+deep-scanning policy.
