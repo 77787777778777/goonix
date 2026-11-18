@@ -55,13 +55,37 @@ EXTRA_DIST +=					\
 if CAN_RUN_TESTS
 if BUILD_DAEMON
 
-# The vectors of the token and placeholder formats, then the unit tests of
-# the build records against the test suite's own state directory and a
-# 'guix' that runs from the build tree.
+# The checks of the finaliser that need a store of their own.  Each one is
+# given an empty directory.
+goonix_ca_store_checks =			\
+  inverse-fragment				\
+  fragment-boundary				\
+  sibling-order					\
+  staged					\
+  leftover					\
+  final-root					\
+  siblings					\
+  existing-item					\
+  streaming					\
+  symlink-modes					\
+  path-validation
+
+# The vectors of the token and placeholder formats, the checks of the
+# finaliser, then the unit tests of the build records against the test
+# suite's own state directory and a 'guix' that runs from the build tree.
 check-local:
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --tree-vectors
 	$(AM_V_at)$(abs_top_builddir)/nix/ca-test --placeholder-vector
+	$(AM_V_at)for check in $(goonix_ca_store_checks); do		\
+	  directory=`mktemp -d` || exit 1;				\
+	  $(abs_top_builddir)/nix/ca-test --$$check "$$directory";	\
+	  status=$$?;							\
+	  chmod -R u+w "$$directory"; rm -rf "$$directory";		\
+	  if test $$status -ne 0; then					\
+	    echo "nix/ca-test --$$check failed" >&2; exit 1;		\
+	  fi;								\
+	done
 	$(AM_V_at)$(top_builddir)/test-env $(SHELL) -e -c \
 	  'helper="$$GUIX_STATE_DIRECTORY/guix-helper"; \
 	   printf "#!%s\nexec %s guix \"\$$@\"\n" "$$SHELL" \

@@ -527,6 +527,11 @@ int main(int argc, char ** argv)
         checkOutputPathValidation(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (argc != 1) {
+        /* A check that does not exist must not pass as the vectors below. */
+        std::cerr << "ca-test: unknown check `" << argv[1] << "'\n";
+        return EXIT_FAILURE;
+    }
     settings.nixStore = "/gnu/store";
 
     auto out = selfToken("out");
