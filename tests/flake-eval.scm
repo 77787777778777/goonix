@@ -9,6 +9,8 @@
   #:use-module (ice-9 textual-ports)
   #:use-module ((guix utils) #:select (call-with-temporary-directory string-replace-substring))
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-34)
+  #:use-module (srfi srfi-35)
   #:use-module (srfi srfi-64))
 
 (test-begin "flake-eval")
@@ -105,6 +107,31 @@
          (let ((third (evaluate-flake store directory 'packages 'sample)))
            (and (string=? (derivation-file-name first) (derivation-file-name second))
                 (not (string=? (derivation-file-name first) (derivation-file-name third))))))))))
+
+;; The evaluator asks the host for files by name.  A name that passes through
+;; a tracked symbolic link would make the host copy a file from outside the
+;; tree into the store.
+(test-assert "source-set does not follow a symbolic link out of the tree"
+  (call-with-temporary-directory
+   (lambda (directory)
+     (let ((project (string-append directory "/project"))
+           (outside (string-append directory "/outside")))
+       (mkdir-p project)
+       (write-file* (string-append outside "/secret") "secret")
+       (init-repo project)
+       (symlink outside (string-append project "/link"))
+       (write-file* (string-append project "/flake.scm")
+                    (string-replace-substring
+                     (call-with-input-file "tests/fixtures/flake-source-set.scm"
+                       get-string-all)
+                     "\"one.txt\"" "\"link/secret\""))
+       (commit-all project)
+       (guard (condition
+               ((message-condition? condition)
+                (string-contains (condition-message condition)
+                                 "symbolic link")))
+         (evaluate-flake store project 'packages 'sample)
+         #f)))))
 
 (test-assert "a persistent cache hit starts no evaluator"
   (call-with-temporary-directory

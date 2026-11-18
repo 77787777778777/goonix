@@ -127,6 +127,20 @@ to the evaluator.  The caller owns the returned temporary directory."
                     (not (member ".." (string-split file #\/)))
                     (not (member "." (string-split file #\/))))
          (error "invalid source-set file" file))
+       ;; Every directory on the way must be a real directory.  A tracked
+       ;; symbolic link among them would lead out of the tree, and the host
+       ;; would copy a file of the user's into the store.
+       (let loop ((directory source-root)
+                  (components (string-split file #\/)))
+         (match components
+           ((_) #t)
+           ((head . tail)
+            (let ((next (string-append directory "/" head)))
+              (unless (and (file-exists? next)
+                           (eq? 'directory (stat:type (lstat next))))
+                (error "source-set file is reached through a symbolic link"
+                       file))
+              (loop next tail)))))
        (let ((path (string-append source-root "/" file)))
          (unless (and (file-exists? path) (not (eq? 'directory (stat:type (lstat path)))))
            (error "source-set file is not tracked" file))))
