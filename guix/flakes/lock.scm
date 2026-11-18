@@ -22,11 +22,12 @@
             locked-input-type locked-input-url locked-input-path
             locked-input-branch locked-input-tag locked-input-commit
             locked-input-tree-hash locked-input-as locked-input-worktree?
+            locked-input-dependency-path locked-input-identity
             locked-input-override?
             locked-input-authentication locked-input-introduction
             locked-input-edges locked-input-options locked-input-checkout
             lock-edge? make-lock-edge lock-edge lock-edge-from lock-edge-name
-            lock-edge-kind lock-edge-target
+            lock-edge-kind lock-edge-target lock-edge-child locked-input-identity
             read-flake-lock read-flake-local write-flake-lock
             flake-lock->sexp))
 
@@ -47,6 +48,7 @@
   (tree-hash  locked-input-tree-hash)
   (as         locked-input-as (default 'flake))
   (worktree?  locked-input-worktree? (default #f))
+  (dependency-path locked-input-dependency-path (default '()))
   (override?  locked-input-override? (default #f))
   (authentication locked-input-authentication (default 'pinned-by-hash))
   (introduction locked-input-introduction (default #f))
@@ -55,12 +57,17 @@
   ;; The checkout is runtime information.  It is deliberately not serialized.
   (checkout   locked-input-checkout (default #f)))
 
+(define (locked-input-identity input)
+  (append (locked-input-dependency-path input)
+          (list (locked-input-name input))))
+
 (define-record-type* <lock-edge> lock-edge make-lock-edge
   lock-edge?
   (from       lock-edge-from)
   (name       lock-edge-name)
   (kind       lock-edge-kind)
-  (target     lock-edge-target (default #f)))
+  (target     lock-edge-target (default #f))
+  (child      lock-edge-child (default #f)))
 
 (define (invalid datum message)
   (error (format #f "invalid flake lock: ~a: ~s" message datum)))
@@ -80,10 +87,13 @@
            (name (field properties 'name #f))
            (kind (field properties 'kind #f))
            (target (field properties 'target #f)))
-       (unless (and (symbol? from) (symbol? name)
+       (unless (and (or (symbol? from)
+                        (and (list? from) (every symbol? from)))
+                    (symbol? name)
                     (memq kind '(direct followed pinned replaced same-as)))
          (invalid datum "invalid edge"))
-       (lock-edge (from from) (name name) (kind kind) (target target))))
+       (lock-edge (from from) (name name) (kind kind) (target target)
+                  (child (field properties 'child #f)))))
     (_ (invalid datum "expected edge"))))
 
 (define (sexp->locked-input datum)
@@ -93,7 +103,10 @@
             (commit (field properties 'commit #f))
             (hash (field properties 'tree-hash #f))
             (auth (field properties 'authentication 'pinned-by-hash))
-            (edges (field properties 'edges '())))
+            (edges (field properties 'edges '()))
+            (path-in-graph (field properties 'path-in-graph '())))
+       (unless (and (list? path-in-graph) (every symbol? path-in-graph))
+         (invalid datum "invalid dependency path"))
        (unless (memq type '(git local))
          (invalid datum "unknown input type"))
        (unless (and (string? commit)
@@ -115,6 +128,7 @@
         (commit commit) (tree-hash hash)
         (as (field properties 'as 'flake))
         (worktree? (field properties 'worktree #f))
+        (dependency-path (field properties 'path-in-graph '()))
         (override? (field properties 'override #f))
         (authentication auth)
         (introduction (field properties 'introduction #f))
@@ -150,6 +164,8 @@
   `(edge (from ,(lock-edge-from edge))
          (name ,(lock-edge-name edge))
          (kind ,(lock-edge-kind edge))
+         ,@(if (lock-edge-child edge)
+               `((child ,(lock-edge-child edge))) '())
          ,@(if (lock-edge-target edge)
                `((target ,(lock-edge-target edge)))
                '())))
@@ -167,6 +183,8 @@
     ,@(if (not (eq? 'flake (locked-input-as input)))
           `((as ,(locked-input-as input))) '())
     ,@(if (locked-input-worktree? input) '((worktree)) '())
+    ,@(if (null? (locked-input-dependency-path input)) '()
+          `((path-in-graph ,(locked-input-dependency-path input))))
     (authentication ,(locked-input-authentication input))
     ,@(if (locked-input-introduction input)
           `((introduction ,(locked-input-introduction input))) '())

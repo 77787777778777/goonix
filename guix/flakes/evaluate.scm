@@ -94,14 +94,15 @@
 
 (define* (evaluate-request store directory kind name #:key (options '())
                            (system (%current-system)) target (pure? #t)
-                           imported-source)
+                           imported-source overrides (path '()))
   "Evaluate a locked tree in a fresh confined Guile and return output handles."
   (let* ((directory (canonicalize-path directory))
          (flake (read-flake (string-append directory "/flake.scm")))
          (lock (if (file-exists? (string-append directory "/flake.lock"))
-                   (effective-flake-lock directory)
-                   (if (null? (flake-inputs flake))
-                       (flake-lock (version 1) (inputs '()))
+                   (effective-flake-lock directory #:overrides (or overrides '()))
+                   (if (or (null? (flake-inputs flake)) overrides)
+                       (lock-flake directory #:local-overrides (or overrides '())
+                                   #:write? #f)
                        (if pure?
                            (error "pure flake evaluation requires flake.lock; run guix flake lock first")
                            (lock-flake directory #:write? #f)))))
@@ -117,20 +118,38 @@
                                                    directory)))
                          (import-tracked-tree store directory)
                          directory)))
-         (locked-trees
-          (map (lambda (input)
-                 (let ((path (locked-input-directory input)))
-                   (unless path (error "missing locked input checkout" (locked-input-name input)))
-                   (cons (locked-input-name input)
-                         (list (if pure?
-                                   (add-to-store store "pure-eval-project" #t "sha256" path)
-                                   path)
-                               (locked-input-options input)
-                               path))))
-               (flake-lock-inputs lock)))
          (manifest (call-with-input-file (string-append source "/flake.scm")
                      (lambda (port) (read port))))
          (declared (or (and=> (assq 'inputs (cdr manifest)) cdr) '()))
+         (locked-trees
+          (map (lambda (spec)
+                 (let* ((name (car spec))
+                        (parent (or (and (null? path) #f)
+                                    (find (lambda (input)
+                                            (equal? path (locked-input-identity input)))
+                                          (flake-lock-inputs lock))))
+                        (edge (and parent
+                                   (find (lambda (edge)
+                                           (eq? name (lock-edge-name edge)))
+                                         (locked-input-edges parent))))
+                        (identity (if edge (lock-edge-child edge) (list name)))
+                        (input (or (and edge (find (lambda (item)
+                                                    (equal? identity (locked-input-identity item)))
+                                                  (flake-lock-inputs lock)))
+                                   (and (null? path)
+                                        (find (lambda (item)
+                                                (eq? name (locked-input-name item)))
+                                              (flake-lock-inputs lock)))
+                                   (error "missing locked input" name path))))
+                   (let ((checkout (locked-input-directory input)))
+                     (unless checkout (error "missing locked input checkout" name))
+                     (cons name
+                           (list (if pure?
+                                     (add-to-store store "pure-eval-project" #t "sha256" checkout)
+                                     checkout)
+                                 (locked-input-options input)
+                                 checkout identity)))))
+               declared))
          (inputs (map (lambda (spec)
                         (let ((name (car spec))
                               (kind (or (and=> (assq 'as (cdr spec)) cadr) 'flake)))
@@ -141,7 +160,7 @@
          (runtime-path? (lambda (path)
                           (or (string-prefix? "/nix/store/" path)
                               (string-prefix? "/gnu/store/" path))))
-         (load-path (append (list support module-tree)
+         (load-path (append (list support module-tree source)
                             (filter runtime-path? %load-path)
                             (map caddr (filter (lambda (x) (eq? 'library (cadr x))) inputs))
                             (if (flake-modules flake)
@@ -197,7 +216,8 @@
                          (unless child (error "unknown locked input" input))
                          (let ((outputs (evaluate-request store (cadr child) kind name
                                                          #:options (caddr child) #:system system
-                                                         #:target target #:pure? pure?)))
+                                                         #:target target #:pure? pure?
+                                                         #:path (cadddr child))))
                            (match outputs
                              ((output)
                               (write (list 'handle (cadddr output) (car (cddddr output))) host-out))
@@ -274,44 +294,47 @@
                      (_ #f)))
                  outputs)))))
 
-(define (evaluate-flake/cached store directory kind name source options system target)
-  (if (string-prefix? (string-append (%store-prefix) "/") source)
+(define (evaluate-flake/cached store directory kind name source options system target overrides)
+  (let ((overrides (or overrides '())))
+    (if (and (null? overrides)
+             (string-prefix? (string-append (%store-prefix) "/") source))
       (let* ((key (flake-cache-key directory source kind name options system target))
              (memory (hash-ref %evaluation-cache key)))
-        (or (and memory (every (lambda (output)
+        (if (and memory (every (lambda (output)
                                  (valid-path? store (cadddr output)))
-                               memory)
-                 memory)
+                               memory))
+            memory
             (let ((cached (cached-evaluation store key)))
               (if cached
                   (begin (hash-set! %evaluation-cache key cached) cached)
-       (let ((outputs (evaluate-request store directory kind name
-                                        #:options options #:system system
-                                        #:target target #:pure? #t
-                                        #:imported-source source)))
+                  (let ((outputs (evaluate-request store directory kind name
+                                                  #:options options #:system system
+                                                  #:target target #:pure? #t
+                                                  #:imported-source source)))
                     (store-evaluation! store key outputs)
                     (hash-set! %evaluation-cache key outputs)
                     outputs)))))
       (evaluate-request store directory kind name #:options options
-                        #:system system #:target target #:pure? #f)))
+                        #:system system #:target target #:pure? #f
+                        #:overrides overrides))))
 
-(define (evaluate-flake/cache store directory kind name options system target pure?)
+(define (evaluate-flake/cache store directory kind name options system target pure? overrides)
   (let* ((directory (canonicalize-path directory))
          (source (if (and pure?
                            (not (string-prefix? (string-append (%store-prefix) "/")
                                                 directory)))
                      (import-tracked-tree store directory)
                      directory)))
-    (evaluate-flake/cached store directory kind name source options system target)))
+    (evaluate-flake/cached store directory kind name source options system target overrides)))
 
 (define* (evaluate-flake store directory kind name #:key (options '())
-                         (system (%current-system)) target (pure? #t))
-  (match (evaluate-flake/cache store directory kind name options system target pure?)
+                         (system (%current-system)) target (pure? #t) overrides)
+  (match (evaluate-flake/cache store directory kind name options system target pure? overrides)
     ((output) (read-derivation-from-file (canonicalize-path (cadddr output))))
     (_ (error "flake did not return one named output" kind name))))
 
 (define* (evaluate-flake-outputs store directory #:key (options '())
-                                 (system (%current-system)) target (pure? #t))
+                                 (system (%current-system)) target (pure? #t) overrides)
   (map (lambda (message)
          (match message (('output kind name path metadata) (list kind name path))))
-       (evaluate-flake/cache store directory '* #f options system target pure?)))
+       (evaluate-flake/cache store directory '* #f options system target pure? overrides)))

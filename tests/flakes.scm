@@ -342,4 +342,58 @@
                       (not (string=? old (locked-input-commit root-shared)))
                       (not (eq? transitive root-shared)))))))))))))
 
+(test-assert "two pinned parents retain different revisions of one child"
+  (with-temporary-git-repository child
+      '((add "value.txt" "old") (commit "old"))
+    (let ((old (first-commit child)))
+      (with-git-repository child '((add "value.txt" "new") (commit "new"))
+        (let ((new (first-commit child)))
+          (call-with-temporary-directory
+           (lambda (root)
+             (define (make-parent name commit)
+               (let ((directory (string-append root "/" name)))
+                 (mkdir directory)
+                 (invoke-git directory "init" "-q")
+                 (call-with-output-file (string-append directory "/parent.txt")
+                   (lambda (port) (display "parent" port)))
+                 (invoke-git directory "add" "parent.txt")
+                 (invoke-git directory "-c" "user.name=goonix-test"
+                             "-c" "user.email=goonix-test@example.invalid"
+                             "commit" "-qm" "parent")
+                 (write-manifest
+                  directory
+                  (format #f "(flake (format 1) (inputs (c (local ~s) (commit ~s))))"
+                          child commit))
+                 (invoke-git directory "add" "flake.scm")
+                 (invoke-git directory "-c" "user.name=goonix-test"
+                             "-c" "user.email=goonix-test@example.invalid"
+                             "commit" "-qm" "flake")
+                 (lock-flake directory)
+                 (invoke-git directory "add" "flake.lock")
+                 (invoke-git directory "-c" "user.name=goonix-test"
+                             "-c" "user.email=goonix-test@example.invalid"
+                             "commit" "-qm" "lock")
+                 directory))
+             (let ((a (make-parent "a" old))
+                   (b (make-parent "b" new)))
+               (mkdir (string-append root "/project"))
+               (let ((project (string-append root "/project")))
+                 (write-manifest
+                  project
+                  (format #f "(flake (format 1) (inputs (a (local ~s) (pinned)) (b (local ~s) (pinned))))"
+                          a b))
+                 (let* ((lock-data (lock-flake project))
+                        (a/c (find (lambda (input)
+                                     (equal? '(a c) (locked-input-identity input)))
+                                   (flake-lock-inputs lock-data)))
+                        (b/c (find (lambda (input)
+                                     (equal? '(b c) (locked-input-identity input)))
+                                   (flake-lock-inputs lock-data))))
+                   (and a/c b/c
+                        (string=? old (locked-input-commit a/c))
+                        (string=? new (locked-input-commit b/c))
+                        (not (eq? a/c b/c))
+                        (equal? (flake-lock->sexp lock-data)
+                                (flake-lock->sexp (lock-flake project))))))))))))))
+
 (test-end)

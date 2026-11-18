@@ -21,6 +21,7 @@
   #:use-module (ice-9 pretty-print)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-26)
+  #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-37)
   #:export (guix-flake))
 
@@ -120,7 +121,8 @@ Lock, inspect, and evaluate a goonix flake.
                                     #:options (filter-map
                                                (match-lambda
                                                  (('option . pair) pair)
-                                                 (_ #f)) options)))))
+                                                 (_ #f)) options)
+                                    #:overrides overrides))))
          ((check)
           (with-store store
             (build-derivations

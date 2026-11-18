@@ -28,7 +28,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
   #:export (tree-snapshot? tree-snapshot-directory tree-snapshot-commit
-            tree-snapshot-hash tree-snapshot-dirty?
+            tree-snapshot-hash tree-snapshot-dirty? tree-snapshot-source
             tracked-tree verify-tree-snapshot resolve-git-input))
 
 (define-record-type* <tree-snapshot> tree-snapshot make-tree-snapshot
@@ -36,7 +36,10 @@
   (directory tree-snapshot-directory)
   (commit    tree-snapshot-commit)
   (hash      tree-snapshot-hash)
-  (dirty?    tree-snapshot-dirty? (default #f)))
+  (dirty?    tree-snapshot-dirty? (default #f))
+  ;; The repository the snapshot was taken from, for local-change notices.
+  ;; Runtime information; never serialized.
+  (source    tree-snapshot-source (default #f)))
 
 (define (git-output directory . arguments)
   "Run read-only git inspection in DIRECTORY; never execute repository hooks."
@@ -91,7 +94,7 @@ For WORKTREE? use the index plus working-tree modifications; otherwise export
 COMMIT exactly.  git archive invokes no repository-defined code."
   (mkdir-p destination)
   (if worktree?
-      (let ((files (string-split (git-output directory "ls-files" "-z") #\nul)))
+      (let ((files (string-split (git-output directory "ls-files" "-z" "--" ".") #\nul)))
         (for-each
          (lambda (file)
            (unless (string-null? file)
@@ -135,11 +138,12 @@ tracked worktree according to WORKTREE?."
          (dirty? (and worktree? (not requested-commit)
                       (not (string-null?
                             (git-output directory "status" "--porcelain" "--untracked-files=no"
-                                        "--ignore-submodules=all")))))
+                                        "--ignore-submodules=all" "--" ".")))))
          (temporary (mkdtemp "/tmp/goonix-tracked.XXXXXX")))
     (export-tracked-tree directory commit worktree? temporary)
     (tree-snapshot
      (directory temporary) (commit commit) (dirty? dirty?)
+     (source directory)
      (hash (tracked-content-hash
             temporary
             (tree-files temporary))))))
@@ -169,7 +173,9 @@ tracked worktree according to WORKTREE?."
 (define* (resolve-git-input url #:key branch tag commit worktree?
                             (repository-cache-directory
                              (%repository-cache-directory)))
-  "Resolve URL to a cached checkout.  A named COMMIT is always authoritative."
+  "Resolve URL to a cached checkout, then export the resolved commit to a
+pristine tree.  A named COMMIT is always authoritative.  The snapshot never
+points into the mutable cache: its content is exactly the locked commit."
   (let ((ref (cond (commit `(tag-or-commit . ,commit))
                    (tag `(tag . ,tag))
                    (branch `(branch . ,branch))
@@ -177,10 +183,4 @@ tracked worktree according to WORKTREE?."
     (let-values (((directory resolved relation)
                   (update-cached-checkout url #:ref ref
                                           #:cache-directory repository-cache-directory)))
-      (let* ((hash (tracked-content-hash
-                    directory
-                    (filter (lambda (file) (not (string-null? file)))
-                            (string-split (git-output directory "ls-files" "-z")
-                                          #\nul)))))
-        (tree-snapshot (directory directory) (commit resolved) (hash hash)
-                       (dirty? #f))))))
+      (tracked-tree directory #:commit resolved #:worktree? #f))))

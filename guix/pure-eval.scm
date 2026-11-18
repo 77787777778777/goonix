@@ -46,7 +46,7 @@
   (and (file-exists? (string-append directory "/.git"))
        (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
                                "status" "--porcelain" "--untracked-files=no"
-                               "--ignore-submodules=all"))
+                               "--ignore-submodules=all" "--" "."))
               (changes (get-string-all port))
               (status (close-pipe port)))
          (and (zero? status) (string-null? (string-trim-both changes))
@@ -55,6 +55,20 @@
                      (revision (get-string-all port))
                      (status (close-pipe port)))
                 (and (zero? status) (string-trim-right revision)))))))
+
+(define (tree-files directory)
+  (let walk ((root directory) (prefix ""))
+    (append-map
+     (lambda (name)
+       (if (member name '("." ".."))
+           '()
+           (let* ((relative (if (string-null? prefix) name
+                                (string-append prefix "/" name)))
+                  (file (string-append root "/" name)))
+             (if (eq? 'directory (stat:type (lstat file)))
+                 (walk file relative)
+                 (list relative)))))
+     (scandir root))))
 
 (define (tracked-tree directory)
   "Materialize the working contents of DIRECTORY's tracked files.
@@ -67,7 +81,7 @@ to the evaluator.  The caller owns the returned temporary directory."
       (const #t)
       (lambda ()
         (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
-                                 "ls-files" "-z"))
+                                 "ls-files" "-z" "--" "."))
                (names (string-split (get-string-all port) #\nul))
                (status (close-pipe port)))
           (unless (zero? status)
@@ -144,38 +158,45 @@ to the evaluator.  The caller owns the returned temporary directory."
       (lambda () (delete-file-recursively tree)))))
 
 (define* (import-guix-modules store)
-  "Return a store path with the active Guix source and compiled modules.
-Exclude everything else in an uninstalled checkout, including untracked files,
-transient test state and sibling project files."
-  (let* ((root (getcwd))
+  "Import the active Guix worktree's tracked Guix and GNU modules."
+  (let* ((module (search-path %load-path "guix/flakes/evaluator.scm"))
+         (root (if module
+                   (dirname (dirname (dirname (canonicalize-path module))))
+                   (getcwd)))
          (temporary (mkdtemp (string-append (or (getenv "TMPDIR") "/tmp")
                                             "/goonix-guix-modules.XXXXXX"))))
     (dynamic-wind
       (const #t)
       (lambda ()
-        (let ((status (system* "git" "-C" root "checkout-index" "--all"
-                               (string-append "--prefix=" temporary "/"))))
-          (unless (zero? status) (error "cannot snapshot Guix module tree" root)))
-        (copy-file (string-append root "/guix/config.scm")
-                   (string-append temporary "/guix/config.scm"))
-        (copy-file (string-append root "/guix/config.go")
-                   (string-append temporary "/guix/config.go"))
+        (let ((tree (tracked-tree root)))
+          (for-each
+           (lambda (file)
+             (when (or (member file '("guix.scm" "gnu.scm"))
+                       (string-prefix? "guix/" file)
+                       (string-prefix? "gnu/" file))
+               (let ((source (string-append root "/" file))
+                     (target (string-append temporary "/" file)))
+                 (mkdir-p (dirname target))
+                 (if (eq? 'symlink (stat:type (lstat source)))
+                     (symlink (readlink source) target)
+                     (copy-file source target))
+                 (when (string-suffix? ".scm" file)
+                   (let* ((compiled-name (string-append (dirname file) "/"
+                                                       (basename file ".scm") ".go"))
+                          (compiled (string-append root "/" compiled-name))
+                          (target-compiled (string-append temporary "/" compiled-name)))
+                     (when (file-exists? compiled)
+                       (copy-file compiled target-compiled)))))))
+           (tree-files tree))
+          (delete-file-recursively tree))
         (for-each
-         (lambda (tree)
-           (let walk ((directory (string-append root "/" tree)))
-             (for-each
-              (lambda (name)
-                (unless (member name '("." ".."))
-                  (let ((file (string-append directory "/" name)))
-                    (when (string-suffix? ".go" name)
-                      (let ((target (string-append temporary "/"
-                                                   (substring file (+ 1 (string-length root))))))
-                        (mkdir-p (dirname target))
-                        (copy-file file target)))
-                    (when (eq? 'directory (stat:type (lstat file)))
-                      (walk file)))))
-              (scandir directory))))
-         '("guix" "gnu"))
+         (lambda (file)
+           (let ((source (string-append root "/" file))
+                 (target (string-append temporary "/" file)))
+             (when (file-exists? source)
+               (mkdir-p (dirname target))
+               (copy-file source target))))
+         '("guix/config.scm" "guix/config.go"))
         (add-to-store store "pure-eval-guix-modules" #t "sha256" temporary))
       (lambda () (delete-file-recursively temporary)))))
 

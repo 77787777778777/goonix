@@ -28,10 +28,11 @@
                locked-input-type locked-input-url locked-input-path
                locked-input-branch locked-input-tag locked-input-commit
                locked-input-tree-hash locked-input-as locked-input-worktree?
+               locked-input-dependency-path locked-input-identity
                locked-input-authentication locked-input-introduction
                locked-input-edges locked-input-options locked-input-checkout
                lock-edge? make-lock-edge lock-edge lock-edge-from lock-edge-name
-               lock-edge-kind lock-edge-target
+               lock-edge-kind lock-edge-target lock-edge-child
                read-flake-lock read-flake-local write-flake-lock
                flake-lock->sexp
                lock-flake update-flake verify-flake-lock

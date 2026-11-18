@@ -16,7 +16,8 @@
                         flake-input-tag flake-input-commit flake-input-as
                         flake-input-worktree? flake-input-pinned?
                         flake-input-follows flake-input-overrides
-                        flake-input-options flake-input-introduction))
+                        flake-input-options flake-input-introduction
+                        flake-input-same-as))
   #:use-module (guix flakes lock)
   #:use-module (guix flakes checkout)
   #:use-module ((guix channels)
@@ -104,6 +105,7 @@
          (tree-hash (tree-snapshot-hash snapshot))
          (as (flake-input-as input))
          (worktree? (flake-input-worktree? input))
+         (dependency-path dependency-path)
          (authentication status) (introduction introduction)
          (checkout (tree-snapshot-directory snapshot))
          (options (flake-input-options input))
@@ -113,17 +115,8 @@
                     '())))))))
 
 (define (input-at-path lock path)
-  (if (null? path)
-      #f
-      (let ((name (car (reverse path))))
-        (find (lambda (input)
-                (and (eq? name (locked-input-name input))
-                     (any (lambda (edge)
-                            (eq? (if (null? (cdr path)) 'root
-                                     (car (reverse (cdr path))))
-                                 (lock-edge-from edge)))
-                          (locked-input-edges input))))
-              (flake-lock-inputs lock)))))
+  (find (lambda (input) (equal? path (locked-input-identity input)))
+        (flake-lock-inputs lock)))
 
 (define (nested-replacement input child)
   (or (assoc child (flake-input-overrides input))
@@ -140,10 +133,14 @@
          (resolved '())
          (table '()))
 
-    (define (previous-for name)
-      (and old (find (lambda (candidate)
-                       (eq? name (locked-input-name candidate)))
-                     (flake-lock-inputs old))))
+    (define (previous-for path name)
+      (and old (or (input-at-path old (append path (list name)))
+                   ;; A version-1 lock without path identities is usable for
+                   ;; root inputs only, where names were already unique.
+                   (and (null? path)
+                        (find (lambda (candidate)
+                                (eq? name (locked-input-name candidate)))
+                              (flake-lock-inputs old))))))
 
     (define (add-parent-edge! path name kind target)
       (unless (null? path)
@@ -152,8 +149,11 @@
                (parent (assoc (cons parent-path parent-name) table)))
           (when parent
             (let* ((old-parent (cdr parent))
-                   (edge (lock-edge (from parent-name) (name name)
-                                    (kind kind) (target target)))
+                   (edge (lock-edge (from (if (null? parent-path)
+                                          parent-name
+                                          parent-path))
+                                (name name) (kind kind) (target target)
+                                (child (append path (list name)))))
                    (new-parent (locked-input (inherit old-parent)
                                 (edges (cons edge (locked-input-edges old-parent))))))
               (set! table (acons (cons parent-path parent-name) new-parent table))
@@ -171,7 +171,7 @@
                    (effective (if override
                                   (sexp->input (cons name (cdr override))) input))
                    (kind (if override 'replaced kind))
-                   (previous (previous-for name))
+                   (previous (previous-for path name))
                    (reuse? (and previous (null? path) (not override)
                                 (not (eq? update #t)) (not (memq name update))
                                 (same-source? effective previous)

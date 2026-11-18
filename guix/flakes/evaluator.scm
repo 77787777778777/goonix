@@ -96,7 +96,7 @@
     (for-each
      (lambda (spec)
        (when (equal? '(as library) (assq 'as (cdr spec)))
-         (set! %load-path (cons (assoc-ref input-sources (car spec)) %load-path))))
+         (set! %load-path (cons (car (assoc-ref input-sources (car spec))) %load-path))))
      input-specs)
     (module-use! module (resolve-interface '(guix flakes support)))
     (when (and (pair? output-form) (eq? 'lambda (car output-form)))
