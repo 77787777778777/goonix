@@ -11,6 +11,7 @@ module Goonix.Store.Hash
   , digestLength
   , hashBytes
   , hashBytesIO
+  , hashFile
   , sha256
   , sha1
   , compressHash
@@ -25,12 +26,15 @@ import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BI
+import qualified Data.ByteString.Char8 as C
+import System.Posix.ByteString (RawFilePath)
 import Data.Word (Word8)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..), CUInt (..))
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (free, mallocBytes)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
+import System.IO (IOMode (ReadMode), withBinaryFile)
 import Foreign.Storable (peek)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -83,6 +87,14 @@ hashBytesIO algorithm input = do
   len <- checkedDigestLength algorithm
   BI.create len $ \out -> B.useAsCStringLen input $ \(ptr, size) ->
     c_hash_buffer (algorithmId algorithm) out (castPtr ptr) (fromIntegral size)
+
+hashFile :: HashAlgorithm -> RawFilePath -> IO Hash
+hashFile algorithm path = withBinaryFile (C.unpack path) ReadMode $ \handle -> do
+  sink <- newHashSink algorithm
+  let loop = do
+        bytes <- B.hGetSome handle 1048576
+        if B.null bytes then finishHashSink sink else updateHashSink sink bytes >> loop
+  loop
 
 compressHash :: Int -> ByteString -> ByteString
 compressHash size input = B.pack [foldl xor 0 [B.index input i | i <- [j, j + size .. B.length input - 1]] | j <- [0 .. size - 1]]

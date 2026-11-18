@@ -276,9 +276,11 @@ registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \outp
 
 verifyFixedOutput :: DerivationOutput -> RawFilePath -> IO ()
 verifyFixedOutput output path = do
-  algorithm <- either (throwIO . storeError) pure (algorithmFromName (outputHashAlgo output))
+  algorithm <- either (throwIO . storeError) pure (algorithmFromName (if "r:" `B.isPrefixOf` outputHashAlgo output then B.drop 2 (outputHashAlgo output) else outputHashAlgo output))
   when (algorithm /= SHA256) $ throwIO (storeError "only SHA-256 fixed-output checks are implemented")
-  hash <- hashNar path
+  hash <- if outputHashAlgo output == "r:sha256"
+    then hashNar path
+    else hashFile SHA256 path
   expected <- either (throwIO . storeError) pure (decodeBase16 (outputHash output))
   when (hashDigest hash /= expected) $
     throwIO (storeError ("output `" ++ C.unpack path ++ "' has the wrong hash"))
