@@ -15,23 +15,37 @@ module Goonix.Store.Server
   ) where
 
 import Control.Concurrent (forkFinally)
-import Control.Exception (IOException, SomeException, bracket, catch, throwIO, try)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
+import Control.Exception (IOException, SomeException, bracket, catch, fromException, throwIO, try)
 import Control.Monad (forever, unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Word (Word32)
+import qualified Data.Set as Set
+import Data.Word (Word32, Word64)
+import Goonix.Store.Database (Value (Bytes), execute)
 import Goonix.Store.Base32 (encodeBase16)
 import Goonix.Store.Config (ServerConfig (..), defaultConfig)
 import Goonix.Store.ReadOnly
 import Goonix.Store.Settings
 import Goonix.Store.Socket
 import Goonix.Store.Substitute
+import Goonix.Store.Archive (exportPath, importPathsFrom)
+import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig)
+import Goonix.Store.Hash (algorithmFromName, hashDigest)
 import Goonix.Store.Wire
+import Goonix.Store.Writing
+import Goonix.Store.Path (validateStoreName)
 import System.Posix.Env.ByteString (getEnv)
+import Goonix.Store.Files (withTempRootFile, appendTempRoot, deleteTree, mkdirParents, directoryEntries, tryExclusiveLock, catchMissing, deduplicateTree)
+import Goonix.Store.Nar (hashNar)
+import System.Posix.IO (closeFd)
+import qualified System.Posix.Files.ByteString as Files
+import System.Posix.User (getUserEntryForID, userName)
 import System.Posix.Process (getProcessID)
+import System.Posix.Types (Fd (..))
 import System.Posix.User (getRealUserID)
 import System.IO (hPutStrLn, stderr)
 
@@ -47,10 +61,26 @@ serveSocket config path = do
   serveListener config listener
 
 serveListener :: ServerConfig -> Socket -> IO ()
-serveListener config listener = forever $ do
-  client <- acceptSocket listener
-  _ <- forkFinally (handleClient config client) (const (closeSocket client))
-  pure ()
+serveListener config listener = do
+  initialiseState config
+  counter <- newMVar (0 :: Integer)
+  forever $ do
+    client <- acceptSocket listener
+    _ <- forkFinally (handleClient config counter client) (const (closeSocket client))
+    pure ()
+
+initialiseState :: ServerConfig -> IO ()
+initialiseState config = do
+  mkdirParents (configStore config)
+  case configStateDirectory config of
+    Nothing -> pure ()
+    Just state -> do
+      uid <- getRealUserID
+      user <- getUserEntryForID uid
+      mkdirParents (state <> "/gcroots/auto")
+      mkdirParents (state <> "/profiles/per-user/" <> C.pack (userName user))
+      Files.setFileMode (state <> "/profiles/per-user") 0o755
+      Files.setFileMode (state <> "/profiles/per-user/" <> C.pack (userName user)) 0o755
 
 activationSockets :: IO [Socket]
 activationSockets = do
@@ -80,23 +110,33 @@ breakLastColon path = case B.break (== 58) (B.reverse path) of
   (reversedPort, rest) | not (B.null rest) -> Just (B.reverse (B.drop 1 rest), B.reverse reversedPort)
   _ -> Nothing
 
-handleClient :: ServerConfig -> Socket -> IO ()
-handleClient config client = do
+handleClient :: ServerConfig -> MVar Integer -> Socket -> IO ()
+handleClient config counter client = do
   isTcpClient <- isTcp client
   credential <- peerUid client
   uid <- getRealUserID
   let isTrusted = not isTcpClient && maybe False (\peer -> peer == 0 || fromIntegral peer == uid) credential
       settings = (configDefaultSettings config) { trusted = isTrusted, remote = isTcpClient }
   settingsRef <- newIORef settings
+  pid <- getProcessID
+  credentialId <- pure (maybe 0 id credential)
+  connectionId <- modifyMVar counter (\n -> pure (n + 1, n + 1))
+  let rootName = "goonix-" <> C.pack (show pid) <> "-" <> C.pack (show credentialId) <> "-" <> C.pack (show connectionId)
   catch
-    (bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->
-      catch (handleConnection config store { storeStateDirectory = configStateDirectory config } client settingsRef) report)
+    (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) $ \rootFd ->
+      bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->
+        catch (handleConnection config store { storeStateDirectory = configStateDirectory config } client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
   where
     report exception = hPutStrLn stderr ("guix-daemon: " ++ show (exception :: SomeException))
 
-handleConnection :: ServerConfig -> Store -> Socket -> IORef Settings -> IO ()
-handleConnection config store client settingsRef = do
+temporaryRootsPath :: ServerConfig -> ByteString
+temporaryRootsPath config = case configStateDirectory config of
+  Just state -> state <> "/temproots/goonix"
+  Nothing -> "/tmp/goonix-temproots"
+
+handleConnection :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
+handleConnection config store client settingsRef rootFd rootPath = do
   magic <- readIntSocket client
   unless (magic == workerMagic1) (throwIO (userError "protocol mismatch"))
   writeSocket client (encodeInt workerMagic2 <> encodeInt protocolVersion)
@@ -116,15 +156,17 @@ handleConnection config store client settingsRef = do
       case next of
         Left (_ :: IOError) -> pure ()
         Right operation -> do
-          result <- try (dispatch config store client settingsRef clientVersion operation)
+          result <- try (dispatch config store client settingsRef rootFd rootPath clientVersion operation)
           case result of
-            Left (StoreError message status) -> do
-              writeSocket client (encodeInt stderrError <> encodeString message <> if clientVersion .&. 0xff >= 8 then encodeInt status else B.empty)
+            Left exception -> do
+              case fromException exception of
+                Just (StoreError message status) -> writeSocket client (encodeInt stderrError <> encodeString message <> if clientVersion .&. 0xff >= 8 then encodeInt status else B.empty)
+                Nothing -> writeSocket client (encodeInt stderrError <> encodeString (C.pack (show (exception :: SomeException))) <> encodeInt 1)
               loop clientVersion
             Right () -> loop clientVersion
 
-dispatch :: ServerConfig -> Store -> Socket -> IORef Settings -> Word32 -> Word32 -> IO ()
-dispatch config store client settingsRef clientVersion operation = case operation of
+dispatch :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> Word32 -> Word32 -> IO ()
+dispatch config store client settingsRef rootFd rootPath clientVersion operation = case operation of
   19 -> do
     settings <- readIORef settingsRef
     fields <- readSetOptions client clientVersion
@@ -132,6 +174,88 @@ dispatch config store client settingsRef clientVersion operation = case operatio
       Left message -> throwIO (StoreError (C.pack message) 1)
       Right updated -> writeIORef settingsRef updated
     writeFrame client stderrLast
+  7 -> do
+    name <- readStringSocket client
+    fixed <- readIntSocket client
+    recursiveField <- readIntSocket client
+    algorithmField <- readStringSocket client
+    let recursive = recursiveField == 1
+        algorithmName' = if fixed /= 1 then "sha256" else algorithmField
+    algorithm <- either (throwIO . storeError) pure (algorithmFromName algorithmName')
+    either (throwIO . storeError) pure (validateStoreName name)
+    dump <- readNarSocket client
+    path <- addNarToStore rootFd store name recursive algorithm dump
+    writeFrame client stderrLast
+    writeSocket client (encodeString path)
+  9 -> do
+    things <- readStringsSocket client
+    mode <- if clientVersion .&. 0xff >= 15 then readIntSocket client else pure 0
+    settings <- readIORef settingsRef
+    when (mode == 1 && not (trusted settings)) (throwIO (storeError "repairing is a privileged operation"))
+    buildThingsWithConfig config rootFd store settings (buildTrace settings client) things (if mode == 1 then Repair else if mode == 2 then Check else Normal)
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  10 -> do
+    path <- readStringSocket client
+    _ <- assertStorePath store path
+    settings <- readIORef settingsRef
+    buildThings rootFd store settings [path] Normal
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  8 -> do
+    name <- readStringSocket client
+    contents <- readStringSocket client
+    references <- readStorePathsSocket client
+    path <- addTextToStore rootFd store name contents references
+    writeFrame client stderrLast
+    writeSocket client (encodeString path)
+  11 -> do
+    path <- readStringSocket client
+    _ <- assertStorePath store path
+    appendTempRoot rootFd path
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  12 -> do
+    path <- readStringSocket client
+    addIndirectRoot store path
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  13 -> do
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  16 -> do
+    path <- readStringSocket client
+    sign <- readIntSocket client
+    archive <- exportPath store path (sign == 1)
+    writeSocket client (encodeInt stderrWrite <> encodeString archive)
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  27 -> do
+    (paths, _) <- importPathsFrom store (readArchiveChunk client)
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings paths)
+  20 -> do
+    action <- readIntSocket client
+    paths <- readStorePathsSocket client
+    ignoreLiveness <- readIntSocket client
+    minFreed <- readWord64Socket client
+    _obsolete1 <- readIntSocket client
+    when (clientVersion .&. 0xffff >= 5) $ do
+      _obsolete2 <- readIntSocket client
+      _obsolete3 <- readIntSocket client
+      pure ()
+    when (ignoreLiveness == 1) (throwIO (storeError "you are not allowed to ignore liveness"))
+    (deleted, freed) <- if action == 3
+      then deleteSpecificPaths store paths minFreed
+      else do
+        live <- livePaths rootPath rootFd store
+        allPaths <- queryAllValidPaths store
+        case action of
+          0 -> pure (live, 0)
+          1 -> pure (filter (`notElem` live) allPaths, 0)
+          _ -> throwIO (storeError "unsupported garbage-collection action")
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
   1 -> queryOnePath $ \_ path -> do
     _ <- assertStorePath store path
     encodeBool <$> isValidPath store path
@@ -163,17 +287,12 @@ dispatch config store client settingsRef clientVersion operation = case operatio
     writeFrame client stderrLast
     writeSocket client (encodeBool (path `elem` result))
   30 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    paths <- readStorePathsSocket client
     settings <- readIORef settingsRef
-    info <- if settingBool "build-use-substitutes" False settings
-      then substitutableInfo config settings path else pure Nothing
+    infos <- if settingBool "build-use-substitutes" False settings
+      then substitutableInfos config settings paths else pure []
     writeFrame client stderrLast
-    writeSocket client $ case info of
-      Nothing -> encodeInt 0
-      Just (deriver, references, downloadSize, narSize) -> encodeInt 1 <> encodeString deriver
-        <> encodeStrings references <> encodeWord64 downloadSize
-        <> if clientVersion .&. 0xff >= 7 then encodeWord64 narSize else B.empty
+    writeSocket client (encodeInt (fromIntegral (length infos)) <> foldMap encodeInfo infos)
   31 -> do
     paths <- readStorePathsSocket client
     result <- queryValidPaths store paths
@@ -182,11 +301,25 @@ dispatch config store client settingsRef clientVersion operation = case operatio
   32 -> do
     paths <- readStorePathsSocket client
     settings <- readIORef settingsRef
-    infos <- if settingBool "build-use-substitutes" False settings
-      then substitutableInfos config settings paths else pure []
+    result <- if settingBool "build-use-substitutes" False settings
+      then substitutablePaths config settings paths else pure []
     writeFrame client stderrLast
-    writeSocket client (encodeInt (fromIntegral (length infos)) <> foldMap encodeInfo infos)
+    writeSocket client (encodeStrings result)
   33 -> queryOnePath $ \_ path -> encodeStrings <$> queryValidDerivers store path
+  34 -> do
+    paths <- queryAllValidPaths store
+    mapM_ (deduplicateTree (storeDirectory store)) paths
+    writeFrame client stderrLast
+    writeSocket client (encodeInt 1)
+  35 -> do
+    checkContents <- (/= 0) <$> readIntSocket client
+    repair <- (/= 0) <$> readIntSocket client
+    settings <- readIORef settingsRef
+    when (repair && not (trusted settings)) (throwIO (storeError "you are not privileged to repair paths"))
+    paths <- queryAllValidPaths store
+    errors <- verifyStorePaths store checkContents paths
+    writeFrame client stderrLast
+    writeSocket client (encodeBool errors)
   80 -> do
     writeFrame client stderrLast
     writeSocket client (encodeStrings ["download", "git-download"])
@@ -208,6 +341,32 @@ dispatch config store client settingsRef clientVersion operation = case operatio
       reply <- action store path
       writeFrame client stderrLast
       writeSocket client reply
+
+verifyStorePaths :: Store -> Bool -> [ByteString] -> IO Bool
+verifyStorePaths store checkContents paths = or <$> mapM verify paths
+  where
+    verify path = do
+      exists <- Files.fileExist path
+      if not exists then pure True else do
+        references <- queryReferences store path
+        missingReferences <- or <$> mapM (fmap not . isValidPath store) references
+        changed <- if checkContents
+          then do
+            expected <- queryPathHash store path
+            actual <- hashDigest <$> hashNar path
+            pure (expected /= actual)
+          else pure False
+        pure (missingReferences || changed)
+
+buildTrace :: Settings -> Socket -> BuildTrace
+buildTrace settings client = BuildTrace
+  { traceStarted = \drv platform log pid -> emit ("@ build-started " <> drv <> " - " <> platform <> " " <> log <> " " <> C.pack (show pid))
+  , traceSucceeded = \drv -> emit ("@ build-succeeded " <> drv <> " -")
+  , traceFailed = \drv reason -> emit ("@ build-failed " <> drv <> " - " <> C.pack reason)
+  , traceOutput = \bytes -> writeSocket client (encodeInt stderrNext <> encodeString bytes)
+  }
+  where
+    emit message = when (printBuildTrace settings) $ writeSocket client (encodeInt stderrNext <> encodeString message)
 
 readSetOptions :: Socket -> Word32 -> IO [ByteString]
 readSetOptions client clientVersion = do
@@ -236,6 +395,13 @@ readIntSocket client = do
     Left message -> throwIO (StoreError message 1)
     Right value -> pure value
 
+readWord64Socket :: Socket -> IO Word64
+readWord64Socket client = do
+  bytes <- readExactly client 8
+  case decodeWord64 bytes of
+    Left message -> throwIO (StoreError message 1)
+    Right value -> pure value
+
 readStringSocket :: Socket -> IO ByteString
 readStringSocket client = do
   size <- fromIntegral <$> readIntSocket client
@@ -244,8 +410,140 @@ readStringSocket client = do
   contents <- readExactly client padded
   pure (B.take size contents)
 
+readNarSocket :: Socket -> IO ByteString
+readNarSocket client = do
+  version <- readWireStringRaw
+  when (B.length version < 16 || B.take 8 version /= encodeInt 13 || B.take 13 (B.drop 8 version) /= "nix-archive-1")
+    (throwIO (storeError "invalid NAR header"))
+  node <- readNarNode
+  pure (version <> node)
+  where
+    readNarNode = do
+      open <- readWireStringRaw
+      typeTag <- readWireStringRaw
+      kind <- readWireStringRaw
+      when (B.take 8 open /= encodeInt 1 || B.take 8 typeTag /= encodeInt 4 || B.take 8 kind /= encodeInt (fromIntegral (B.length (wireValue kind)) :: Word32))
+        (throwIO (storeError "invalid NAR node"))
+      case wireValue kind of
+        "regular" -> do
+          first <- readWireStringRaw
+          (executable, tag) <- if wireValue first == "executable"
+            then do
+              empty <- readWireStringRaw
+              when (not (B.null (wireValue empty))) (throwIO (storeError "non-empty executable marker"))
+              next <- readWireStringRaw
+              pure (first <> empty, next)
+            else pure (B.empty, first)
+          when (wireValue tag /= "contents") (throwIO (storeError "invalid NAR contents"))
+          lenBytes <- readExactly client 8
+          let len = either (const 0) fromIntegral (decodeWord64 lenBytes) :: Int
+          contents <- readExactly client (len + paddingLength len)
+          close <- readWireStringRaw
+          when (wireValue close /= ")") (throwIO (storeError "missing regular close"))
+          pure (open <> typeTag <> kind <> executable <> tag <> lenBytes <> contents <> close)
+        "symlink" -> do
+          tag <- readWireStringRaw
+          target <- readWireStringRaw
+          close <- readWireStringRaw
+          when (wireValue tag /= "target" || wireValue close /= ")") (throwIO (storeError "invalid symlink"))
+          pure (open <> typeTag <> kind <> tag <> target <> close)
+        "directory" -> do
+          entries <- readDirectoryEntries
+          pure (open <> typeTag <> kind <> entries)
+        _ -> throwIO (storeError "unknown NAR node type")
+    readDirectoryEntries = do
+      tag <- readWireStringRaw
+      if wireValue tag == ")" then pure tag else do
+        open <- readWireStringRaw
+        nameTag <- readWireStringRaw
+        name <- readWireStringRaw
+        nodeTag <- readWireStringRaw
+        when (wireValue tag /= "entry" || wireValue open /= "(" || wireValue nameTag /= "name" || wireValue nodeTag /= "node")
+          (throwIO (storeError "invalid directory entry"))
+        child <- readNarNode
+        close <- readWireStringRaw
+        rest <- readDirectoryEntries
+        pure (tag <> open <> nameTag <> name <> nodeTag <> child <> close <> rest)
+    readWireStringRaw = do
+      lenBytes <- readExactly client 8
+      let len = either (const 0) fromIntegral (decodeInt lenBytes) :: Int
+      bytes <- readExactly client (len + paddingLength len)
+      pure (lenBytes <> bytes)
+    wireValue bytes = B.take (either (const 0) fromIntegral (decodeInt (B.take 8 bytes))) (B.drop 8 bytes)
+
+readArchiveChunk :: Socket -> IO ByteString
+readArchiveChunk client = do
+  writeSocket client (encodeInt stderrRead <> encodeInt 32768)
+  lenBytes <- readExactly client 8
+  len <- case decodeInt lenBytes of
+    Left message -> throwIO (StoreError message 1)
+    Right value -> pure (fromIntegral value)
+  bytes <- readExactly client (len + paddingLength len)
+  pure (B.take len bytes)
+
+otherTemporaryRoots :: ByteString -> Store -> IO [ByteString]
+otherTemporaryRoots currentPath store = case storeStateDirectory store of
+  Nothing -> pure []
+  Just state -> do
+    entries <- directoryEntries (state <> "/temproots/goonix")
+    paths <- mapM readOne entries
+    pure (concat paths)
+  where
+    readOne file = do
+      let path = maybe "" (<> "/temproots/goonix/" <> file) (storeStateDirectory store)
+      if path == currentPath then pure [] else do
+        stale <- tryExclusiveLock path
+        case stale of
+          Just fd -> do
+            closeFd fd
+            Files.removeLink path `catchMissing` pure ()
+            pure []
+          Nothing -> do
+            result <- try (B.readFile (C.unpack path))
+            case result of
+              Left (_ :: IOException) -> pure []
+              Right bytes -> pure (filter (not . B.null) (B.split 0 bytes))
+
+livePaths :: ByteString -> Fd -> Store -> IO [ByteString]
+livePaths currentPath _rootFd store = do
+  roots <- findRoots store
+  temporary <- otherTemporaryRoots currentPath store
+  let rootPaths = map snd roots ++ temporary
+  closure <- go Set.empty rootPaths
+  pure (Set.toList closure)
+  where
+    go seen [] = pure seen
+    go seen (path:rest)
+      | Set.member path seen = go seen rest
+      | otherwise = do
+          valid <- isValidPath store path
+          if not valid then go seen rest else do
+            references <- queryReferences store path
+            go (Set.insert path seen) (references ++ rest)
+
+deleteSpecificPaths :: Store -> [ByteString] -> Word64 -> IO ([ByteString], Word64)
+deleteSpecificPaths store paths minFreed = do
+  mapM_ (assertStorePath store) paths
+  let go acc freed remaining
+        | freed >= minFreed = pure (reverse acc, freed)
+        | otherwise = case remaining of
+            [] -> pure (reverse acc, freed)
+            path:rest -> do
+              valid <- isValidPath store path
+              if not valid then go acc freed rest else do
+                status <- Files.getSymbolicLinkStatus path
+                let size = fromIntegral (Files.fileSize status)
+                deleteTree path
+                execute (database store) "DELETE FROM Refs WHERE referrer IN (SELECT id FROM ValidPaths WHERE path = ?)" [Bytes path]
+                execute (database store) "DELETE FROM ValidPaths WHERE path = ?" [Bytes path]
+                go (path:acc) (freed + size) rest
+  go [] 0 paths
+
 readStorePathsSocket :: Socket -> IO [ByteString]
-readStorePathsSocket client = do
+readStorePathsSocket = readStringsSocket
+
+readStringsSocket :: Socket -> IO [ByteString]
+readStringsSocket client = do
   count :: Int <- fromIntegral <$> readIntSocket client
   paths <- mapM (const (readStringSocket client)) [1 .. count]
   pure (foldr (\path rest -> if path `elem` rest then rest else path:rest) [] paths)
