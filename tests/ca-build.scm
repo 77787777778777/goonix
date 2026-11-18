@@ -4,11 +4,16 @@
              (guix ca)
              (gnu packages bootstrap)
              (guix derivations)
+             (guix build utils)
              (ice-9 match)
+             (ice-9 ftw)
+             (ice-9 threads)
              (srfi srfi-1)
              (srfi srfi-34)
              (srfi srfi-64)
-             (ice-9 textual-ports))
+             (ice-9 textual-ports)
+             (rnrs bytevectors)
+             ((gcrypt hash) #:select (sha256)))
 
 (test-begin "ca-build")
 (define store (open-connection-for-tests))
@@ -70,6 +75,34 @@
 
 (define (read-all file) (call-with-input-file file get-string-all))
 (define (realised drv) (realised-output-path store drv "out"))
+
+(define (matching-store-files suffix)
+  (map (lambda (name) (string-append (%store-prefix) "/" name))
+       (scandir (%store-prefix)
+                (lambda (name) (string-suffix? suffix name)))))
+
+(define (resolved-derivation-with-output name output)
+  (find (lambda (file)
+          (let ((text (read-all file)))
+            (and (string-contains text "goonixResolved")
+                 (string-contains text output))))
+        (matching-store-files (string-append "-" name ".drv"))))
+
+(define (failed-partial-derivation)
+  (let ((drv (shell-drv "ca-partial"
+                        "(call-with-output-file out (lambda (p) (display out p)))"
+                        #:outputs '("out" "missing"))))
+    (guard (condition ((store-protocol-error? condition)
+                       (resolved-derivation-with-output "ca-partial" "missing")))
+      (build-derivations store (list drv))
+      #f)))
+
+(define (successful-partial-retry)
+  (let ((drv (shell-drv "ca-partial"
+                        "(call-with-output-file out (lambda (p) (display out p)))\n(call-with-output-file (getenv \"missing\") (lambda (p) (display \"ok\" p)))"
+                        #:outputs '("out" "missing"))))
+    (build-derivations store (list drv))
+    (realised drv)))
 
 (test-assert "input-addressed derivation bytes remain unchanged"
   (let ((drv (shell-drv "legacy-identity" (write-output "legacy")
@@ -192,41 +225,125 @@
       (and (string=? lib (read-all (string-append out "/reference")))
            (member lib (references store out))))))
 
-(test-assert "a failed sibling leaves no record or final tree, and can be retried"
-  (let* ((bad (shell-drv "ca-partial"
-                         "(call-with-output-file out (lambda (p) (display out p)))"
-                         #:outputs '("out" "missing")))
-         (store-directory (dirname (derivation-file-name bad)))
-         (resolved
-          (find (lambda (file)
-                  (string-contains (read-all file) "goonixResolved"))
-                (map (lambda (name) (string-append store-directory "/" name))
-                     (scandir store-directory
-                              (lambda (name)
-                                (and (string-suffix? "-ca-partial.drv" name)
-                                     (not (string-suffix? ".lock" name))))))))
-         (hash (sha256 (string->utf8 (read-all resolved))))
-         (output-files
-          (map (lambda (name) (string-append store-directory "/" name))
-               (scandir store-directory
-                        (lambda (name)
-                          (and (string-suffix? "-ca-partial" name)
-                               (not (string-suffix? ".drv" name))
-                               (not (string-suffix? ".lock" name))))))))
+(define (partial-failure-is-clean?)
+  (let* ((resolved (failed-partial-derivation))
+         (hash (sha256 (string->utf8 (read-all resolved)))))
     (and resolved
-         (guard (condition ((store-protocol-error? condition) #t))
-           (build-derivations store (list bad))
-           #f)
          (null? (query-build-records store hash "out"))
-         (every (negate file-exists?) output-files)
-         (let ((good (shell-drv "ca-partial"
-                                "(call-with-output-file out (lambda (p) (display out p)))"
-                                #:outputs '("out" "lib")
-                                #:env-vars '(("retry" . "1")))))
-           (build-derivations store (list good))
-           (let ((out (realised good)))
-             (and (valid-path? store out)
-                  (string=? out (read-all out))))))))
+         (every (negate file-exists?) (matching-store-files "-ca-partial")))))
+
+(define (partial-retry-is-valid?)
+  (let* ((out (successful-partial-retry))
+         (contents (read-all out)))
+    (and (valid-path? store out) (string=? out contents))))
+
+(test-assert "a failed sibling leaves no record or final tree, and can be retried"
+  (and (partial-failure-is-clean?)
+       (partial-retry-is-valid?)))
+
+(test-assert "a missing CA output is an ordinary build failure"
+  (let ((drv (derivation store "ca-missing" bash '("-c" "exit 0")
+                         #:sources (list bash) #:addressing 'content)))
+    (and (guard (condition ((store-protocol-error? condition)
+                           (string-contains
+                            (store-protocol-error-message condition)
+                            "failed to produce output")))
+      (build-derivations store (list drv))
+      #f)
+         (string? (derivation-file-name drv)))))
+
+(test-assert "a CA output obeys its self-reference policy"
+  (let ((drv (derivation store "ca-disallowed-self" bash
+                         '("-c" "printf %s \"$out\" > \"$out\"")
+                         #:sources (list bash) #:addressing 'content
+                         #:disallowed-references '("out"))))
+    (guard (condition ((store-protocol-error? condition)
+                       (string-contains
+                        (store-protocol-error-message condition)
+                        "not allowed to refer")))
+      (build-derivations store (list drv))
+      #f)))
+
+(test-assert "a CA output obeys disallowed input references"
+  (let ((drv (derivation store "ca-disallowed-input" bash
+                         '("-c" "printf %s \"$input\" > \"$out\"")
+                         #:sources (list bash) #:addressing 'content
+                         #:env-vars (list (cons "input" bash))
+                         #:disallowed-references (list bash))))
+    (guard (condition ((store-protocol-error? condition)
+                       (string-contains
+                        (store-protocol-error-message condition)
+                        "not allowed to refer")))
+      (build-derivations store (list drv))
+      #f)))
+
+(test-assert "a malformed CA derivation is refused without dropping the connection"
+  (let ((text (string-append
+               "Derive([(\"out\",\"/not-a-store/output\",\"\",\"\")],[],[],"
+               "\"x86_64-linux\",\"/bin/sh\",[],[(\"goonixAddressing\",\"content\"),"
+               "(\"out\",\"/not-a-store/output\")])")))
+    (and (guard (condition ((store-protocol-error? condition) #t))
+           (add-text-to-store store "malformed.drv" text)
+           #f)
+         (valid-path? store bash)
+         (let ((ordinary (derivation store "ca-after-malformed" bash
+                                     '("-c" "printf ok > \"$out\"")
+                                     #:sources (list bash) #:addressing 'content)))
+           (build-derivations store (list ordinary))
+           (string=? "ok" (read-all (realised ordinary)))))))
+
+(test-assert "two goals for one resolved derivation build only once"
+  (call-with-temporary-output-file
+   (lambda (counter port)
+     (display "0\n" port)
+     (force-output port)
+     (let* ((builder (add-text-to-store
+                      store "ca-concurrent-builder.sh"
+                      "n=$(cat \"$COUNTER\"); echo $((n + 1)) > \"$COUNTER\"; printf %s \"$out\" > \"$out\""))
+            (drv (derivation store "ca-concurrent" bash
+                             (list builder)
+                             #:sources (list bash builder)
+                             #:addressing 'content
+                             #:env-vars (list (cons "COUNTER" counter)))))
+       ;; Both requests carry the same unresolved derivation, so both goals
+       ;; resolve to the same R and must share the single recorded result.
+       (let* ((one (open-connection-for-tests))
+              (two (open-connection-for-tests))
+              (request (lambda (connection)
+                         (lambda ()
+                           (dynamic-wind
+                             (const #t)
+                             (lambda ()
+                               (build-derivations connection (list drv))
+                               (realised-output-path connection drv "out"))
+                             (lambda () (close-connection connection))))))
+              (first (begin-thread (request one)))
+              (second (begin-thread (request two))))
+         (and (string=? "1" (string-trim-right (read-all counter)))
+              (string=? (join-thread first)
+                        (join-thread second))))))))
+
+(test-assert "a fixed output in a CA derivation obeys its declared hash"
+  (let ((drv (derivation store "ca-fixed-hash" bash
+                         '("-c" "printf fixed > \"$out\"")
+                         #:sources (list bash) #:addressing 'content
+                         #:hash (sha256 (string->utf8 "wrong"))
+                         #:hash-algo 'sha256)))
+    (guard (condition ((store-protocol-error? condition)
+                       (string-contains
+                        (store-protocol-error-message condition)
+                        "hash mismatch")))
+      (build-derivations store (list drv))
+      #f)))
+
+(test-assert "a fixed output in a CA derivation accepts its declared hash"
+  (let ((drv (derivation store "ca-fixed-valid" bash
+                         '("-c" "printf fixed > \"$out\"")
+                         #:sources (list bash) #:addressing 'content
+                         #:hash (sha256 (string->utf8 "fixed"))
+                         #:hash-algo 'sha256)))
+    (and (build-derivations store (list drv))
+         (string=? "fixed" (read-all (derivation->output-path drv))))))
 
 (test-assert "resolved-addressed paths hash the final resolved derivation"
   (let* ((one (shell-drv "ca-resolved-cutoff" (write-output "same")
