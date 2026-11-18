@@ -50,6 +50,8 @@
   #:use-module ((guix progress) #:select (current-terminal-columns))
   #:autoload   (guix build syscalls) (terminal-columns)
   #:use-module (guix transformations)
+  #:autoload   (guix pure-eval) (load-file-purely)
+  #:autoload   (guix flakes evaluate) (evaluate-flake)
   #:export (log-url
 
             %standard-build-options
@@ -443,6 +445,8 @@ Build the given PACKAGE-OR-DERIVATION and return their output paths.\n"))
   -m, --manifest=FILE    build the packages that the manifest given in FILE
                          evaluates to"))
   (display (G_ "
+      --pure-eval        evaluate FILE from its tracked tree in a container")) ;goonix: CLI hook
+  (display (G_ "
   -D, --development      build the inputs of the following package"))
   (display (G_ "
   -P, --dependents[=N]   build dependents of the following package, up to
@@ -532,6 +536,9 @@ must be one of 'package', 'all', or 'transitive'~%")
          (option '(#\m "manifest") #t #f
                  (lambda (opt name arg result)
                    (alist-cons 'manifest arg result)))
+         (option '("pure-eval") #f #f
+                 (lambda (opt name arg result)
+                   (alist-cons 'pure-eval? #t result)))
          (option '(#\D "development") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'development? #t result)))
@@ -596,6 +603,28 @@ must be one of 'package', 'all', or 'transitive'~%")
       (mlet %store-monad ((edges (node-back-edges %bag-node-type (all-packages))))
         (return (get-dependents packages edges))))))
 
+(define (flake-reference? spec)
+  (let ((hash (string-index spec #\#)))
+    (and hash (> hash 0) (< hash (- (string-length spec) 1))
+         (let ((path (string-take spec hash)))
+           (or (string=? path ".") (string=? path "..")
+               (string-prefix? "/" path)
+               (string-prefix? "./" path)
+               (string-prefix? "../" path))))))
+
+(define (flake-reference->derivation store spec opts)
+  (let* ((hash (string-index spec #\#))
+         (path (string-take spec hash))
+         (name (string->symbol (string-drop spec (+ hash 1))))
+         (directory (canonicalize-path path))
+         (options (filter-map (match-lambda
+                               (('option . pair) pair)
+                               (_ #f)) opts)))
+    (evaluate-flake store directory 'packages name
+                    #:options options
+                    #:system (or (assoc-ref opts 'system) (%current-system))
+                    #:target (assoc-ref opts 'target))))
+
 (define (options->things-to-build store opts)
   "Read the arguments from OPTS and return a list of high-level objects to
 build---packages, gexps, derivations, and so on."
@@ -636,6 +665,8 @@ values.")))))))))
       (raise (formatted-message (G_ "file '~a' does not return a manifest")
                                 file)))
     x)
+
+  (define pure-eval? (assoc-ref opts 'pure-eval?))
 
   (define system
     (or (assoc-ref opts 'system) (%current-system)))
@@ -691,9 +722,13 @@ values.")))))))))
                  ;; Nothing to do; maybe for --log-file.
                  (loop tail type result))
                 (else
-                 (loop tail 'regular
-                       (append (for-type (specification->package spec))
-                               result)))))
+                 (if (flake-reference? spec)
+                     (loop tail 'regular
+                           (cons (flake-reference->derivation store spec opts)
+                                 result))
+                     (loop tail 'regular
+                           (append (for-type (specification->package spec))
+                                   result))))))
          (('argument . (? derivation? drv))
           (loop tail 'regular (cons drv result)))
          (('file . file)
@@ -703,7 +738,11 @@ values.")))))))))
             (loop tail 'regular
                   (append (append-map
                            for-type
-                           (ensure-list (load* file '())))
+                           (ensure-list
+                            (if pure-eval?
+                                (map read-derivation-from-file
+                                     (load-file-purely store file))
+                                (load* file '()))))
                           result))))
          (('manifest . manifest)
           ;; Otherwise '--system' is ignored.

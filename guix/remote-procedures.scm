@@ -46,7 +46,7 @@
 
 (define %protocol-version
   ;; Version of the currently-implemented protocol.
-  #x164)
+  #x165)                                        ;goonix: realised CA outputs
 
 ;; Values sent by the client and then the server upon handshake.
 (define %worker-magic-1 #x6e697863)               ; "nixc"
@@ -301,6 +301,19 @@ Return #t on success."
   (define (substitute-urls)
     "Return the list of substitute URLs."
     id: 81
+    returns: string-list)
+
+  ;; goonix: query the daemon's choice, not a mapping supplied by the client.
+  (define (query-realised-output (store-path derivation)
+                                 (utf8-string output))
+    "Return the realised store path of DERIVATION's OUTPUT."
+    id: 82
+    returns: store-path)
+
+  (define (query-build-records (base16 resolved-hash)
+                               (utf8-string output))
+    "Return signed records of a resolved derivation output."
+    id: 83
     returns: string-list))
 
 (define-syntax remote-procedure-id

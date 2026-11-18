@@ -9,6 +9,7 @@
 #include "archive.hh"
 #include "builtins.hh"
 #include "spawn.hh"
+#include "ca.hh" // goonix: resolution and content finalisation
 
 #include <map>
 #include <algorithm>
@@ -135,7 +136,10 @@ typedef map<Path, WeakGoalPtr> WeakGoalMap;
 
 class Goal : public std::enable_shared_from_this<Goal>
 {
+    friend class Worker;
 public:
+    size_t waiteeCount() const { return waitees.size(); }
+    const string & goalName() const { return name; }
     typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters, ecIncompleteClosure} ExitCode;
 
 protected:
@@ -674,6 +678,12 @@ private:
     /* RAII object to delete the chroot directory. */
     std::shared_ptr<AutoDelete> autoDelChroot;
 
+    /* goonix: original derivation and its realised, buildable form. */
+    Path originalDrvPath;
+    Derivation originalDrv;
+    bool goonixCA = false;
+    Path resolvedDrvPath;
+
     /* Whether this is a fixed-output derivation. */
     bool fixedOutput;
 
@@ -721,7 +731,8 @@ public:
            i.e. a derivation named "aardvark" always comes before
            "baboon". And substitution goals always happen before
            derivation goals (due to "b$"). */
-        return "b$" + storePathToName(drvPath) + "$" + drvPath;
+        return "b$" + storePathToName(originalDrvPath.empty() ? drvPath : originalDrvPath)
+            + "$" + (originalDrvPath.empty() ? drvPath : originalDrvPath);
     }
 
     void work() override;
@@ -801,6 +812,7 @@ DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOut
     , bzLogFile(0)
 #endif
     , useChroot(false)
+    , fixedOutput(false)
     , buildMode(buildMode)
 {
     this->drvPath = drvPath;
@@ -930,6 +942,60 @@ void DerivationGoal::haveDerivation()
 
     /* Get the derivation. */
     drv = derivationFromPath(worker.store, drvPath);
+    goonixCA = goonixAddressed(drv);
+    if (goonixCA) {
+        if (originalDrvPath.empty()) {
+            originalDrvPath = drvPath;
+            originalDrv = drv;
+        }
+        for (auto & choice : worker.store.choices(originalDrvPath))
+            worker.store.addTempRoot(choice.second);
+        if (resolvedDerivation(drv)) {
+            for (auto & output : drv.outputs) {
+                auto chosen = worker.store.choices(originalDrvPath);
+                auto it = chosen.find({originalDrvPath, output.first});
+                if (it != chosen.end() && worker.store.isValidPath(it->second))
+                    output.second.path = it->second;
+                worker.store.addTempRoot(output.second.path);
+            }
+            if (buildMode == bmNormal) {
+                auto records = dynamic_cast<LocalStore &>(worker.store)
+                    .queryGoonixBuildRecords(
+                        printHash(hashString(htSHA256, unparseDerivation(drv))), "");
+                bool allRealised = true;
+                for (auto & output : drv.outputs) {
+                    bool found = false;
+                    for (auto & record : records)
+                        if (record.output == output.first &&
+                            worker.store.isValidPath(record.path)) {
+                            output.second.path = record.path;
+                            found = true;
+                            break;
+                        }
+                    allRealised = allRealised && found;
+                }
+                if (allRealised) {
+                    done(BuildResult::AlreadyValid);
+                    return;
+                }
+            }
+            for (auto & source : drv.inputSrcs)
+                computeFSClosure(worker.store, source, inputPaths);
+            if (isInStore(drv.builder))
+                computeFSClosure(worker.store, toStorePath(drv.builder), inputPaths);
+            allPaths.insert(inputPaths.begin(), inputPaths.end());
+            for (auto & output : drv.outputs) allPaths.insert(output.second.path);
+            missingPaths = outputPaths(drv);
+            nrRounds = settings.get("build-repeat", 0) + 1;
+            state = &DerivationGoal::tryToBuild;
+            worker.wakeUp(shared_from_this());
+            return;
+        }
+        /* Content outputs have no meaningful path until their inputs resolve. */
+        state = &DerivationGoal::outputsSubstituted;
+        worker.wakeUp(shared_from_this());
+        return;
+    }
 
     for (auto& i : drv.outputs)
         worker.store.addTempRoot(i.second.path);
@@ -1088,6 +1154,33 @@ void DerivationGoal::inputsRealised()
         return;
     }
 
+    if (goonixCA && !resolvedDerivation(drv)) {
+        // goonix: only the resolved derivation is eligible for a record lookup.
+        drv = resolveDerivation(worker.store, originalDrvPath, originalDrv);
+        resolvedDrvPath = writeResolvedDerivation(worker.store,
+            originalDrvPath, drv);
+        drvPath = resolvedDrvPath;
+        auto & local = dynamic_cast<LocalStore &>(worker.store);
+        auto records = local.queryGoonixBuildRecords(
+            printHash(hashString(htSHA256, unparseDerivation(drv))), "");
+        for (auto & record : records)
+            if (local.isValidPath(record.path))
+                local.chooseOutput(originalDrvPath, record.output, record.path);
+        for (auto & output : originalDrv.outputs) {
+            Path chosen = local.chosenOutput(originalDrvPath, output.first);
+            if (!chosen.empty() && local.isValidPath(chosen))
+                drv.outputs[output.first].path = chosen;
+            else
+                drv.outputs[output.first].path = output.second.path;
+        }
+        /* Resolution has no pending waitees: enter the resolved-output state
+           directly and schedule the continuation. */
+        haveDerivation(); // goonix: sets resolved inputs, outputs and next state
+        if (state == &DerivationGoal::tryToBuild)
+            worker.wakeUp(shared_from_this());
+        return;
+    }
+
     if (retrySubstitution) {
         haveDerivation();
         return;
@@ -1186,8 +1279,6 @@ void DerivationGoal::tryToBuild()
        goal to sleep until another goal finishes, then try again. */
     for (auto& i : drv.outputs)
         if (pathIsLockedByMe(i.second.path)) {
-            debug(std::format("putting derivation `{}' to sleep because `{}' is locked by another goal",
-                drvPath, i.second.path));
             worker.waitForAnyGoal(shared_from_this());
             return;
         }
@@ -2589,6 +2680,14 @@ void DerivationGoal::startBuilder()
     for (auto& i : drv.env)
         ctx.env[i.first] = i.second;
 
+    /* goonix: reserved entries and embedded files are daemon metadata. */
+    for (auto it = ctx.env.begin(); it != ctx.env.end(); ) {
+        if (it->first.starts_with("goonix") ||
+            it->first == "__files" || it->first.starts_with("__file:"))
+            it = ctx.env.erase(it);
+        else ++it;
+    }
+
     /* Create a temporary directory where the build will take
        place. */
     auto drvName = storePathToName(drvPath);
@@ -2630,6 +2729,27 @@ void DerivationGoal::startBuilder()
        inode of the current directory doesn't appear in .. (because
        getdents returns the inode of the mount point). */
     ctx.env["PWD"] = tmpDirInSandbox;
+
+    // goonix: materialise __files after placeholder resolution.
+    auto embedded = get(drv.env, "__files");
+    for (auto & name : tokenizeString<Strings>(embedded)) {
+        if (name.empty() || name[0] == '/' || name.find("\\") != string::npos)
+            throw BuildError(std::format("invalid embedded builder file `{}'", name));
+        std::istringstream components(name);
+        string component;
+        while (std::getline(components, component, '/'))
+            if (component.empty() || component == "." || component == "..")
+                throw BuildError(std::format("invalid embedded builder file `{}'", name));
+        auto value = drv.env.find("__file:" + name);
+        if (value == drv.env.end())
+            throw BuildError(std::format("missing embedded builder file `{}'", name));
+        Path file = tmpDir + "/" + name;
+        Path sandboxFile = tmpDirInSandbox + "/" + name;
+        for (auto & arg : ctx.args)
+            if (arg == "$NIX_BUILD_TOP/" + name) arg = sandboxFile;
+        createDirs(dirOf(file));
+        writeFile(file, value->second);
+    }
 
     /* *Only* if this is a fixed-output derivation, propagate the
        values of the environment variables specified in the
@@ -3152,7 +3272,24 @@ void DerivationGoal::registerOutputs()
         Path path = i.second.path;
         if (missingPaths.find(path) == missingPaths.end()) continue;
 
-        Path actualPath = path;
+        Path actualPath = useChroot ? chrootRootDir + path : path;
+        if (addressingOf(drv) == Addressing::content && resolvedDerivation(drv)) {
+            // goonix: canonicalise before hashing; final path is tree-derived.
+            canonicalisePathMetaData(actualPath,
+                buildUser.enabled() ? buildUser.getUID() : -1, inodesSeen);
+            ValidPathInfo info;
+            info.path = path;
+            Path final = finaliseContentOutput(worker.store, actualPath,
+                i.first, storePathToName(path), allPaths, info.references,
+                info.hash, info.narSize);
+            info.path = final;
+            info.deriver = drvPath;
+            infos.push_back(info);
+            auto & localStore = dynamic_cast<LocalStore &>(worker.store);
+            localStore.recordBuild(drvPath, i.first, final, "local", false);
+            localStore.chooseOutput(originalDrvPath, i.first, final);
+            continue;
+        }
         if (useChroot) {
             actualPath = chrootRootDir + path;
         } else {
@@ -3340,6 +3477,13 @@ void DerivationGoal::registerOutputs()
             worker.store.optimisePath(path); // FIXME: combine with scanForReferences()
 
             worker.store.markContentsGood(path);
+        }
+
+        // goonix: resolved-addressed outputs still produce a signed fact.
+        if (resolvedDerivation(drv)) {
+            auto & local = dynamic_cast<LocalStore &>(worker.store);
+            local.recordBuild(drvPath, i.first, path, "local", false);
+            local.chooseOutput(originalDrvPath, i.first, path);
         }
 
         ValidPathInfo info;
@@ -3635,6 +3779,7 @@ PathSet DerivationGoal::checkPathValidity(bool returnValid, bool checkHash)
     for (auto& i : drv.outputs) {
         if (!wantOutput(i.first, wantedOutputs)) continue;
         bool good =
+            !isReservedStorePath(i.second.path) && // goonix: never a realised output
             worker.store.isValidPath(i.second.path) &&
             (!checkHash || worker.store.pathContentsGood(i.second.path));
         if (good == returnValid) result.insert(i.second.path);
@@ -3645,7 +3790,9 @@ PathSet DerivationGoal::checkPathValidity(bool returnValid, bool checkHash)
 
 bool DerivationGoal::pathFailed(const Path & path)
 {
-    if (!settings.cacheFailure) return false;
+    /* A reserved path is shared by independent derivations; their build
+       failures must never poison one another. */
+    if (!settings.cacheFailure || isReservedStorePath(path)) return false;
 
     if (!worker.store.hasPathFailed(path)) return false;
 
@@ -4289,7 +4436,11 @@ void Worker::run(const Goals & _topGoals)
             if (awake.empty() && settings.maxBuildJobs == 0) throw Error(
                 "unable to start any build; either increase `--max-jobs' "
                 "or enable distributed builds");
-            assert(!awake.empty());
+            if (awake.empty()) {
+                for (auto & goal : topGoals)
+                    printMsg(lvlError, std::format("stalled top goal `{}' with {} waitees", goal->goalName(), goal->waiteeCount()));
+                throw Error("goonix: goal scheduler stalled without a wake-up");
+            }
         }
     }
 

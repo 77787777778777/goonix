@@ -1,0 +1,388 @@
+#include "ca.hh"
+#include "local-store.hh"
+#include "archive.hh"
+#include "globals.hh"
+#include "references.hh"
+#include "misc.hh"
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <format>
+#include <map>
+#include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace nix {
+
+static const string alphabet = "eout";
+static const string treeDomain = "goonix-tree-v1\0";
+
+static string encodeReserved(const Hash & digest, bool token)
+{
+    string result(32, 'e');
+    result[0] = token ? alphabet[1 + digest.hash[0] % 3] : 'e';
+    for (unsigned i = 1; i < 32; ++i) {
+        unsigned bit = 2 + 2 * (i - 1);
+        result[i] = alphabet[(digest.hash[bit / 8] >> (6 - bit % 8)) & 3];
+    }
+    return result;
+}
+
+static void checkOutputName(const string & name)
+{
+    if (name.empty() || name.find('/') != string::npos || name.starts_with('.'))
+        throw Error(std::format("invalid CA output name `{}'", name));
+    for (char c : name)
+        if (!(isalnum((unsigned char) c) || strchr("+-._?=", c)))
+            throw Error(std::format("invalid CA output name `{}'", name));
+}
+
+string selfToken(const string & output)
+{
+    checkOutputName(output);
+    return encodeReserved(hashString(htSHA256, "goonix:self-token:v1:" + output), true);
+}
+
+Path tokenPath(const string & output, const string & name)
+{
+    return settings.nixStore + "/" + selfToken(output) + "-" + name;
+}
+
+Path makePlaceholder(const string & unresolvedBytes, const string & output,
+    const string & name)
+{
+    checkOutputName(output);
+    string prefix = "goonix:placeholder:v1:" + std::to_string(unresolvedBytes.size())
+        + ":" + output + ":";
+    return settings.nixStore + "/" +
+        encodeReserved(hashString(htSHA256, prefix + unresolvedBytes), false)
+        + "-" + name;
+}
+
+static bool reservedPath(const Path & path)
+{
+    if (!isStorePath(path) || path.size() < settings.nixStore.size() + 35)
+        return false;
+    auto base = baseNameOf(path);
+    if (base.size() < 34 || base[32] != '-') return false;
+    return base.substr(0, 32).find_first_not_of(alphabet) == string::npos;
+}
+
+bool isReservedStorePath(const Path & path) { return reservedPath(path); }
+bool isPlaceholderPath(const Path & path)
+{
+    return reservedPath(path) && baseNameOf(path)[0] == 'e';
+}
+bool isTokenStorePath(const Path & path)
+{
+    return reservedPath(path) && baseNameOf(path)[0] != 'e';
+}
+void assertNotReserved(const Path & path)
+{
+    if (reservedPath(path))
+        throw Error(std::format("refusing unresolved goonix token or placeholder `{}'", path));
+}
+string validateTokenPath(const string & path)
+{
+    if (!isTokenStorePath(path) && !isTokenStorePath(settings.nixStore + "/" + path))
+        throw Error(std::format("invalid goonix self token `{}'", path));
+    return path;
+}
+
+Addressing addressingOf(const Derivation & drv)
+{
+    auto it = drv.env.find("goonixAddressing");
+    if (it == drv.env.end()) return Addressing::input;
+    if (it->second == "content") return Addressing::content;
+    if (it->second == "resolved") return Addressing::resolved;
+    throw Error(std::format("unknown goonix addressing `{}'", it->second));
+}
+bool goonixAddressed(const Derivation & drv)
+{
+    return addressingOf(drv) != Addressing::input;
+}
+bool resolvedDerivation(const Derivation & drv)
+{
+    auto it = drv.env.find("goonixResolved");
+    return it != drv.env.end() && it->second == "1";
+}
+
+static void put64(string & out, uint64_t value)
+{
+    for (unsigned i = 0; i < 8; ++i) out.push_back((value >> (i * 8)) & 0xff);
+}
+static void putBytes(string & out, const string & bytes)
+{
+    put64(out, bytes.size());
+    out += bytes;
+}
+static void putBytes(string & out, const unsigned char * bytes, size_t size)
+{
+    put64(out, size);
+    out.append((const char *) bytes, size);
+}
+
+static Hash hashTree(const Path & path, unsigned depth)
+{
+    if (depth > 1024) throw Error("CA tree nesting exceeds 1024 directories");
+    struct stat st;
+    if (lstat(path.c_str(), &st))
+        throw SysError(std::format("reading CA tree `{}'", path));
+    if (S_ISREG(st.st_mode)) {
+        string header = treeDomain;
+        header.push_back(1);
+        /* Match the NAR writer's canonical executable marker. */
+        header.push_back(st.st_mode & S_IXUSR ? 1 : 0);
+        int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+        if (fd == -1) throw SysError(std::format("opening `{}' for CA hash", path));
+        AutoCloseFD close = fd;
+        std::vector<unsigned char> buffer(128 * 1024);
+        /* File bytes are streamed; their known length precedes the stream. */
+        put64(header, st.st_size);
+        HashSink sink(htSHA256);
+        sink((const unsigned char *) header.data(), header.size());
+        while (true) {
+            ssize_t n = read(fd, buffer.data(), buffer.size());
+            if (n < 0) { if (errno == EINTR) continue;
+                throw SysError(std::format("reading `{}' for CA hash", path)); }
+            if (n == 0) break;
+            sink(buffer.data(), n);
+        }
+        return sink.finish().first;
+    }
+    string encoding = treeDomain;
+    if (S_ISLNK(st.st_mode)) {
+        encoding.push_back(2);
+        putBytes(encoding, readLink(path));
+        return hashString(htSHA256, encoding);
+    }
+    if (S_ISDIR(st.st_mode)) {
+        encoding.push_back(3);
+        auto entries = readDirectory(path);
+        std::sort(entries.begin(), entries.end(), [](const DirEntry & a, const DirEntry & b) {
+            return std::lexicographical_compare(a.name.begin(), a.name.end(),
+                b.name.begin(), b.name.end(), [](unsigned char x, unsigned char y) { return x < y; });
+        });
+        put64(encoding, entries.size());
+        for (auto & entry : entries) {
+            putBytes(encoding, entry.name);
+            auto child = printHash(hashTree(path + "/" + entry.name, depth + 1));
+            putBytes(encoding, child);
+        }
+        return hashString(htSHA256, encoding);
+    }
+    throw Error(std::format("unsupported file type in CA tree `{}'", path));
+}
+Hash treeHash(const Path & path) { return hashTree(path, 0); }
+
+Path contentAddressedPath(const string & output, const string & name,
+    const Hash & tree, const PathSet & references)
+{
+    string bytes = "goonix-content-v1\0";
+    put64(bytes, tree.hashSize);
+    putBytes(bytes, tree.hash, tree.hashSize);
+    put64(bytes, references.size());
+    for (auto & reference : references) putBytes(bytes, reference);
+    return makeStorePath("goonix-content:" + output,
+        hashString(htSHA256, bytes), name);
+}
+
+Path resolvedAddressedPath(const string & output, const string & name,
+    const string & resolvedBytes)
+{
+    return makeStorePath("goonix-resolved:" + output,
+        hashString(htSHA256, resolvedBytes), name);
+}
+
+static string replaceWhole(string input, const string & from, const string & to,
+    const string & file)
+{
+    if (from.size() != to.size()) throw Error("internal CA token length mismatch");
+    size_t at = 0;
+    while ((at = input.find(from, at)) != string::npos) {
+        input.replace(at, from.size(), to);
+        at += to.size();
+    }
+    /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable. */
+    for (size_t i = 0; i + 8 <= from.size(); ++i) {
+        auto fragment = from.substr(i, 8);
+        if (input.find(fragment) != string::npos)
+            throw BuildError(std::format("opaque self-reference fragment in `{}' near `{}'",
+                file, fragment));
+    }
+    for (unsigned width : {2, 4}) {
+        string encoded;
+        for (char c : from) {
+            encoded.push_back(c);
+            for (unsigned j = 1; j < width; ++j) encoded.push_back(0);
+        }
+        auto at = input.find(encoded);
+        if (at != string::npos)
+            throw BuildError(std::format("UTF-{} self-reference in `{}' at byte {}",
+                width * 8, file, at));
+    }
+    return input;
+}
+
+static void checkReserved(const Path & path, const string & bytes)
+{
+    /* The normal reference scanner only knows base32 hashes.  Reserved
+       paths deliberately use the other alphabet, so scan for them here. */
+    for (size_t offset = 0; offset + 33 <= bytes.size(); ++offset) {
+        if (bytes[offset] != 'e') continue;
+        if (bytes.substr(offset, 32).find_first_not_of(alphabet) != string::npos)
+            continue;
+        if (bytes[offset + 32] != '-') continue;
+        throw BuildError(std::format("unresolved goonix placeholder in `{}' at byte {}",
+            path, offset));
+    }
+}
+
+static void checkReservedTree(const Path & path, unsigned depth = 0)
+{
+    if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
+    struct stat st;
+    if (lstat(path.c_str(), &st)) throw SysError(std::format("scanning `{}'", path));
+    checkReserved(path, baseNameOf(path));
+    if (S_ISDIR(st.st_mode)) {
+        for (auto & entry : readDirectory(path))
+            checkReservedTree(path + "/" + entry.name, depth + 1);
+    } else if (S_ISREG(st.st_mode)) {
+        checkReserved(path, readFile(path, true));
+    } else if (S_ISLNK(st.st_mode)) {
+        checkReserved(path, readLink(path));
+    } else throw BuildError(std::format("unsupported CA output file `{}'", path));
+}
+
+static void rewriteTree(const Path & path, const string & from, const string & to,
+    unsigned depth = 0)
+{
+    if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
+    struct stat st;
+    if (lstat(path.c_str(), &st)) throw SysError(std::format("reading `{}' for CA rewrite", path));
+    if (S_ISDIR(st.st_mode)) {
+        auto entries = readDirectory(path);
+        for (auto & entry : entries)
+            rewriteTree(path + "/" + entry.name, from, to, depth + 1);
+        for (auto & entry : entries) {
+            auto name = replaceWhole(entry.name, from, to, path + "/" + entry.name);
+            if (name != entry.name) {
+                if (name.empty() || name == "." || name == ".." || name.find('/') != string::npos)
+                    throw BuildError(std::format("invalid CA file name in `{}'", path));
+                if (rename((path + "/" + entry.name).c_str(), (path + "/" + name).c_str()))
+                    throw SysError(std::format("renaming `{}' for CA", path + "/" + entry.name));
+            }
+        }
+        /* The parent may need renaming after its contents, not before. */
+    } else if (S_ISREG(st.st_mode)) {
+        if (chmod(path.c_str(), 0600))
+            throw SysError(std::format("making `{}' writable for CA rewrite", path));
+        string data = readFile(path, true);
+        if (data.size() != (size_t) st.st_size)
+            throw BuildError(std::format("file `{}' changed while scanning CA output", path));
+        string rewritten = replaceWhole(data, from, to, path);
+        if (rewritten != data) writeFile(path, rewritten);
+        /* NAR has one executable bit, S_IXUSR.  Keep it on every pass:
+           the inverse mapping must hash exactly the same tree. */
+        if (chmod(path.c_str(), (st.st_mode & S_IFMT) |
+                  ((st.st_mode & S_IXUSR) ? 0555 : 0444)) != 0)
+            throw SysError(std::format("restoring permissions on `{}'", path));
+    } else if (S_ISLNK(st.st_mode)) {
+        string target = replaceWhole(readLink(path), from, to, path);
+        if (target != readLink(path)) {
+            Path parent = dirOf(path);
+            chmod(parent.c_str(), 0700);
+            Path replacement = path + ".goonix-new-link";
+            unlink(replacement.c_str());
+            createSymlink(target, replacement);
+            if (rename(replacement.c_str(), path.c_str()))
+                throw SysError(std::format("replacing symlink `{}'", path));
+            chmod(parent.c_str(), st.st_mode);
+        }
+    } else throw BuildError(std::format("unsupported CA output file `{}'", path));
+}
+
+Path finaliseContentOutput(LocalStore & store, const Path & token,
+    const string & output, const string & name, const PathSet & allPaths,
+    PathSet & references, Hash & narHash, uint64_t & narSize)
+{
+    checkReservedTree(token);
+    HashResult initial;
+    PathSet initialReferences = scanForReferences(token, allPaths, initial);
+    Hash built = treeHash(token);
+    PathSet namingReferences = initialReferences;
+    namingReferences.erase(token);
+    Path final = contentAddressedPath(output, name, built, namingReferences);
+    string oldHash = baseNameOf(token).substr(0, 32);
+    string newHash = baseNameOf(final).substr(0, 32);
+    rewriteTree(token, oldHash, newHash);
+    /* Renaming self references necessarily changes this tree's hash.
+       Verification is the inverse mapping performed below. */
+    if (rename(token.c_str(), final.c_str()))
+        throw SysError(std::format("moving CA output `{}' to `{}'", token, final));
+    /* Inverse verification is performed on the actual final tree. */
+    rewriteTree(final, newHash, oldHash);
+    bool good = treeHash(final) == built;
+    rewriteTree(final, oldHash, newHash);
+    if (!good) {
+        deletePath(final);
+        throw BuildError(std::format("CA inverse mapping failed for `{}'", final));
+    }
+    HashResult finalNAR;
+    references = scanForReferences(final, allPaths, finalNAR);
+    auto result = hashPath(htSHA256, final);
+    narHash = result.first;
+    narSize = result.second;
+    return final;
+}
+
+Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
+    const Derivation & unresolved)
+{
+    Derivation resolved = unresolved;
+    std::map<string, string> replacements;
+    for (auto & input : unresolved.inputDrvs) {
+        auto inDrv = derivationFromPath(store, input.first);
+        for (auto & output : input.second) {
+            Path realised = store.realisedOutputPath(input.first, inDrv, output);
+            replacements[inDrv.outputs.at(output).path] = realised;
+            resolved.inputSrcs.insert(realised);
+        }
+    }
+    auto substitute = [&](string value) {
+        for (auto & replacement : replacements) {
+            size_t at = 0;
+            while ((at = value.find(replacement.first, at)) != string::npos) {
+                value.replace(at, replacement.first.size(), replacement.second);
+                at += replacement.second.size();
+            }
+        }
+        return value;
+    };
+    resolved.builder = substitute(resolved.builder);
+    for (auto & arg : resolved.args)
+        arg = substitute(arg);
+    for (auto & entry : resolved.env) entry.second = substitute(entry.second);
+    resolved.inputDrvs.clear();
+    const string provisional = unparseDerivation(resolved);
+    for (auto & output : resolved.outputs) {
+        string name = storePathToName(output.second.path);
+        if (addressingOf(unresolved) == Addressing::content)
+            output.second.path = tokenPath(output.first, name);
+        else
+            output.second.path = resolvedAddressedPath(output.first, name, provisional);
+    }
+    resolved.env["out"] = resolved.outputs["out"].path;
+    resolved.env["goonixResolved"] = "1";
+    return resolved;
+}
+
+Path writeResolvedDerivation(LocalStore & store, const Path & originalPath,
+    const Derivation & resolved)
+{
+    return writeDerivation(store, resolved, storePathToName(originalPath));
+}
+
+}

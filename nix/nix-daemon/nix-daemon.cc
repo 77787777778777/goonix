@@ -1,6 +1,7 @@
 #include "config.h"
 #include "nix-daemon.hh"
 #include "local-store.hh"
+#include "misc.hh" // goonix: derivationFromPath for realised-output queries
 #include "util.hh"
 #include "serialise.hh"
 #include "worker-protocol.hh"
@@ -772,6 +773,37 @@ static void performOp(bool trusted, unsigned int clientVersion,
 	stopWork();
 	writeStrings(urls, to);
 	break;
+    }
+
+    case wopQueryRealisedOutput: {
+        // goonix: no choice mutation in a query and no client registration.
+        Path drv = readStorePathStrict(from);
+        string output = readString(from);
+        startWork();
+        Path path = dynamic_cast<LocalStore *>(store.get())
+            ->realisedOutputPath(drv, derivationFromPath(*store, drv), output);
+        stopWork();
+        writeString(path, to);
+        break;
+    }
+
+    case wopQueryBuildRecords: {
+        string hash = readString(from);
+        string output = readString(from);
+        startWork();
+        auto records = dynamic_cast<LocalStore *>(store.get())
+            ->queryGoonixBuildRecords(hash, output);
+        stopWork();
+        writeInt(records.size(), to);
+        for (auto & record : records) {
+            writeString(record.resolvedDerivation, to);
+            writeString(record.output, to);
+            writeString(record.path, to);
+            writeString(record.origin, to);
+            writeInt(record.relocationChecked, to);
+            writeString(record.signature, to);
+        }
+        break;
     }
 
     default:

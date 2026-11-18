@@ -172,6 +172,8 @@
             topologically-sorted
             valid-derivers
             query-derivation-outputs
+            query-realised-output/direct
+            query-build-records
             live-paths
             dead-paths
             collect-garbage
@@ -703,6 +705,8 @@ definitions."
   (query-substitutable-paths => substitutable-paths)
   (query-substitutable-path-infos => substitutable-path-info)
   (built-in-builders => built-in-builders/direct)
+  (query-realised-output => query-realised-output/direct)
+  query-build-records
   optimize-store
   (verify-store => verify-store/direct)
   (collect-garbage => run-gc/direct)
@@ -2047,7 +2051,10 @@ that would be accepted by 'add-to-store' & co."
   (define hash-len 32)
 
   (and (> (string-length item) (+ hash-len 1))
-       (string-every %nix-base32-charset item 0 hash-len)
+       ;; goonix: reserved e/o/u/t tokens are valid *syntactic* store paths;
+       ;; they remain unacceptable for ordinary daemon store operations.
+       (or (string-every %nix-base32-charset item 0 hash-len)
+           (string-every (string->char-set "eout") item 0 hash-len))
        (eqv? (string-ref item hash-len) #\-)
        (valid-store-name? (string-drop item (+ hash-len 1)))))
 

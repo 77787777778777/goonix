@@ -6,6 +6,7 @@
 
 #include "pathlocks.hh"
 #include "store-api.hh"
+#include "records.hh"
 #include "util.hh"
 
 
@@ -138,6 +139,30 @@ public:
        remain. */
     bool verifyStore(bool checkContents, bool repair);
 
+    // goonix: persistent facts, choices and cryptographic record signatures.
+    Path realisedOutputPath(const Path & drvPath, const Derivation & drv,
+        const string & output);
+    void recordBuild(const Path & resolvedPath, const string & output,
+        const Path & path, const string & origin, bool relocationChecked);
+    void recordGoonixBuild(const Path & resolvedPath, const string & output,
+        const Path & path, const string & resolvedHash, const string & origin,
+        bool relocationChecked, const string & signature);
+    std::vector<BuildRecord> queryGoonixBuildRecords(const string & hash,
+        const string & output);
+    void chooseGoonixOutput(const Path & unresolved, const string & output,
+        const Path & realised);
+    Path chosenGoonixOutput(const Path & unresolved, const string & output);
+    void chooseOutput(const Path & unresolved, const string & output,
+        const Path & realised);
+    Path chosenOutput(const Path & unresolved, const string & output);
+    OutputChoices choices(const Path & unresolved);
+    string signBuildRecord(const string & payload);
+    void initialiseGoonixRecords();
+    Path addResolvedDerivation(const string & name, const string & contents,
+        const PathSet & references);
+    Path addTextToStoreNoDerivationOutputs(const string & name,
+        const string & contents, const PathSet & references);
+
     /* Register the validity of a path, i.e., that `path' exists, that
        the paths referenced by it exists, and in the case of an output
        path of a derivation, that it has been produced by a successful
@@ -200,6 +225,9 @@ private:
     SQLiteStmt stmtQueryDerivationOutputs;
     SQLiteStmt stmtQueryPathFromHashPart;
     SQLiteStmt stmtQueryValidPaths;
+
+    // goonix: records and choices are not keyed by collectible ValidPaths rows.
+    std::unique_ptr<class BuildRecords> goonixRecords;
 
     /* Cache for pathContentsGood(). */
     std::map<Path, bool> pathContentsGoodCache;

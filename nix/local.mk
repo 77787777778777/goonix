@@ -54,6 +54,7 @@ libutil_a_CPPFLAGS =				\
   -I$(top_srcdir)/%D%/libutil			\
   $(LIBGCRYPT_CPPFLAGS)
 
+# goonix: CA store modules.
 libstore_a_SOURCES =				\
   %D%/libstore/gc.cc				\
   %D%/libstore/globals.cc			\
@@ -66,7 +67,9 @@ libstore_a_SOURCES =				\
   %D%/libstore/pathlocks.cc			\
   %D%/libstore/derivations.cc			\
   %D%/libstore/builtins.cc			\
-  %D%/libstore/sqlite.cc
+  %D%/libstore/sqlite.cc			\
+  %D%/libstore/records.cc			\
+  %D%/libstore/ca.cc
 
 libstore_headers =				\
   %D%/libstore/references.hh			\
@@ -78,7 +81,9 @@ libstore_headers =				\
   %D%/libstore/local-store.hh			\
   %D%/libstore/sqlite.hh			\
   %D%/libstore/builtins.hh			\
-  %D%/libstore/store-api.hh
+  %D%/libstore/store-api.hh			\
+  %D%/libstore/ca.hh				\
+  %D%/libstore/records.hh
 
 libstore_a_CPPFLAGS =				\
   $(libutil_a_CPPFLAGS)				\
@@ -95,6 +100,18 @@ libstore_a_CXXFLAGS = $(AM_CXXFLAGS)		\
   $(SQLITE3_CFLAGS)
 
 bin_PROGRAMS = guix-daemon
+noinst_PROGRAMS = nix/ca-test nix/records-test
+
+nix_ca_test_SOURCES = %D%/libstore/ca-test.cc
+nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
+nix_ca_test_LDADD = libstore.a libutil.a -lz $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
+nix_records_test_SOURCES = %D%/libstore/records-test.cc
+nix_records_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
+nix_records_test_LDADD = $(nix_ca_test_LDADD)
+if HAVE_LIBBZ2
+nix_ca_test_LDADD += -lbz2
+nix_records_test_LDADD += -lbz2
+endif HAVE_LIBBZ2
 
 guix_daemon_SOURCES =				\
   %D%/nix-daemon/nix-daemon.cc			\
@@ -124,6 +141,13 @@ endif HAVE_LIBBZ2
 noinst_HEADERS =						\
   $(libutil_headers) $(libstore_headers)	\
   $(guix_daemon_headers)
+
+%D%/libstore/libstore_a-local-store.o: %D%/libstore/local-store.cc %D%/libstore/local-store.hh %D%/libstore/schema.sql.hh
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(libstore_a_CPPFLAGS) $(CPPFLAGS) $(libstore_a_CXXFLAGS) $(CXXFLAGS) -c -o $@ $(srcdir)/nix/libstore/local-store.cc
+libstore.a: $(libstore_a_OBJECTS)
+	$(AM_V_at)-rm -f $@
+	$(AM_V_AR)$(libstore_a_AR) $@ $(libstore_a_OBJECTS) $(libstore_a_LIBADD)
+	$(AM_V_at)$(libstore_a_RANLIB) $@
 
 %D%/libstore/schema.sql.hh: guix/store/schema.sql
 	$(AM_V_GEN)$(GUILE) --no-auto-compile -c		\

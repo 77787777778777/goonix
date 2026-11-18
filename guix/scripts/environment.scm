@@ -35,6 +35,8 @@
   #:autoload   (guix channels) (guix-channel? channel-commit)
   #:use-module (guix scripts)
   #:use-module (guix scripts build)
+  #:autoload   (guix pure-eval) (load-file-purely)
+  #:autoload   (guix flakes evaluate) (evaluate-flake)
   #:autoload   (guix scripts pack) (symlink-spec-option-parser)
   #:use-module (guix transformations)
   #:autoload   (ice-9 ftw) (scandir)
@@ -112,6 +114,8 @@ shell'."
   -C, --container        run command within an isolated container"))
   (display (G_ "
   -N, --network          allow containers to access the network"))
+  (display (G_ "
+      --pure-eval        evaluate project files in an isolated container")) ;goonix: CLI hook
   (display (G_ "
   -P, --link-profile     link environment profile to ~/.guix-profile within
                          an isolated container"))
@@ -212,6 +216,9 @@ COMMAND or an interactive shell in that environment.\n"))
          (option '("pure") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'pure #t result)))
+         (option '("pure-eval") #f #f
+                 (lambda (opt name arg result)
+                   (alist-cons 'pure-eval? #t result)))
          (option '(#\E "preserve") #t #f
                  (lambda (opt name arg result)
                    (let ((=-index (string-index arg #\=)))
@@ -325,6 +332,20 @@ use '--preserve' instead~%"))
             (_ memo)))
         '() alist))
 
+(define (pure-file->manifest store file)
+  "Return a manifest reconstructed from the derivations of a pure evaluation.
+Scheme package and service values never cross the evaluator boundary."
+  (manifest
+   (map (lambda (description)
+          (match description
+            ((name version file output)
+             (let ((drv (read-derivation-from-file file)))
+               (manifest-entry
+                (name name) (version version)
+                (output output)
+                (item drv))))))
+        (load-file-purely store file #:kind 'environment))))
+
 (define (load-manifest file)                      ;TODO: factorize
   "Load the user-profile manifest (Scheme code) from FILE and return it."
   (let ((modules '((guix profiles) (gnu))))
@@ -360,26 +381,49 @@ for the corresponding packages."
       ((lst ...)
        (append-map (cut packages->outputs <> mode) lst))))
 
+  (define (flake-reference? spec)
+    (and (string-index spec #\#)
+         (file-exists? (substring spec 0 (string-index spec #\#)))))
+
+  (define (flake-entry spec)
+    (let* ((hash (string-index spec #\#))
+           (directory (substring spec 0 hash))
+           (name (substring spec (+ hash 1)))
+           (drv (evaluate-flake store directory 'packages
+                                (string->symbol name) #:pure? #t)))
+      (manifest-entry
+        (name name) (version "0") (item drv)
+        (output (or (assoc-ref (assoc-ref opts 'outputs) name) "out")))))
+
   (manifest
    (delete-duplicates
     (append-map (match-lambda
                   (('package 'ad-hoc-package (? string? spec))
-                   (let-values (((package output)
-                                 (specification->package+output spec)))
-                     (list (package->manifest-entry* package output))))
+                   (if (flake-reference? spec)
+                       (list (flake-entry spec))
+                       (let-values (((package output)
+                                     (specification->package+output spec)))
+                         (list (package->manifest-entry* package output)))))
                   (('package 'package (? string? spec))
-                   (manifest-entries
-                    (package->development-manifest
-                     (transform (specification->package+output spec))
-                     system)))
+                   (if (flake-reference? spec)
+                       (list (flake-entry spec))
+                       (manifest-entries
+                        (package->development-manifest
+                         (transform (specification->package+output spec))
+                         system))))
                   (('expression mode str)
                    ;; Add all the outputs of the package STR evaluates to.
                    (packages->outputs (read/eval str) mode))
                   (('load mode file)
                    ;; Add all the outputs of the package defined in FILE.
-                   (packages->outputs (load* file '()) mode))
+                   (if (assoc-ref opts 'pure-eval?)
+                       (manifest-entries (pure-file->manifest store file))
+                       (packages->outputs (load* file '()) mode)))
                   (('manifest . file)
-                   (manifest-entries (load-manifest file)))
+                   (manifest-entries
+                    (if (assoc-ref opts 'pure-eval?)
+                        (pure-file->manifest store file)
+                        (load-manifest file))))
                   (('nesting? . #t)
                    (if (assoc-ref opts 'profile)
                        '()

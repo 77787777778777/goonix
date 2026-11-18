@@ -1232,6 +1232,7 @@ derivations--e.g., code evaluated for its side effects."
                            leaked-env-vars
                            local-build? (substitutable? #t)
                            (properties '())
+                           (addressing 'input)       ;goonix: lowering policy
                            deprecation-warnings
                            (script-name (string-append name "-builder")))
   "Return a derivation NAME that runs EXP (a gexp) with GUILE-FOR-BUILD (a
@@ -1333,9 +1334,11 @@ The other arguments are as for 'derivation'."
                                                          #:target target)
                                        (return #f)))
                        (guile -> (lowered-gexp-guile lowered))
-                       (builder  (text-file script-name
-                                            (sexp->string
-                                             (lowered-gexp-sexp lowered)))))
+                       (builder-text -> (sexp->string
+                                         (lowered-gexp-sexp lowered)))
+                       (builder  (if (eq? addressing 'input)
+                                     (text-file script-name builder-text)
+                                     (return script-name))))
     (mbegin %store-monad
       (set-grafting graft?)                       ;restore the initial setting
       (raw-derivation name
@@ -1348,9 +1351,18 @@ The other arguments are as for 'derivation'."
                         ,@(append-map (lambda (directory)
                                         `("-C" ,directory))
                                       (lowered-gexp-load-compiled-path lowered))
-                        ,builder)
+                        ,(if (eq? addressing 'input)
+                             builder
+                             (string-append "$NIX_BUILD_TOP/" builder)))
                       #:outputs outputs
-                      #:env-vars env-vars
+                      #:env-vars
+                      `(,@env-vars
+                        ,@(if (eq? addressing 'input)
+                              '()
+                              `(("__files" . ,builder)
+                                (,(string-append "__file:" builder)
+                                 . ,builder-text))))
+                      #:addressing addressing
                       #:system system
                       #:inputs `(,guile
                                  ,@(lowered-gexp-inputs lowered)
@@ -1358,7 +1370,9 @@ The other arguments are as for 'derivation'."
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))
                                      (#f '())))
-                      #:sources `(,builder
+                      #:sources `(,@(if (eq? addressing 'input)
+                                        (list builder)
+                                        '())
                                   ,@(if (and (string? modules)
                                              (store-path? modules))
                                         (list modules)

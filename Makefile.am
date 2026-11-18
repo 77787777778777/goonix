@@ -94,6 +94,17 @@ MODULES =					\
   guix/openpgp.scm				\
   guix/pki.scm					\
   guix/progress.scm				\
+  guix/pure-eval.scm				\
+  guix/ca.scm					\
+  guix/flakes.scm				\
+  guix/flakes/syntax.scm			\
+  guix/flakes/lock.scm				\
+  guix/flakes/checkout.scm			\
+  guix/flakes/resolve.scm			\
+  guix/flakes/evaluate.scm			\
+  guix/flakes/evaluator.scm		\
+  guix/flakes/support.scm			\
+  guix/scripts/flake.scm			\
   guix/combinators.scm				\
   guix/memoization.scm				\
   guix/utils.scm				\
@@ -538,6 +549,11 @@ clean-go:
 TEST_EXTENSIONS = .scm .sh
 
 SCM_TESTS =					\
+  tests/ca.scm					\
+  tests/ca-build.scm				\
+  tests/flakes.scm				\
+  tests/flake-eval.scm				\
+  tests/pure-eval.scm				\
   tests/accounts.scm				\
   tests/base16.scm				\
   tests/base32.scm				\
@@ -663,6 +679,8 @@ EXTRA_DIST += tests/offload.scm
 endif
 
 SH_TESTS =					\
+  build-aux/check-goonix-hooks.sh		\
+  tests/guix-pure-eval.sh			\
   tests/guix-build.sh				\
   tests/guix-build-branch.sh			\
   tests/guix-download.sh			\
@@ -693,6 +711,14 @@ SH_TESTS =					\
   tests/guix-lint.sh
 
 if CAN_RUN_TESTS
+
+check-local:
+	$(AM_V_at)$(top_builddir)/test-env $(SHELL) -e -c \
+	  'helper="$$GUIX_STATE_DIRECTORY/guix-helper"; \
+	   printf "#!%s\nexec %s guix \"\$$@\"\n" "$$SHELL" \
+	     "$(abs_top_builddir)/pre-inst-env" > "$$helper"; \
+	   chmod +x "$$helper"; \
+	   $(abs_top_builddir)/nix/records-test "$$GUIX_STATE_DIRECTORY" "$$helper"'
 
 TESTS = $(SCM_TESTS) $(SH_TESTS)
 

@@ -91,6 +91,7 @@
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
+  #:autoload   (guix pure-eval) (load-file-purely) ;goonix: contained files
   #:export (guix-system
             read-operating-system
 
@@ -1012,6 +1013,8 @@ Some ACTIONS support additional ARGS.\n"))
   (display (G_ "
   -d, --derivation       return the derivation of the given system"))
   (display (G_ "
+      --pure-eval        evaluate FILE from its tracked tree in a container"))
+  (display (G_ "
   -e, --expression=EXPR  consider the operating-system EXPR evaluates to
                          instead of reading FILE, when applicable"))
   (display (G_ "
@@ -1108,6 +1111,9 @@ Some ACTIONS support additional ARGS.\n"))
          (option '(#\d "derivation") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'derivations-only? #t result)))
+         (option '("pure-eval") #f #f
+                 (lambda (opt name arg result)
+                   (alist-cons 'pure-eval? #t result)))
          (option '("allow-downgrades") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'validate-reconfigure
@@ -1268,11 +1274,34 @@ resulting from command-line parsing."
              file-or-exp))
     obj)
 
+  (define file (match args
+                 ((file . _) file)
+                 (() (leave (G_ "no configuration specified~%")))))
+  (define system (assoc-ref opts 'system))
+  (define target (assoc-ref opts 'target))
+
   (define save-provenance?
     (or (assoc-ref opts 'save-provenance?)
         (memq action '(init reconfigure))))
 
-  (let* ((file        (match args
+  (when (and (assoc-ref opts 'pure-eval?)
+             (memq action '(reconfigure init)))
+    (leave (G_ "--pure-eval is not supported for host-changing actions~%")))
+
+  (if (assoc-ref opts 'pure-eval?)
+      (with-store store
+        (set-build-options-from-command-line store opts)
+        (match (load-file-purely store file #:kind 'system
+                                 #:system system #:target target)
+          ((drv output)
+           (if (assoc-ref opts 'derivations-only?)
+               (display (string-append drv "\n"))
+               (begin
+                 (build-derivations store (list (read-derivation-from-file drv)))
+                 (when (assoc-ref opts 'gc-root)
+                   (register-root store (list output) (assoc-ref opts 'gc-root)))
+                 (display (string-append output "\n")))))))
+      (let* ((file        (match args
                         (() #f)
                         ((x . _) x)))
          (expr        (assoc-ref opts 'expression))
@@ -1398,7 +1427,7 @@ resulting from command-line parsing."
                                #:gc-root (assoc-ref opts 'gc-root)))))
           #:target target
           #:system system)))
-    (warn-about-disk-space)))
+    (warn-about-disk-space))))
 
 (define (resolve-subcommand name)
   (let ((module (resolve-interface
