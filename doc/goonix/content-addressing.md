@@ -131,5 +131,6 @@ bytes; neither calls the other. The C++ side runs as
 `tests/ca.scm`. The vectors cover empty files and directories, executable
 bits, symbolic links, arbitrary-byte file contents, directory entry
 ordering, self tokens, placeholders, content paths with sorted references,
-resolved derivation serialization and paths, and canonical record payload
-bytes and hashes.
+resolved derivation serialization and paths, unresolved two-output
+derivation serialization with an input derivation and its placeholder, and
+canonical record payload bytes and hashes.

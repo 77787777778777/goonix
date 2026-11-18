@@ -604,6 +604,19 @@ static void checkSharedVectors(const Path & file, const Path & root)
         field(resolved, "resolvedLibPath"),
         "shared resolved-addressed sibling path vector");
 
+    auto unresolved = vectors.at("unresolvedDerivation");
+    string unresolvedBytes = field(unresolved, "bytes");
+    Derivation unresolvedParsed = parseDerivationText(unresolvedBytes);
+    check(unparseDerivation(unresolvedParsed) == unresolvedBytes,
+        "shared unresolved derivation canonical bytes");
+    check(unresolvedParsed.outputs.size() == 2 &&
+        unresolvedParsed.inputDrvs.size() == 1,
+        "shared unresolved derivation has two outputs and an input derivation");
+    check(makePlaceholder(unresolvedBytes, field(unresolved, "output"),
+            field(unresolved, "name")) == "/gnu/store/" +
+            field(unresolved, "placeholderHash") + "-" + field(unresolved, "name"),
+        "shared placeholder bytes match the unresolved derivation serializer");
+
     auto recordVector = vectors.at("record");
     BuildRecord record;
     record.resolvedHash = field(recordVector, "resolvedHash");

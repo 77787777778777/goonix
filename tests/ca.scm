@@ -13,6 +13,7 @@
   #:use-module (guix base16)
   #:use-module (guix derivations)
   #:use-module (guix store)
+  #:use-module ((guix utils) #:select (call-with-temporary-directory))
   #:use-module (ice-9 match)
   #:use-module (ice-9 binary-ports)
   #:use-module (ice-9 textual-ports)
@@ -41,6 +42,14 @@
     (unless (vector? value)
       (error "CA vector field is not a JSON array" name))
     (vector->list value)))
+
+(define (parse-derivation-vector vector)
+  (read-derivation
+   (open-bytevector-input-port (string->utf8 (field vector "bytes")))
+   ;; The input derivation is a path in this vector, not a file to fetch.
+   (lambda (path)
+     ((@@ (guix derivations) make-derivation)
+      '() '() '() "x86_64-linux" "" '() '() path))))
 
 (test-group "tokens and placeholders"
   (test-assert "self token is deterministic and reserved"
@@ -102,7 +111,8 @@
       #f)))
 
 (test-group "tree and content vectors"
-  (let ((root (mkdtemp "/tmp/ca-vectors.XXXXXX")))
+  (call-with-temporary-directory
+   (lambda (root)
     (for-each
      (lambda (vector)
        (let ((name (field vector "name"))
@@ -156,17 +166,10 @@
         (field content "withReferences")
         (parameterize ((%store-prefix "/gnu/store"))
           (content-addressed-path "out" "hello" tree
-                                  (reverse (list-field content "references")))))))
+                                  (reverse (list-field content "references"))))))))
   (let* ((resolved (field vectors "resolvedDerivation"))
          (bytes (string->utf8 (field resolved "bytes")))
-         (drv (call-with-input-file
-                  (begin
-                    (let ((file (string-append (mkdtemp "/tmp/ca-drv.XXXXXX")
-                                               "/resolved.drv")))
-                      (call-with-output-file file
-                        (lambda (port) (display (field resolved "bytes") port)))
-                      file))
-                read-derivation)))
+         (drv (parse-derivation-vector resolved)))
     (test-equal "shared canonical resolved derivation bytes"
       bytes (derivation->bytevector drv))
     (test-equal "shared resolved-addressed path"
@@ -176,7 +179,22 @@
     (test-equal "shared resolved-addressed sibling path"
       (field resolved "resolvedLibPath")
       (parameterize ((%store-prefix "/gnu/store"))
-        (resolved-addressed-path "lib" "hello-lib" bytes)))))
+        (resolved-addressed-path "lib" "hello-lib" bytes))))
+  (let* ((unresolved (field vectors "unresolvedDerivation"))
+         (bytes (string->utf8 (field unresolved "bytes")))
+         (drv (parse-derivation-vector unresolved)))
+    (test-equal "shared canonical unresolved derivation bytes"
+      bytes (derivation->bytevector drv))
+    (test-equal "shared unresolved derivation has two outputs"
+      '("lib" "out") (map car (derivation-outputs drv)))
+    (test-equal "shared unresolved derivation has one input derivation"
+      1 (length (derivation-inputs drv)))
+    (test-equal "shared placeholder is computed from the unresolved derivation bytes"
+      (field unresolved "placeholderHash")
+      (substring
+       (basename (placeholder bytes (field unresolved "output")
+                              (field unresolved "name")))
+       0 32))))
 
 (test-group "build record canonical payload"
   (let* ((vector (field vectors "record"))
@@ -190,7 +208,14 @@
       (u8-list->bytevector (list-field vector "payload")) payload)
     (test-equal "record payload hash matches the shared vectors"
       (field vector "sha256")
-      (bytevector->base16-string (sha256 payload))))
+      (bytevector->base16-string (sha256 payload)))
+    (test-equal "record content hash matches the shared vectors"
+      (field vector "sha256")
+      (bytevector->base16-string
+       (build-record-content-hash
+        (field vector "resolvedHash") (field vector "derivation")
+        (field vector "output") (field vector "path") (field vector "origin")
+        #:relocation-checked? (= 1 (field vector "relocationChecked")))))))
   (test-assert "record payload is field-framed, not concatenated"
     (not (equal? (canonical-build-record-payload "resolved" "derivation"
                                                  "ou" "tpath" "origin")
@@ -207,6 +232,6 @@
            (not (equal? base (canonical-build-record-payload "r" "d2" "out" "p" "o")))
            (not (equal? base (canonical-build-record-payload "r" "d" "lib" "p" "o")))
            (not (equal? base (canonical-build-record-payload "r" "d" "out" "p2" "o")))
-           (not (equal? base (canonical-build-record-payload "r" "d" "out" "p" "o2")))))))
+           (not (equal? base (canonical-build-record-payload "r" "d" "out" "p" "o2"))))))
 
 (test-end)
