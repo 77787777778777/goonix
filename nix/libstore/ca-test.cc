@@ -97,14 +97,11 @@ static void checkSymlinkModes(const Path & root)
     createDirs(settings.nixStore);
     chmod(settings.nixStore.c_str(), 0755);
     Path output = tokenPath("out", "symlink-output");
-    createDirs(output);
-    const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
-    if (utimensat(AT_FDCWD, output.c_str(), times, 0))
-        throw SysError("canonicalising symlink test timestamp");
-    createSymlink(baseNameOf(output), output + "/self");
+    createSymlink(baseNameOf(output), output);
     PathSet references;
     Hash narHash;
     uint64_t narSize = 0;
+    chmod(settings.nixStore.c_str(), 0755);
     Path final = finaliseContentOutput(store, output, "out", "symlink-output",
         PathSet{output}, references, narHash, narSize);
     struct stat st;
@@ -116,6 +113,7 @@ static void checkSymlinkModes(const Path & root)
     chmod(directory.c_str(), 0755);
     createSymlink(directory, directory + "/self");
     writeFile(directory + "/reference", directory);
+    const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
     if (utimensat(AT_FDCWD, (directory + "/self").c_str(), times, AT_SYMLINK_NOFOLLOW) ||
         utimensat(AT_FDCWD, (directory + "/reference").c_str(), times, 0) ||
         utimensat(AT_FDCWD, directory.c_str(), times, 0))
@@ -196,8 +194,60 @@ static void checkExistingItemIsUntouched(const Path & root)
         "hard-linked content is not rewritten");
 }
 
+static void checkSiblingOutputReferences(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "multi-lib");
+    createDirs(libToken);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "multi-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "multi-out");
+    createDirs(outToken);
+    writeFile(outToken + "/uses-lib", libToken);
+    references.clear();
+    Path outFinal = finaliseContentOutput(store, outToken, "out", "multi-out",
+        PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+        std::map<Path, Path>{{libToken, libFinal}});
+    check(readFile(outFinal + "/uses-lib") == libFinal,
+        "sibling token is replaced by its final output path");
+    check(references.count(libFinal) == 1,
+        "sibling output is registered as a reference");
+}
+
+static void checkPlaceholderVector()
+{
+    Derivation drv;
+    drv.platform = "x86_64-linux";
+    drv.builder = "/bin/sh";
+    drv.env["goonixAddressing"] = "content";
+    drv.outputs["lib"] = DerivationOutput("", "", "");
+    drv.outputs["out"] = DerivationOutput("", "", "");
+    drv.env["lib"] = "";
+    drv.env["out"] = "";
+    settings.nixStore = "/gnu/store";
+    const string bytes = unparseDerivation(drv);
+    Path actual = makePlaceholder(bytes, "lib", "ca-multi-lib");
+    const Path expected = "/gnu/store/eeoeooettuoueuuooetuooteouteeooe-ca-multi-lib";
+    if (actual != expected) std::cerr << "actual placeholder=" << actual << "\n";
+    check(actual == expected,
+        "placeholder bytes match the Scheme serializer");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 2 && string(argv[1]) == "--placeholder-vector") {
+        checkPlaceholderVector();
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--siblings") {
+        checkSiblingOutputReferences(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--existing-item") {
         checkExistingItemIsUntouched(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

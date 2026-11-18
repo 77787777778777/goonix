@@ -59,6 +59,7 @@ Path resolvedAddressedPath(const string & output, const string & name,
    mapping reproduces the original tree hash.  Returns the final path. */
 Path finaliseContentOutput(class LocalStore & store, const Path & tokenPath,
     const string & output, const string & name, const PathSet & allPaths,
-    PathSet & references, Hash & narHash, uint64_t & narSize);
+    PathSet & references, Hash & narHash, uint64_t & narSize,
+    const std::map<Path, Path> & finalOutputs = {});
 
 }

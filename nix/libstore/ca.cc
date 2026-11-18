@@ -214,23 +214,29 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
             expected = tokenPath(output.first,
                 name + (output.first == "out" ? "" : "-" + output.first));
             if (!resolvedDerivation(drv))
-                expected = makePlaceholder(bytes, output.first, name);
+                expected = makePlaceholder(bytes, output.first,
+                    name + (output.first == "out" ? "" : "-" + output.first));
         } else if (addressingOf(drv) == Addressing::resolved) {
             expected = resolvedAddressedPath(output.first,
                 name + (output.first == "out" ? "" : "-" + output.first), bytes);
         } else {
-            if (!resolvedDerivation(drv))
-                throw Error(std::format(
-                    "goonix: unresolved input-addressed output `{0}' is not validated here",
-                    output.first));
-            continue;
+            /* Registration routes input-addressed derivations through the
+               ordinary path check, and refuses a resolved mark without an
+               explicit addressing.  This branch is therefore unreachable. */
+            throw Error(std::format(
+                "goonix: input-addressed output `{0}' reached CA validation",
+                output.first));
         }
         if (output.second.path != expected)
             throw Error(std::format(
                 "goonix: output `{0}' has incorrect path `{1}', expected `{2}'",
                 output.first, output.second.path, expected));
+        Path expectedEnvironment = expected;
+        if (addressingOf(drv) == Addressing::content && !resolvedDerivation(drv))
+            expectedEnvironment = tokenPath(output.first,
+                name + (output.first == "out" ? "" : "-" + output.first));
         auto env = drv.env.find(output.first);
-        if (env == drv.env.end() || env->second != expected)
+        if (env == drv.env.end() || env->second != expectedEnvironment)
             throw Error(std::format(
                 "goonix: output `{0}' has an incorrect environment path", output.first));
     }
@@ -457,7 +463,7 @@ static void checkReservedTree(const Path & path, unsigned depth = 0)
 }
 
 static void rewriteTree(const Path & path, const string & from, const string & to,
-    unsigned depth = 0)
+    unsigned depth = 0, bool outputRoot = true)
 {
     if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
     struct stat st;
@@ -469,7 +475,7 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         try {
             auto entries = readDirectory(path);
             for (auto & entry : entries)
-                rewriteTree(path + "/" + entry.name, from, to, depth + 1);
+                rewriteTree(path + "/" + entry.name, from, to, depth + 1, false);
             for (auto & entry : entries) {
                 auto name = replaceWhole(entry.name, from, to, path + "/" + entry.name);
                 if (name != entry.name) {
@@ -497,9 +503,12 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         if (target != readLink(path)) {
             Path parent = dirOf(path);
             struct stat parentStat;
-            if (stat(parent.c_str(), &parentStat))
+            if (lstat(parent.c_str(), &parentStat))
                 throw SysError(std::format("reading parent of `{}'", path));
-            if (chmod(parent.c_str(), 0700))
+            /* The output root's parent is the store.  Never change its
+               mode: it is outside the output tree and already writable. */
+            bool insideOutput = !outputRoot;
+            if (insideOutput && chmod(parent.c_str(), 0700))
                 throw SysError(std::format("making parent of `{}' writable", path));
             /* goonix: restore the parent's mode, never the symlink's 0777. */
             try {
@@ -523,12 +532,19 @@ static void rewriteTree(const Path & path, const string & from, const string & t
 }
 
 static string inverseTree(const Path & path, const string & final,
-    const string & token, unsigned depth = 0)
+    const string & token, const std::map<Path, Path> & siblings = {}, unsigned depth = 0)
 {
     if (depth > 1024) throw Error("CA tree nesting exceeds 1024 directories");
     struct stat st;
     if (lstat(path.c_str(), &st))
         throw SysError(std::format("reading CA tree `{}'", path));
+    auto inverse = [&](string value) {
+        value = replaceWhole(value, final, token, path, false);
+        for (auto it = siblings.rbegin(); it != siblings.rend(); ++it)
+            value = replaceWhole(value, baseNameOf(it->second).substr(0, 32),
+                baseNameOf(it->first).substr(0, 32), path, false);
+        return value;
+    };
     if (S_ISREG(st.st_mode)) {
         string header = treeDomain;
         header.push_back(1);
@@ -557,16 +573,16 @@ static string inverseTree(const Path & path, const string & final,
                     process -= length;
                     break;
                 }
-            write(replaceWhole(pending.substr(0, process), final, token, path, false));
+            write(inverse(pending.substr(0, process)));
             pending.erase(0, process);
         }
-        write(replaceWhole(pending, final, token, path, false));
+        write(inverse(pending));
         return printHash(sink.finish().first);
     }
     string encoding = treeDomain;
     if (S_ISLNK(st.st_mode)) {
         encoding.push_back(2);
-        putBytes(encoding, replaceWhole(readLink(path), final, token, path, false));
+        putBytes(encoding, inverse(readLink(path)));
         return printHash(hashString(htSHA256, encoding));
     }
     if (S_ISDIR(st.st_mode)) {
@@ -578,10 +594,10 @@ static string inverseTree(const Path & path, const string & final,
         });
         put64(encoding, entries.size());
         for (auto & entry : entries) {
-            string name = replaceWhole(entry.name, final, token, path, false);
+            string name = inverse(entry.name);
             putBytes(encoding, name);
             putBytes(encoding, inverseTree(path + "/" + entry.name,
-                final, token, depth + 1));
+                final, token, siblings, depth + 1));
         }
         return printHash(hashString(htSHA256, encoding));
     }
@@ -590,17 +606,24 @@ static string inverseTree(const Path & path, const string & final,
 
 /* goonix: compare the inverse tree without writing to an existing store item. */
 static bool sameContent(const Path & path, const string & final,
-    const string & token, const Hash & expected)
+    const string & token, const Hash & expected,
+    const std::map<Path, Path> & siblings = {})
 {
     return inverseTree(path, baseNameOf(final).substr(0, 32),
-        baseNameOf(token).substr(0, 32)) == printHash(expected);
+        baseNameOf(token).substr(0, 32), siblings) == printHash(expected);
 }
 
 Path finaliseContentOutput(LocalStore & store, const Path & token,
     const string & output, const string & name, const PathSet & allPaths,
-    PathSet & references, Hash & narHash, uint64_t & narSize)
+    PathSet & references, Hash & narHash, uint64_t & narSize,
+    const std::map<Path, Path> & finalOutputs)
 {
     checkReservedTree(token);
+    /* goonix: sibling tokens have the same fixed width as final hashes. */
+    for (auto & sibling : finalOutputs)
+        if (sibling.first != token)
+            rewriteTree(token, baseNameOf(sibling.first).substr(0, 32),
+                baseNameOf(sibling.second).substr(0, 32));
     HashResult initial;
     PathSet initialReferences = scanForReferences(token, allPaths, initial);
     Hash built = treeHash(token);
@@ -619,7 +642,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (!store.isValidPath(final))
             throw BuildError(std::format(
                 "CA final path `{0}' exists but is not a valid store item", final));
-        bool same = sameContent(final, final, token, built);
+        bool same = sameContent(final, final, token, built, finalOutputs);
         if (!same)
             throw BuildError(std::format(
                 "CA content address collision at `{0}': existing item differs", final));
@@ -638,7 +661,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     if (rename(token.c_str(), final.c_str()))
         throw SysError(std::format("moving CA output `{}' to `{}'", token, final));
     /* goonix: the inverse mapping is verified without touching the final tree. */
-    bool good = sameContent(final, final, token, built);
+    bool good = sameContent(final, final, token, built, finalOutputs);
     if (!good) {
         deletePath(final);
         throw BuildError(std::format("CA inverse mapping failed for `{}'", final));
@@ -702,7 +725,11 @@ Path writeResolvedDerivation(LocalStore & store, const Path & originalPath,
     const Derivation & resolved)
 {
     checkResolvedDerivation(resolved);
-    return writeDerivation(store, resolved, storePathToName(originalPath));
+    /* The original name already ends in `.drv'; writeDerivation appends
+       that suffix itself.  Keep exactly one to preserve output names. */
+    string name = storePathToName(originalPath);
+    if (name.ends_with(drvExtension)) name.resize(name.size() - drvExtension.size());
+    return writeDerivation(store, resolved, name);
 }
 
 }

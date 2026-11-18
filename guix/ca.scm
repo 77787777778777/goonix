@@ -26,7 +26,7 @@
             build-record-content-hash))
 
 (define %ca-store-directory "/gnu/store")
-(define %reserved-alphabet "eotu")
+(define %reserved-alphabet "eout")
 
 (define (reserved-hash digest self?)
   "Encode 62 digest bits, with a self-token discriminator in character zero."

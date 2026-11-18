@@ -3285,6 +3285,9 @@ void DerivationGoal::registerOutputs()
 
     Path checkSuffix = "-check";
 
+    // goonix: sibling tokens become their final output paths before naming.
+    std::map<Path, Path> goonixFinalOutputs;
+
     /* Check whether the output paths were created, and grep each
        output path to determine what other paths it references.  Also make all
        output paths read-only. */
@@ -3306,7 +3309,8 @@ void DerivationGoal::registerOutputs()
                 ValidPathInfo checkInfo;
                 Path checkFinal = finaliseContentOutput(worker.store, actualPath,
                     i.first, storePathToName(path), allPaths, checkInfo.references,
-                    checkInfo.hash, checkInfo.narSize);
+                    checkInfo.hash, checkInfo.narSize, goonixFinalOutputs);
+                goonixFinalOutputs[path] = checkFinal;
                 checkInfo.path = checkFinal;
                 checkInfo.deriver = drvPath;
                 if (!worker.store.isValidPath(checkFinal))
@@ -3323,7 +3327,8 @@ void DerivationGoal::registerOutputs()
             info.path = path;
             Path final = finaliseContentOutput(worker.store, actualPath,
                 i.first, storePathToName(path), allPaths, info.references,
-                info.hash, info.narSize);
+                info.hash, info.narSize, goonixFinalOutputs);
+            goonixFinalOutputs[path] = final;
             info.path = final;
             info.deriver = drvPath;
             infos.push_back(info);
