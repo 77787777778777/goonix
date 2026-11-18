@@ -794,15 +794,19 @@ static void performOp(bool trusted, unsigned int clientVersion,
         auto records = dynamic_cast<LocalStore *>(store.get())
             ->queryGoonixBuildRecords(hash, output);
         stopWork();
-        writeInt(records.size(), to);
+        /* One list of strings, six per record: a type that the client's
+           (guix serialization) has, so that the module stays upstream's.
+           Its text is part of the derivations of most packages.  */
+        Strings fields;
         for (auto & record : records) {
-            writeString(record.resolvedDerivation, to);
-            writeString(record.output, to);
-            writeString(record.path, to);
-            writeString(record.origin, to);
-            writeInt(record.relocationChecked, to);
-            writeString(record.signature, to);
+            fields.push_back(record.resolvedDerivation);
+            fields.push_back(record.output);
+            fields.push_back(record.path);
+            fields.push_back(record.origin);
+            fields.push_back(record.relocationChecked ? "1" : "0");
+            fields.push_back(record.signature);
         }
+        writeStrings(fields, to);
         break;
     }
 

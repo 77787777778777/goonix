@@ -312,9 +312,10 @@ Return #t on success."
 
   (define (query-build-records (base16 resolved-hash)
                                (utf8-string output))
-    "Return signed records of a resolved derivation output."
+    "Return the signed records of a resolved derivation output as one list
+of strings, six per record; see 'build-records' in (guix ca)."
     id: 83
-    returns: build-records))
+    returns: string-list))
 
 (define-syntax remote-procedure-id
   (syntax-rules ()

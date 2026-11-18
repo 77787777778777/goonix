@@ -247,20 +247,6 @@ substitute invalid byte sequences with question marks.  This is a
 (define write-store-path-list write-string-list)
 (define read-store-path-list read-string-list)
 
-(define (read-build-records port)
-  ;; goonix: each record is four strings, an integer flag, and a signature.
-  (let ((count (read-int port)))
-    (let loop ((remaining count) (records '()))
-      (if (zero? remaining)
-          (reverse records)
-          (let ((record (list (read-string port)
-                              (read-string port)
-                              (read-string port)
-                              (read-string port)
-                              (read-int port)
-                              (read-string port))))
-            (loop (- remaining 1) (cons record records)))))))
-
 (define-syntax write-literal-strings
   (lambda (s)
     "Write the given literal strings to PORT in an optimized fashion, without
@@ -385,7 +371,6 @@ value."
   (store-path      read-store-path write-store-path)
   (store-path-list read-store-path-list write-store-path-list)
   (base16          read-base16 write-base16)
-  (build-records   read-build-records write-build-records/not-implemented)
   (path-info       read-path-info write-path-info/not-implemented)
   (substitutable-path-list read-substitutable-path-list
                            write-substitutable-path-list/not-implemented)
