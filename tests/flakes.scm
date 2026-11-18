@@ -12,6 +12,7 @@
 (define-module (test-flakes)
   #:use-module (guix flakes)
   #:use-module (guix flakes checkout)
+  #:use-module ((guix git) #:select (%repository-cache-directory))
   #:use-module (guix tests git)
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
   #:use-module (git)
@@ -395,5 +396,55 @@
                         (not (eq? a/c b/c))
                         (equal? (flake-lock->sexp lock-data)
                                 (flake-lock->sexp (lock-flake project))))))))))))))
+
+(test-assert "same-as takes the other lock's pin without running outputs"
+  (with-temporary-git-repository dependency
+      '((add "tracked.txt" "dependency") (commit "initial"))
+    (call-with-temporary-directory
+     (lambda (root)
+       (let ((other (string-append root "/other"))
+             (project (string-append root "/project")))
+         (mkdir other) (mkdir project)
+         (write-manifest other
+                         (format #f "(flake (format 1) (inputs (shared (local ~s))))"
+                                 dependency))
+         (lock-flake other)
+         (write-manifest project
+                         (format #f "(flake (format 1) (inputs (shared (same-as ~s shared))) (outputs (lambda (in) (error \"locking evaluated outputs\"))))"
+                                 other))
+         (let* ((lock-data (lock-flake project))
+                (input (first (flake-lock-inputs lock-data))))
+           (and (= 1 (length (flake-lock-inputs lock-data)))
+                (equal? (locked-input-commit input)
+                        (locked-input-commit
+                         (first (flake-lock-inputs
+                                 (read-flake-lock (string-append other "/flake.lock"))))))
+                (eq? 'same-as
+                     (lock-edge-kind (first (locked-input-edges input)))))))))))
+
+(test-assert ".guix-channel dependencies are inert locked library inputs"
+  (with-temporary-git-repository dependency
+      '((add "library.scm" "(define-module (library))") (commit "initial"))
+    (call-with-temporary-directory
+     (lambda (project)
+       (write-manifest project
+                       "(flake (format 1) (outputs (lambda (in) (error \"locking evaluated outputs\"))))")
+       (call-with-output-file (string-append project "/.guix-channel")
+         (lambda (port)
+           (format port "(channel (version 0) (dependencies ((name library) (url ~s) (branch \"master\"))))"
+                   (string-append "file://" dependency))))
+       (let* ((cache (string-append project "/repository-cache"))
+              (lock-data (parameterize ((%repository-cache-directory cache))
+                           (lock-flake project)))
+              (input (first (flake-lock-inputs lock-data)))
+              (isolated (parameterize ((%repository-cache-directory cache))
+                          (lock-flake project))))
+         (and (= 1 (length (flake-lock-inputs lock-data)))
+              (eq? 'library (locked-input-as input))
+              (equal? (string-append "file://" dependency) (locked-input-url input))
+              (equal? (invoke-git dependency "rev-parse" "HEAD")
+                      (locked-input-commit input))
+              (equal? (flake-lock->sexp lock-data)
+                      (flake-lock->sexp isolated)))))))))
 
 (test-end)

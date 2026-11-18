@@ -120,7 +120,15 @@
                          directory)))
          (manifest (call-with-input-file (string-append source "/flake.scm")
                      (lambda (port) (read port))))
-         (declared (or (and=> (assq 'inputs (cdr manifest)) cdr) '()))
+         (declared (append
+                   (or (and=> (assq 'inputs (cdr manifest)) cdr) '())
+                   (map (lambda (input)
+                          `(,(flake-input-name input) (as ,(flake-input-as input))))
+                        (filter (lambda (input)
+                                  (not (assoc (flake-input-name input)
+                                              (or (and=> (assq 'inputs (cdr manifest)) cdr)
+                                                  '()))))
+                                (channel-inputs source)))))
          (locked-trees
           (map (lambda (spec)
                  (let* ((name (car spec))

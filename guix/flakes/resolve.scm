@@ -11,6 +11,7 @@
 
 (define-module (guix flakes resolve)
   #:use-module ((guix flakes syntax) #:select (sexp->input read-flake read-data-file
+                        make-flake flake-input
                         flake-inputs flake-input-name flake-input-type
                         flake-input-url flake-input-path flake-input-branch
                         flake-input-tag flake-input-commit flake-input-as
@@ -31,7 +32,7 @@
   #:use-module (srfi srfi-11)
   #:export (lock-flake update-flake verify-flake-lock
             read-local-overrides effective-flake-lock
-            flake-metadata))
+            flake-metadata channel-inputs declared-inputs))
 
 (define (lock-file directory)
   (string-append directory "/flake.lock"))
@@ -73,6 +74,8 @@
 
 (define (resolve-input input path kind target)
   "Resolve INPUT without evaluating its outputs.  PATH is its dependency path."
+  (when (eq? 'same-as (flake-input-type input))
+    (error "unresolved same-as input" (flake-input-name input)))
   (let* ((snapshot
           (case (flake-input-type input)
             ((local)
@@ -123,6 +126,69 @@
       (and=> (assoc child (flake-input-follows input))
              (lambda (pair) (cons 'follows (cdr pair))))))
 
+(define (channel-dependency->input dependency)
+  (match dependency
+    ((('name name) ('url url) . properties)
+     (let ((branch (assoc-ref properties 'branch))
+           (commit (assoc-ref properties 'commit)))
+       (flake-input
+        (name name) (type 'git) (url url)
+        (branch (and branch (car branch)))
+        (commit (and commit (car commit)))
+        (as 'library))))
+    (_ (error "invalid .guix-channel dependency" dependency))))
+
+(define (channel-inputs directory)
+  "Read .guix-channel dependencies as inert data, never as channel code."
+  (let ((file (string-append directory "/.guix-channel")))
+    (if (file-exists? file)
+        (match (read-data-file file)
+          (('channel ('version 0) properties ...)
+           (map channel-dependency->input
+                (or (assoc-ref properties 'dependencies) '())))
+          (_ (error "unsupported .guix-channel file" file)))
+        '())))
+
+(define (same-as-input directory input)
+  "Take INPUT's source and pin from another flake's lock."
+  (match (flake-input-same-as input)
+    ((source name)
+     (let* ((other (if (or (string-prefix? "/" source)
+                           (string-prefix? "./" source)
+                           (string-prefix? "../" source))
+                       (canonicalize-path
+                        (if (string-prefix? "/" source) source
+                            (string-append directory "/" source)))
+                       source))
+            (lock (read-flake-lock (string-append other "/flake.lock")))
+            (shared (or (find (lambda (item)
+                                (eq? name (locked-input-name item)))
+                              (flake-lock-inputs lock))
+                        (error "same-as names an unknown input" source name))))
+       (flake-input
+        (name (flake-input-name input))
+        (type (locked-input-type shared))
+        (url (locked-input-url shared))
+        (path (locked-input-path shared))
+        (branch (locked-input-branch shared))
+        (tag (locked-input-tag shared))
+        (commit (locked-input-commit shared))
+        (as (locked-input-as shared))
+        (options (flake-input-options input)))))
+    (_ input)))
+
+(define (declared-inputs directory flake)
+  "Return declared inputs plus inert .guix-channel dependencies."
+  (let ((declared (flake-inputs flake))
+        (channels (channel-inputs directory)))
+    (append declared
+            (filter (lambda (channel)
+                      (not (find (lambda (input)
+                                   (eq? (flake-input-name input)
+                                        (flake-input-name channel)))
+                                 declared)))
+                    channels))))
+
 (define* (lock-flake directory #:key (update '()) (local-overrides '())
                      (write? #t))
   "Resolve the complete dependency graph without running any flake outputs."
@@ -167,16 +233,18 @@
              (existing (assoc key table)))
         (if existing
             (cdr existing)
-            (let* ((override (and (null? path) (assoc name local-overrides)))
-                   (effective (if override
-                                  (sexp->input (cons name (cdr override))) input))
-                   (kind (if override 'replaced kind))
+             (let* ((override (and (null? path) (assoc name local-overrides)))
+                    (effective (same-as-input directory
+                                             (if override
+                                                 (sexp->input (cons name (cdr override))) input)))
+                   (kind (if (flake-input-same-as input) 'same-as
+                             (if override 'replaced kind)))
                    (previous (previous-for path name))
                    (reuse? (and previous (null? path) (not override)
                                 (not (eq? update #t)) (not (memq name update))
                                 (same-source? effective previous)
                                 (not (eq? 'local (flake-input-type effective)))))
-                   (locked (if reuse? previous
+                   (locked (if reuse? (restore-locked-checkout previous)
                                (resolve-input effective path kind target))))
               (set! table (acons key locked table))
               (set! resolved (append resolved (list locked)))
@@ -199,12 +267,16 @@
                  (flake-lock-inputs
                   (read-flake-lock (string-append (locked-input-checkout locked)
                                                   "/flake.lock")))))
-               ((and (eq? 'flake (flake-input-as effective))
-                     (file-exists? (string-append
-                                    (locked-input-checkout locked) "/flake.scm")))
-                (let ((child-flake (read-flake
-                                    (string-append (locked-input-checkout locked)
-                                                   "/flake.scm"))))
+               ((and (memq (flake-input-as effective) '(flake library))
+                     (or (file-exists? (string-append
+                                        (locked-input-checkout locked) "/flake.scm"))
+                         (file-exists? (string-append
+                                        (locked-input-checkout locked) "/.guix-channel"))))
+                (let* ((manifest-file (string-append (locked-input-checkout locked)
+                                                    "/flake.scm"))
+                       (child-flake (if (file-exists? manifest-file)
+                                        (read-flake manifest-file)
+                                        (make-flake 1 "" #f '() '() #f #f))))
                   (for-each
                    (lambda (child)
                      (let* ((child-name (flake-input-name child))
@@ -238,14 +310,14 @@
                                           (pinned? 'pinned)
                                           (else 'direct))
                                     (and replacement (cdr replacement)) pinned?)))
-                   (flake-inputs child-flake)))))
+                   (declared-inputs (locked-input-checkout locked) child-flake)))))
               locked))))
 
     (for-each (lambda (input)
                 (resolve-one input '()
                              (if (flake-input-pinned? input) 'pinned 'direct)
                              #f #f))
-              (flake-inputs flake))
+              (declared-inputs directory flake))
     (let ((result (flake-lock (version 1) (inputs resolved))))
       (when (and write? (null? local-overrides))
         (unless (and old (equal? (flake-lock->sexp old)
@@ -284,6 +356,30 @@
     (if (null? overrides)
         (read-flake-lock (lock-file directory))
         (lock-flake directory #:local-overrides overrides #:write? #f))))
+
+(define (restore-locked-checkout locked)
+  "Restore LOCKED's immutable checkout without changing its pinned content."
+  (if (and (locked-input-checkout locked)
+           (file-exists? (locked-input-checkout locked)))
+      locked
+      (let* ((path (locked-input-path locked))
+             (snapshot
+              (case (locked-input-type locked)
+                ((local) (tracked-tree (or path
+                                           (error "missing local input source"
+                                                  (locked-input-name locked)))
+                                      #:commit (locked-input-commit locked)
+                                      #:worktree? (locked-input-worktree? locked)))
+                ((git) (resolve-git-input (locked-input-url locked)
+                                          #:commit (locked-input-commit locked))))))
+        (unless (and (equal? (locked-input-commit locked)
+                             (tree-snapshot-commit snapshot))
+                     (equal? (locked-input-tree-hash locked)
+                             (tree-snapshot-hash snapshot)))
+          (error "locked checkout content differs from lock" locked))
+        (verify-tree-snapshot snapshot)
+        (locked-input (inherit locked)
+                      (checkout (tree-snapshot-directory snapshot))))))
 
 (define (verify-flake-lock directory)
   "Verify each locked checkout against its commit and content fingerprint."

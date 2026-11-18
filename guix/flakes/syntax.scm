@@ -16,7 +16,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-35)
-  #:export (flake?
+  #:export (flake? flake make-flake flake-input
             flake-format flake-description flake-modules
             flake-inputs flake-options flake-outputs-expression
             flake-source
@@ -186,12 +186,20 @@
             (worktree? (flag? properties 'worktree))
             (pinned? (flag? properties 'pinned))
             (as (single properties 'as 'flake))
+            (same-as (let ((values (multiple properties 'same-as)))
+                       (and (pair? values) values)))
             (nested (multiple properties 'inputs))
             (options (multiple properties 'options)))
-       (unless type
-         (data-error datum "input '~a' needs exactly one (git URL) or (local PATH)"
-                     name))
-       (unless (or (and (eq? type 'git) (string? git) (not local))
+       (unless (or type same-as)
+         (data-error datum "input '~a' needs a source or same-as" name))
+       (when same-as
+         (match same-as
+           (((? string? source) (? valid-name? other))
+            (unless (not type) (data-error datum "same-as input has its own source"))
+            (set! type 'same-as))
+           (_ (data-error datum "same-as expects (PATH-OR-URL NAME)"))))
+       (unless (or (eq? type 'same-as)
+                   (and (eq? type 'git) (string? git) (not local))
                    (and (eq? type 'local) (string? local) (not git)))
          (data-error datum "invalid URL or local path for input '~a'" name))
        (when (and (eq? type 'local) (or branch tag))
@@ -232,26 +240,33 @@
         (options options)
         (introduction (and=> (single properties 'introduction #f)
                              sexp->introduction))
-        (same-as (single properties 'same-as #f))))))
+        (same-as same-as)))))
 
 (define (flake-input->sexp input)
   "Return INPUT as a validated, serializable input declaration."
   `(,(flake-input-name input)
-    ,(case (flake-input-type input)
-       ((git) `(git ,(flake-input-url input)))
-       ((local) `(local ,(flake-input-path input))))
+    ,@(case (flake-input-type input)
+        ((git) `((git ,(flake-input-url input))))
+        ((local) `((local ,(flake-input-path input))))
+        ((same-as) '())
+        (else (error "invalid input type" (flake-input-type input))))
     ,@(if (flake-input-branch input) `((branch ,(flake-input-branch input))) '())
     ,@(if (flake-input-tag input) `((tag ,(flake-input-tag input))) '())
     ,@(if (flake-input-commit input) `((commit ,(flake-input-commit input))) '())
     ,@(if (eq? 'flake (flake-input-as input)) '() `((as ,(flake-input-as input))))
     ,@(if (flake-input-worktree? input) '((worktree)) '())
     ,@(if (flake-input-pinned? input) '((pinned)) '())
+    ,@(if (flake-input-same-as input) `((same-as ,(flake-input-same-as input))) '())
+    ,@(if (flake-input-introduction input)
+          `((introduction ,(flake-input-introduction input))) '())
     ,@(if (null? (flake-input-options input)) '()
           `((options ,(flake-input-options input))))
-    ,@(if (null? (flake-input-follows input)) '()
+    ,@(if (and (null? (flake-input-follows input))
+               (null? (flake-input-overrides input))) '()
           `((inputs ,@(map (lambda (edge)
                             `(,(car edge) follows ,(cdr edge)))
-                          (flake-input-follows input)))))))
+                          (flake-input-follows input))
+                    ,@(flake-input-overrides input))))))
 
 (define (sexp->flake datum source)
   (match datum

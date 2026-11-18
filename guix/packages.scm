@@ -197,7 +197,7 @@
             package->bag
             bag->derivation
 
-            %package-overrides
+            %package-overrides ;goonix: lowering-time overrides
             package-override-key
             with-package-overrides
             bag-direct-inputs

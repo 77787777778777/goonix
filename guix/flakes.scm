@@ -36,4 +36,5 @@
                read-flake-lock read-flake-local write-flake-lock
                flake-lock->sexp
                lock-flake update-flake verify-flake-lock
-               read-local-overrides effective-flake-lock flake-metadata))
+               read-local-overrides effective-flake-lock flake-metadata
+               channel-inputs declared-inputs))
