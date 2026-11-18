@@ -50,10 +50,11 @@
   #:use-module ((guix progress) #:select (current-terminal-columns))
   #:autoload   (guix build syscalls) (terminal-columns)
   #:use-module (guix transformations)
-  #:autoload   (guix pure-eval) (load-file-purely)
+  #:autoload   (guix pure-eval) (pure-build-derivations) ;goonix: --pure-eval
   #:autoload   (guix scripts flake) (flake-reference? ;goonix: DIRECTORY#NAME
                                      flake-package-derivation)
   #:export (log-url
+            options->derivations         ;goonix: for the evaluator
 
             %standard-build-options
             %standard-cross-build-options
@@ -446,7 +447,7 @@ Build the given PACKAGE-OR-DERIVATION and return their output paths.\n"))
   -m, --manifest=FILE    build the packages that the manifest given in FILE
                          evaluates to"))
   (display (G_ "
-      --pure-eval        evaluate FILE from its tracked tree in a container")) ;goonix: CLI hook
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
   (display (G_ "
   -D, --development      build the inputs of the following package"))
   (display (G_ "
@@ -537,7 +538,7 @@ must be one of 'package', 'all', or 'transitive'~%")
          (option '(#\m "manifest") #t #f
                  (lambda (opt name arg result)
                    (alist-cons 'manifest arg result)))
-         (option '("pure-eval") #f #f
+         (option '("pure-eval") #f #f              ;goonix: CLI hook
                  (lambda (opt name arg result)
                    (alist-cons 'pure-eval? #t result)))
          (option '(#\D "development") #f #f
@@ -645,8 +646,6 @@ values.")))))))))
                                 file)))
     x)
 
-  (define pure-eval? (assoc-ref opts 'pure-eval?))
-
   (define system
     (or (assoc-ref opts 'system) (%current-system)))
 
@@ -716,11 +715,7 @@ values.")))))))))
             (loop tail 'regular
                   (append (append-map
                            for-type
-                           (ensure-list
-                            (if pure-eval?
-                                (map read-derivation-from-file
-                                     (load-file-purely store file))
-                                (load* file '()))))
+                           (ensure-list (load* file '())))
                           result))))
          (('manifest . manifest)
           ;; Otherwise '--system' is ignored.
@@ -887,7 +882,9 @@ needed."
                          ;; calls 'gexp->derivation').
                          (%graft?                  graft?))
             (let* ((mode  (assoc-ref opts 'build-mode))
-                   (drv   (options->derivations store opts))
+                   (drv   (if (assoc-ref opts 'pure-eval?) ;goonix: --pure-eval
+                              (pure-build-derivations store opts)
+                              (options->derivations store opts)))
                    (items (filter-map (match-lambda
                                         (('argument . (? store-path? file))
                                          ;; If FILE is a .drv that's not in

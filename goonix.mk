@@ -29,6 +29,7 @@ SCM_TESTS +=					\
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
   tests/guix-pure-eval.sh			\
+  tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\
   tests/guix-flake-shell.sh
 

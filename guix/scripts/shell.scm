@@ -23,6 +23,7 @@
   #:use-module (guix scripts environment)
   #:autoload   (guix scripts flake) (resolve-flake-shell-reference ;goonix: flake shells
                                      flake-default-shell-options)
+  #:autoload   (guix pure-eval) (pure-shell-options) ;goonix: --pure-eval
   #:autoload   (guix scripts build) (show-build-options-help
                                      show-native-build-options-help)
   #:autoload   (guix transformations) (options->transformation
@@ -71,6 +72,8 @@ interactive shell in that environment.\n"))
   -q                     inhibit loading of 'guix.scm' and 'manifest.scm'"))
   (display (G_ "
       --rebuild-cache    rebuild cached environment, if any"))
+  (display (G_ "
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
   (display (G_ "
       --export-manifest  print a manifest for the given options"))
   (display (G_ "
@@ -147,6 +150,9 @@ interactive shell in that environment.\n"))
               (option '("rebuild-cache") #f #f
                       (lambda (opt name arg result)
                         (alist-cons 'rebuild-cache? #t result)))
+              (option '("pure-eval") #f #f         ;goonix: CLI hook
+                      (lambda (opt name arg result)
+                        (alist-cons 'pure-eval? #t result)))
 
               (option '(#\F "emulate-fhs") #f #f
                       (lambda (opt name arg result)
@@ -184,13 +190,14 @@ interactive shell in that environment.\n"))
                                  args-parsed)
                      args-parsed)))
       (options-with-caching
-       (auto-detect-manifest
+       (pure-shell-options              ;goonix: --pure-eval, a profile of its own
+        (auto-detect-manifest
         ;; goonix: a flake reference stands for the profile of its shell.
         (resolve-flake-shell-reference
          (match command
            (() opts)
            (("--") opts)
-           (("--" command ...) (alist-cons 'exec command opts)))))))))
+           (("--" command ...) (alist-cons 'exec command opts))))))))))
 
 (define (find-file-in-parent-directories candidates)
   "Find one of CANDIDATES in the current directory or one of its ancestors."
