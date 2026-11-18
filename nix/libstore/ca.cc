@@ -209,7 +209,8 @@ void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
         output.second.path = tokenPath(output.first, outputName);
         resolved.env[output.first] = output.second.path;
     }
-    resolved.env["goonixResolved"] = "1";
+    /* The resolver hashes the token-form resolved derivation before adding
+       goonixResolved; the marker is stripped from builder environments. */
     const string provisionalBytes = unparseDerivation(resolved);
     for (auto & output : drv.outputs) {
         bool recursive;

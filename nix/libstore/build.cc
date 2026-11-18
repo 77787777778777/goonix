@@ -3301,15 +3301,27 @@ void DerivationGoal::registerOutputs()
             canonicalisePathMetaData(actualPath,
                 buildUser.enabled() ? buildUser.getUID() : -1, inodesSeen);
             auto & localStore = dynamic_cast<LocalStore &>(worker.store);
+            Path finalisationPath = actualPath;
+            if (useChroot) {
+                /* The sandbox's nested store is not the daemon's store.
+                   Move the token tree out first, preserving symlinks. */
+                Path staged = settings.nixStore + "/.goonix-tmp-" +
+                    std::to_string(getpid()) + "-" + i.first;
+                if (pathExists(staged)) deletePath(staged);
+                if (rename(actualPath.c_str(), staged.c_str()) != 0)
+                    copyFileRecursively(actualPath, staged, true);
+                finalisationPath = staged;
+            }
             if (buildMode == bmCheck) {
                 /* --check builds again and compares content addresses.  A
                    different result is stored as a second record for the same
                    resolved derivation: two records ARE the reproducibility
                    detection (plan 3.3, 10).  The choice is left untouched. */
                 ValidPathInfo checkInfo;
-                Path checkFinal = finaliseContentOutput(worker.store, actualPath,
+                Path checkFinal = finaliseContentOutput(worker.store, path,
                     i.first, storePathToName(path), allPaths, checkInfo.references,
-                    checkInfo.hash, checkInfo.narSize, goonixFinalOutputs);
+                    checkInfo.hash, checkInfo.narSize, goonixFinalOutputs,
+                    finalisationPath);
                 goonixFinalOutputs[path] = checkFinal;
                 checkInfo.path = checkFinal;
                 checkInfo.deriver = drvPath;
@@ -3325,9 +3337,9 @@ void DerivationGoal::registerOutputs()
             }
             ValidPathInfo info;
             info.path = path;
-            Path final = finaliseContentOutput(worker.store, actualPath,
+            Path final = finaliseContentOutput(worker.store, path,
                 i.first, storePathToName(path), allPaths, info.references,
-                info.hash, info.narSize, goonixFinalOutputs);
+                info.hash, info.narSize, goonixFinalOutputs, finalisationPath);
             goonixFinalOutputs[path] = final;
             info.path = final;
             info.deriver = drvPath;
