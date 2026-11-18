@@ -131,7 +131,12 @@ trySubstitute config rootFd store settings trace path = do
                   _ -> throwIO (storeError "unsupported substitute hash")
                 exists <- Files.fileExist path
                 unless exists $ throwIO (storeError ("substitute did not produce path `" ++ C.unpack path ++ "'"))
-                registerPath store path (Hash SHA256 digest) size references deriver
+                (actualHash, actualSize) <- canonicaliseAndHash store path
+                when (hashDigest actualHash /= digest) $ do
+                  deleteTree path
+                  throwIO (storeError ("corrupt output path `" ++ C.unpack path ++ "' from substitute"))
+                deduplicateTree (storeDirectory store) path
+                registerPath store path actualHash actualSize references deriver
                 traceOutput trace ("@ substituter-succeeded " <> path <> "\n")
                 pure True
 
@@ -265,6 +270,7 @@ registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \outp
   unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' did not produce output `" ++ C.unpack path ++ "'"))
   _ <- canonicaliseAndHash store path
   when (not (B.null (outputHash output))) $ verifyFixedOutput output path
+  deduplicateTree (storeDirectory store) path
   (refs, hash) <- scanOutputReferences store path
   size <- fromIntegral . B.length <$> dumpNar path
   registerPath store path hash size refs drvPath
