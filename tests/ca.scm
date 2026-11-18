@@ -351,46 +351,95 @@
          1 (scan-report-hidden (scan-store-item item))))))
   (let ((scan-compressed (@@ (guix ca scan) scan-compressed))
         (hash (string->utf8 "0123456789abcdfghijklmnpqrsvwxyz")))
+    (define (compressed-file root name body)
+      (let ((file (string-append root "/" name)))
+        (call-with-output-file file body)
+        file))
     (test-equal "compressed data beyond the scan limit is not silently clean"
       1
       (call-with-temporary-directory
        (lambda (root)
-         (let ((file (string-append root "/long.gz")))
-           (call-with-output-file file
-             (lambda (port)
-               (call-with-gzip-output-port port
-                 (lambda (output)
-                   (display (make-string 128 #\x) output)))))
-           (assq-ref (scan-compressed hash file 16) 'unsupported)))))
-    (test-equal "a zlib decoder error is counted as undecodable"
-      '((undecodable . 1))
-      (let ((saved (module-ref (resolve-module '(guix ca scan))
-                               'scan-decoded)))
-        (module-set! (resolve-module '(guix ca scan)) 'scan-decoded
-                     (lambda _ (throw 'zlib-error)))
-        (let ((result
-               (call-with-temporary-directory
-                (lambda (root)
-                  (let ((file (string-append root "/valid.gz")))
-                    (call-with-output-file file
+         (let ((file (compressed-file
+                      root "long.gz"
                       (lambda (port)
                         (call-with-gzip-output-port port
-                          (lambda (output) (display "valid" output)))))
-                    (scan-compressed hash file))))))
-          (module-set! (resolve-module '(guix ca scan)) 'scan-decoded saved)
-          result)))
-    (test-equal "a missing compression module is not undecodable data"
-      'missing-module
-      (let ((saved (module-ref (resolve-module '(guix ca scan))
-                               'open-decoder)))
-        (module-set! (resolve-module '(guix ca scan)) 'open-decoder
-                     (lambda args (throw 'missing-module)))
-        (let ((result
-               (catch 'missing-module
-                 (lambda () (scan-compressed hash "/dev/null.gz") #f)
-                 (lambda _ 'missing-module))))
-          (module-set! (resolve-module '(guix ca scan)) 'open-decoder saved)
-          result))))
+                          (lambda (output)
+                            (display (make-string 128 #\x) output)))))))
+           (assq-ref (scan-compressed hash file 16) 'unsupported)))))
+    (test-equal "a truncated gzip member is undecodable"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (compressed-file
+                      root "truncated.gz"
+                      (lambda (port)
+                        (call-with-gzip-output-port port
+                          (lambda (output)
+                            (display (make-string 16384 #\x) output)))))))
+           (truncate-file file 64)
+           (assq-ref (scan-compressed hash file) 'undecodable)))))
+    (test-equal "a damaged gzip body is undecodable"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (compressed-file
+                      root "body.gz"
+                      (lambda (port)
+                        (call-with-gzip-output-port port
+                          (lambda (output) (display "contents" output)))))))
+           (call-with-output-file file
+             (lambda (port)
+               (seek port 10 SEEK_SET)
+               (put-bytevector port (make-bytevector 128 255)))
+             #:binary #t)
+           (assq-ref (scan-compressed hash file) 'undecodable)))))
+    (test-equal "a non-gzip file with a gzip suffix is undecodable"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (compressed-file root "garbage.gz"
+                                      (lambda (port)
+                                        (display "not gzip" port)))))
+           (assq-ref (scan-compressed hash file) 'undecodable)))))
+    (test-equal "concatenated gzip members are not silently incomplete"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((first (compressed-file
+                       root "first.gz"
+                       (lambda (port)
+                         (call-with-gzip-output-port port
+                           (lambda (output) (display "first" output))))))
+               (second (string-append root "/second")))
+           (call-with-output-file second
+             (lambda (port)
+               (call-with-gzip-output-port port
+                 (lambda (output) (display "second" output)))))
+           (call-with-input-file second
+             (lambda (input)
+               (let ((output (open-file first "al")))
+                 (put-bytevector output (get-bytevector-all input))
+                 (close-port output)))
+             #:binary #t)
+           (assq-ref (scan-compressed hash first) 'unsupported)))))
+    (test-equal "an empty gzip file is not decoded"
+      '()
+      (call-with-temporary-directory
+       (lambda (root)
+         (scan-compressed hash (compressed-file root "empty.gz" (const #t))))))
+    (test-equal "an old lzma-alone member is unsupported, not damaged"
+      1
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (compressed-file
+                      root "old.lzma"
+                      (lambda (port) (display "old" port)))))
+           (assq-ref (scan-compressed hash file) 'unsupported)))))
+    (test-equal "a non-decoder open error escapes unchanged"
+      'system-error
+      (catch 'system-error
+        (lambda () (scan-compressed hash "/no/such/file.gz") #f)
+        (lambda _ 'system-error))))
   (call-with-temporary-directory
    (lambda (root)
      (let ((name "0123456789abcdfghijklmnpqrsvwxyz-cli"))

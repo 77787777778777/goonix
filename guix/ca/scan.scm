@@ -18,7 +18,7 @@
   #:use-module (ice-9 iconv)
   #:use-module (rnrs bytevectors)
   #:use-module ((guix store) #:select (%store-prefix))
-  #:autoload (zlib) (make-gzip-input-port)
+  #:autoload (zlib) (make-gzip-input-port make-zlib-input-port)
   #:autoload (lzma) (make-xz-input-port)
   #:export (<scan-report>
             scan-report?
@@ -145,7 +145,8 @@ Every occurrence counts, also one that overlaps the one before."
         (cons 'fragments (apply + (map fragments (iota 25))))
         (cons 'utf16 (length (owned (latin1 (utf16-le-bytes hash)))))))
 
-(define* (scan-port hash port limit #:key (chunk-size (* 128 1024)))
+(define* (scan-port hash port limit #:key (chunk-size (* 128 1024))
+                    (count-bytes? #f))
   "Read at most LIMIT bytes from PORT, CHUNK-SIZE at a time, and return what
 'scan-bytes' returns for all of them at once.
 
@@ -164,7 +165,9 @@ DECIDED is the offset up to which occurrences are already counted."
            (to (if last? size (max decided (- size %right-context))))
            (totals (add-counts totals (scan-bytes hash bytes decided to))))
       (if last?
-          totals
+          (if count-bytes?
+              (add-counts totals (list (cons 'decoded-bytes (- limit remaining))))
+              totals)
           (let ((keep (min size %retained)))
             (loop (substring-bytes bytes (- size keep) keep)
                   (- to (- size keep))
@@ -173,47 +176,89 @@ DECIDED is the offset up to which occurrences are already counted."
 
 (define (compressed-kind file)
   (cond ((string-suffix? ".gz" file) 'gzip)
-        ((or (string-suffix? ".xz" file) (string-suffix? ".lzma" file)) 'xz)
+        ((string-suffix? ".xz" file) 'xz)
+        ((string-suffix? ".lzma" file) 'unsupported-lzma)
         ((string-suffix? ".bz2" file) 'unsupported-bzip2)
         ((any (lambda (suffix) (string-suffix? suffix file))
               '(".zip" ".jar" ".whl" ".egg" ".war" ".apk" ".epub" ".odt"))
          'unsupported-zip)
         (else #f)))
 
+(define (drain-byte-count port)
+  "Read PORT to EOF and return its byte count."
+  (let loop ((count 0))
+    (let ((chunk (get-bytevector-n port (* 128 1024))))
+      (if (eof-object? chunk)
+          count
+          (loop (+ count (bytevector-length chunk)))))))
+
 (define (open-decoder file kind)
   "Open FILE's decoder after resolving its module; installation errors escape."
   (resolve-interface (case kind ((gzip) '(zlib)) ((xz) '(lzma))))
   (let ((port (open-file file "r0")))
     (case kind
-      ((gzip) (make-gzip-input-port port))
+      ((gzip) (make-zlib-input-port port #:format 'gzip))
       ((xz) (make-xz-input-port port #:close? #t)))))
 
 (define (scan-decoded hash input limit)
   "Scan INPUT and report whether decompression exceeded LIMIT."
-  (let* ((counts (scan-port hash input limit))
+  (let* ((counts (scan-port hash input limit #:count-bytes? #t))
          (extra (get-bytevector-n input 1)))
     (append (list (cons 'hidden (or (assq-ref counts 'full) 0)))
-            (if (eof-object? extra) '() '((unsupported . 1))))))
+            (if (eof-object? extra) '() '((unsupported . 1)))
+            (list (cons 'decoded-bytes
+                        (+ (or (assq-ref counts 'decoded-bytes) 0)
+                           (if (eof-object? extra) 0 1)))))))
+
+(define (scan-gzip hash file limit)
+  "Scan one gzip member strictly and reject unexamined additional members."
+  (let ((input (open-decoder file 'gzip)))
+    (dynamic-wind
+      (const #f)
+      (lambda ()
+        (catch 'zlib-error
+          (lambda () (scan-decoded hash input limit))
+          (lambda _ '((undecodable . 1)))))
+      (lambda () (close-port input)))))
+
+(define (gzip-all-byte-count file)
+  "Return the total decompressed size using the multi-member gzip reader."
+  (let* ((port (open-file file "r0"))
+         (input (make-gzip-input-port port)))
+    (let ((count (drain-byte-count input)))
+      (close-port input)
+      count)))
 
 (define* (scan-compressed hash file #:optional (limit (* 64 1024 1024)))
   "Return hidden self references, or a decoder/limit coverage counter."
   (let ((kind (compressed-kind file)))
-    (if (memq kind '(gzip xz))
-        (let ((input (open-decoder file kind)))
-          (dynamic-wind
-            (const #f)
-            (lambda ()
-              (if (eq? kind 'gzip)
-                  (catch 'zlib-error
-                    (lambda () (scan-decoded hash input limit))
-                    (lambda _ '((undecodable . 1))))
-                  (guard (condition
-                          (((module-ref (resolve-interface '(lzma))
-                                        'lzma-error?) condition)
-                           '((undecodable . 1))))
-                    (scan-decoded hash input limit))))
-            (lambda () (close-port input))))
-        (if kind '((unsupported . 1)) '()))))
+    (cond ((or (not kind) (zero? (stat:size (stat file)))) '())
+          ((eq? kind 'gzip)
+           (let* ((result (scan-gzip hash file limit))
+                  (complete?
+                   (and (not (assq-ref result 'undecodable))
+                        (not (assq-ref result 'unsupported))
+                        (= (or (assq-ref result 'decoded-bytes) 0)
+                           (gzip-all-byte-count file))))
+                  (public (alist-delete 'decoded-bytes result eq?)))
+             (if complete?
+                 public
+                 (if (assq-ref result 'undecodable)
+                     public
+                     (append public '((unsupported . 1)))))))
+          ((eq? kind 'xz)
+           (let ((input (open-decoder file 'xz)))
+             (dynamic-wind
+               (const #f)
+               (lambda ()
+                 (guard (condition
+                         (((module-ref (resolve-interface '(lzma))
+                                       'lzma-error?) condition)
+                          '((undecodable . 1))))
+                   (alist-delete 'decoded-bytes
+                                 (scan-decoded hash input limit) eq?)))
+               (lambda () (close-port input)))))
+          (else '((unsupported . 1))))))
 
 (define (store-directory-items directory)
   "Return sorted directory store items below DIRECTORY, without following links."

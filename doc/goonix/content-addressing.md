@@ -152,9 +152,11 @@ format prints the same counters in a readable line. `--directory=DIR` selects an
 `--jobs=N` scans at most N items concurrently (three by default), while
 retaining input order in the output.
 Unsupported compressed members and decoding failures are counted separately;
-they are not silently treated as clean. A gzip or xz member with more than
-64 MiB of decompressed data is marked `unsupported`. The gzip library can
-report EOF for some truncated or malformed members; such a stream is not
-provably clean and this command does not claim to detect all corruption.
-The scan is a measurement tool, not the daemon's build finaliser or its
-deep-scanning policy.
+they are not silently treated as clean. Gzip uses the strict inflate reader,
+so truncated, damaged and non-gzip data are `undecodable`. A separate
+multi-member reader detects output beyond the first member; such a file is
+`unsupported` rather than silently incomplete. Empty compressed files are
+not decoded. Old lzma-alone, bzip2 and ZIP-family members are `unsupported`.
+A gzip or xz member with more than 64 MiB of decompressed data is also
+`unsupported`. The scan is a measurement tool, not the daemon's build
+finaliser or its deep-scanning policy.
