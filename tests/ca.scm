@@ -356,7 +356,7 @@
         (call-with-output-file file body)
         file))
     (test-equal "compressed data beyond the scan limit is not silently clean"
-      1
+      '((hidden . 0) (unsupported . 1))
       (call-with-temporary-directory
        (lambda (root)
          (let ((file (compressed-file
@@ -365,7 +365,7 @@
                         (call-with-gzip-output-port port
                           (lambda (output)
                             (display (make-string 128 #\x) output)))))))
-           (assq-ref (scan-compressed hash file 16) 'unsupported)))))
+           (scan-compressed hash file 16)))))
     (test-equal "a truncated gzip member is undecodable"
       1
       (call-with-temporary-directory
@@ -387,11 +387,10 @@
                       (lambda (port)
                         (call-with-gzip-output-port port
                           (lambda (output) (display "contents" output)))))))
-           (call-with-output-file file
-             (lambda (port)
-               (seek port 10 SEEK_SET)
-               (put-bytevector port (make-bytevector 128 255)))
-             #:binary #t)
+           (let ((port (open-file file "r+b")))
+             (seek port 10 SEEK_SET)
+             (put-bytevector port (make-bytevector 128 255))
+             (close-port port))
            (assq-ref (scan-compressed hash file) 'undecodable)))))
     (test-equal "a non-gzip file with a gzip suffix is undecodable"
       1
@@ -422,6 +421,22 @@
                  (close-port output)))
              #:binary #t)
            (assq-ref (scan-compressed hash first) 'unsupported)))))
+    (test-equal "a whole gzip member followed by a damaged one is unsupported"
+      '((hidden . 0) (unsupported . 1))
+      (call-with-temporary-directory
+       (lambda (root)
+         (let ((file (compressed-file
+                      root "second-bad.gz"
+                      (lambda (port)
+                        (call-with-gzip-output-port port
+                          (lambda (output) (display "first" output)))))))
+           (call-with-gzip-output-port (open-file file "al")
+             (lambda (output) (display "second" output)))
+           (let ((port (open-file file "r+b")))
+             (seek port (- (stat:size (stat file)) 8) SEEK_SET)
+             (put-bytevector port (make-bytevector 4 255))
+             (close-port port))
+           (scan-compressed hash file)))))
     (test-equal "an empty gzip file is not decoded"
       '()
       (call-with-temporary-directory

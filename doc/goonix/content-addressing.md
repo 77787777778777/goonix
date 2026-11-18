@@ -153,10 +153,11 @@ format prints the same counters in a readable line. `--directory=DIR` selects an
 retaining input order in the output.
 Unsupported compressed members and decoding failures are counted separately;
 they are not silently treated as clean. Gzip uses the strict inflate reader,
-so truncated, damaged and non-gzip data are `undecodable`. A separate
-multi-member reader detects output beyond the first member; such a file is
-`unsupported` rather than silently incomplete. Empty compressed files are
-not decoded. Old lzma-alone, bzip2 and ZIP-family members are `unsupported`.
+so truncated, damaged and non-gzip data are `undecodable`. Only one complete
+member is scanned: a file with further members, padding or trailing bytes is
+`unsupported`, including a damaged or header-only second member. The member's
+trailer size and a separate full-file gzip read must agree with the strict
+reader's decoded byte count. Empty compressed files are not decoded. Old lzma-alone, bzip2 and ZIP-family members are `unsupported`.
 A gzip or xz member with more than 64 MiB of decompressed data is also
 `unsupported`. The scan is a measurement tool, not the daemon's build
 finaliser or its deep-scanning policy.

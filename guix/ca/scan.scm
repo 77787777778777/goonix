@@ -229,23 +229,36 @@ DECIDED is the offset up to which occurrences are already counted."
       (close-port input)
       count)))
 
+(define (gzip-trailer-size file)
+  "Return the size field that ends FILE, read as the last four bytes of a
+gzip member's trailer, or #f when FILE is shorter than that."
+  (let ((size (stat:size (stat file))))
+    (and (>= size 4)
+         (call-with-input-file file
+           (lambda (port)
+             (seek port (- size 4) SEEK_SET)
+             (bytevector-u32-ref (get-bytevector-n port 4) 0 (endianness little)))
+           #:binary #t))))
+
+(define (scan-gzip-file hash file limit)
+  "Scan FILE's first gzip member.  The result has 'undecodable' when that
+member is damaged, and 'unsupported' when the limit was reached or FILE holds
+anything besides the member that was scanned."
+  (let* ((result (scan-gzip hash file limit))
+         (decoded (or (assq-ref result 'decoded-bytes) 0))
+         (public (alist-delete 'decoded-bytes result eq?)))
+    (cond ((assq-ref result 'undecodable) public)
+          ((assq-ref result 'unsupported) public)
+          ((and (eqv? (gzip-trailer-size file) (modulo decoded (expt 2 32)))
+                (= decoded (gzip-all-byte-count file)))
+           public)
+          (else (append public '((unsupported . 1)))))))
+
 (define* (scan-compressed hash file #:optional (limit (* 64 1024 1024)))
   "Return hidden self references, or a decoder/limit coverage counter."
   (let ((kind (compressed-kind file)))
     (cond ((or (not kind) (zero? (stat:size (stat file)))) '())
-          ((eq? kind 'gzip)
-           (let* ((result (scan-gzip hash file limit))
-                  (complete?
-                   (and (not (assq-ref result 'undecodable))
-                        (not (assq-ref result 'unsupported))
-                        (= (or (assq-ref result 'decoded-bytes) 0)
-                           (gzip-all-byte-count file))))
-                  (public (alist-delete 'decoded-bytes result eq?)))
-             (if complete?
-                 public
-                 (if (assq-ref result 'undecodable)
-                     public
-                     (append public '((unsupported . 1)))))))
+          ((eq? kind 'gzip) (scan-gzip-file hash file limit))
           ((eq? kind 'xz)
            (let ((input (open-decoder file 'xz)))
              (dynamic-wind
