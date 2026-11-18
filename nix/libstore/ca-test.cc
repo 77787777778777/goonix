@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 
 using namespace nix;
+namespace nix { void checkRewriteForTest(const Path & path, const string & from, const string & to); }
 
 static unsigned failures = 0;
 
@@ -306,8 +307,46 @@ static void checkSiblingOrder(const Path & root)
         "referenced sibling is finalised before its dependent");
 }
 
+static void checkOpaqueFragmentBoundary(const Path & root)
+{
+    configureIsolatedStore(root);
+    Path token = tokenPath("out", "fragment");
+    Path file = root + "/fragment";
+    string hash = baseNameOf(token).substr(0, 32);
+    size_t split = 128 * 1024 - 31;
+    string contents(split, 'x');
+    contents += hash.substr(0, 1);
+    contents += hash.substr(1, 7);
+    contents += "tail";
+    writeFile(file, contents);
+    check(throws([&] { checkRewriteForTest(file, hash, hash); }),
+        "opaque fragment split across a read boundary is refused");
+}
+
+static void checkInverseFragmentBoundary(const Path & root)
+{
+    configureIsolatedStore(root);
+    Path file = root + "/inverse-fragment";
+    string hash = baseNameOf(tokenPath("out", "inverse")).substr(0, 32);
+    string contents(128 * 1024 - 31, 'x');
+    contents += hash.substr(0, 1);
+    contents += hash.substr(1, 7);
+    contents += "tail";
+    writeFile(file, contents);
+    check(throws([&] { checkRewriteForTest(file, hash, hash); }),
+        "inverse fragment split across a read boundary is refused");
+}
+
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && string(argv[1]) == "--inverse-fragment") {
+        checkInverseFragmentBoundary(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--fragment-boundary") {
+        checkOpaqueFragmentBoundary(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--sibling-order") {
         checkSiblingOrder(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

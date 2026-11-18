@@ -457,6 +457,11 @@ static void rewriteRegularFile(const Path & path, const string & from,
     cleanup.cancel();
 }
 
+void checkRewriteForTest(const Path & path, const string & from, const string & to)
+{
+    rewriteRegularFile(path, from, to, 0444);
+}
+
 static void checkReserved(const Path & path, const string & bytes)
 {
     /* The normal reference scanner only knows base32 hashes.  Reserved
@@ -666,6 +671,9 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     const std::map<Path, Path> & finalOutputs, const Path & actualTokenPath)
 {
     const Path physical = actualTokenPath.empty() ? token : actualTokenPath;
+    PathSet referencePaths = allPaths;
+    for (auto & sibling : finalOutputs)
+        referencePaths.insert(sibling.second);
     checkReservedTree(physical, 0, baseNameOf(token));
     /* goonix: sibling tokens have the same fixed width as final hashes. */
     for (auto & sibling : finalOutputs)
@@ -673,7 +681,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
             rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),
                 baseNameOf(sibling.second).substr(0, 32));
     HashResult initial;
-    PathSet initialReferences = scanForReferences(physical, allPaths, initial);
+    PathSet initialReferences = scanForReferences(physical, referencePaths, initial);
     Hash built = treeHash(physical);
     PathSet namingReferences = initialReferences;
     namingReferences.erase(token);
@@ -705,7 +713,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
                     "CA content address collision at `{0}': existing item differs", final));
             deletePath(physical);
             HashResult existingNAR;
-            references = scanForReferences(final, allPaths, existingNAR);
+            references = scanForReferences(final, referencePaths, existingNAR);
             auto result = hashPath(htSHA256, final);
             narHash = result.first;
             narSize = result.second;
@@ -717,7 +725,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
                 "CA content address collision at `{0}': existing item differs", final));
         deletePath(physical);
         HashResult existingNAR;
-        references = scanForReferences(final, allPaths, existingNAR);
+        references = scanForReferences(final, referencePaths, existingNAR);
         auto result = hashPath(htSHA256, final);
         narHash = result.first;
         narSize = result.second;
@@ -736,7 +744,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         throw BuildError(std::format("CA inverse mapping failed for `{}'", final));
     }
     HashResult finalNAR;
-    references = scanForReferences(final, allPaths, finalNAR);
+    references = scanForReferences(final, referencePaths, finalNAR);
     auto result = hashPath(htSHA256, final);
     narHash = result.first;
     narSize = result.second;
