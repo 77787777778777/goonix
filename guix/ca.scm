@@ -11,8 +11,13 @@
 (define-module (guix ca)
   #:use-module (gcrypt hash)
   #:use-module (srfi srfi-11)
+  #:use-module (ice-9 ftw)
+  #:use-module (ice-9 binary-ports)
+  #:use-module (ice-9 iconv)
   #:use-module (rnrs bytevectors)
   #:use-module (rnrs io ports)
+  #:use-module ((guix base16) #:select (bytevector->base16-string))
+  #:use-module ((guix base32) #:select (bytevector->nix-base32-string))
   #:use-module ((guix store) #:select (%store-prefix))
   #:export (%ca-store-directory
             self-token
@@ -22,11 +27,13 @@
             placeholder-path?
             placeholder-identity
             validate-token-path
+            tree-hash
+            content-addressed-path
             canonical-build-record-payload
             build-record-content-hash))
 
 (define %ca-store-directory "/gnu/store")
-(define %reserved-alphabet "eotu")
+(define %reserved-alphabet "eout")
 
 (define (reserved-hash digest self?)
   "Encode 62 digest bits, with a self-token discriminator in character zero."
@@ -144,6 +151,99 @@
   (let ((bytes (string->utf8 text)))
     (put-u64-le port (bytevector-length bytes))
     (put-bytevector port bytes)))
+
+(define (put-length-prefixed-bytes port bytes)
+  (put-u64-le port (bytevector-length bytes))
+  (put-bytevector port bytes))
+
+(define (bytevector<? a b)
+  (let ((length (min (bytevector-length a) (bytevector-length b))))
+    (let loop ((i 0))
+      (cond ((= i length) (< (bytevector-length a) (bytevector-length b)))
+            ((= (bytevector-u8-ref a i) (bytevector-u8-ref b i))
+             (loop (+ i 1)))
+            (else (< (bytevector-u8-ref a i) (bytevector-u8-ref b i)))))))
+
+(define %tree-domain (string->utf8 "goonix-tree-v1\0"))
+
+(define (tree-hash path)
+  "Return SHA-256 of PATH according to doc/goonix/content-addressing.md.
+Read regular files in bounded chunks and never follow symbolic links."
+  (let walk ((path path) (depth 0))
+    (when (> depth 1024)
+      (error "CA tree nesting exceeds 1024 directories" path))
+    (let ((info (lstat path)))
+      (case (stat:type info)
+        ((regular)
+         (let-values (((port digest) (open-hash-port (hash-algorithm sha256))))
+           (put-bytevector port %tree-domain)
+           (put-u8 port 1)
+           (put-u8 port (if (zero? (logand (stat:mode info) #o100)) 0 1))
+           (put-u64-le port (stat:size info))
+           (call-with-input-file path
+             (lambda (input)
+               (let loop ((bytes (get-bytevector-n input (* 128 1024))))
+                 (unless (eof-object? bytes)
+                   (put-bytevector port bytes)
+                   (loop (get-bytevector-n input (* 128 1024))))))
+             #:binary #t)
+           (force-output port)
+           (let ((result (digest))) (close-port port) result)))
+        ((symlink)
+         (let-values (((port digest) (open-hash-port (hash-algorithm sha256))))
+           (put-bytevector port %tree-domain)
+           (put-u8 port 2)
+           (put-length-prefixed port (readlink path))
+           (force-output port)
+           (let ((result (digest))) (close-port port) result)))
+        ((directory)
+         (let-values (((port digest) (open-hash-port (hash-algorithm sha256)))
+                      ((entries) (sort (scandir path
+                                         (lambda (name)
+                                           (not (member name '("." "..")))))
+                                       (lambda (a b)
+                                         (bytevector<? (string->utf8 a)
+                                                       (string->utf8 b))))))
+           (put-bytevector port %tree-domain)
+           (put-u8 port 3)
+           (put-u64-le port (length entries))
+           (for-each
+            (lambda (entry)
+              (put-length-prefixed port entry)
+              (let ((child (walk (string-append path "/" entry) (+ depth 1))))
+                (put-length-prefixed port (bytevector->base16-string child))))
+            entries)
+           (force-output port)
+           (let ((result (digest))) (close-port port) result)))
+        (else (error "unsupported file type in CA tree" path))))))
+
+(define (content-addressed-path output name tree references)
+  (check-name name)
+  (unless (and (string? output) (valid-name? output)
+               (bytevector? tree) (= 32 (bytevector-length tree)))
+    (error "invalid CA content path inputs" output tree))
+  (let-values (((port digest) (open-hash-port (hash-algorithm sha256))))
+    (put-bytevector port (string->utf8 "goonix-content-v1\0"))
+    (put-length-prefixed-bytes port tree)
+    (put-u64-le port (length references))
+    (for-each (lambda (reference) (put-length-prefixed port reference))
+              (sort references string<?))
+    (force-output port)
+    (let* ((name-hash (digest))
+           (input (string->utf8
+                   (string-append "goonix-content:" output ":sha256:"
+                                  (bytevector->base16-string name-hash) ":"
+                                  (%store-prefix) ":" name)))
+           (hash (sha256 input))
+           (compressed (make-bytevector 20 0)))
+      (close-port port)
+      (do ((i 0 (+ i 1))) ((= i (bytevector-length hash)))
+        (let ((j (modulo i 20)))
+          (bytevector-u8-set! compressed j
+                              (logxor (bytevector-u8-ref compressed j)
+                                      (bytevector-u8-ref hash i)))))
+      (string-append (%store-prefix) "/"
+                     (bytevector->nix-base32-string compressed) "-" name))))
 
 (define* (canonical-build-record-payload resolved-hash derivation output
                                          path origin

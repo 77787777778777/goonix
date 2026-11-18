@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "alphabet": "eout",
+  "tokens": {
+    "out": "ttteoeueuuottuuotutetetooueeoutu",
+    "lib": "teuttuuueeuttoototeeeutooeeeuout"
+  },
+  "placeholder": {
+    "derivationBytes": "drv bytes",
+    "output": "out",
+    "name": "hello-1.0",
+    "hash": "eutuotetteeuuottttouuuteeutttuut"
+  },
+  "tree": {
+    "emptyRegular": "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2",
+    "symlinkToTarget": "5ef2f8b90d0ca186d4b49cc6bbf69533d7bfe13bdc86bd4e7a2ef354ffb6812c",
+    "directoryWithEmptyFile": "4d906c085e9d72c6732872daeafd12323257f240329e76da0e9550d1ec24a2dd"
+  },
+  "contentPath": "/gnu/store/kq0f52qvhdwr2a7a5ycvrra8b124sdw4-hello"
+}

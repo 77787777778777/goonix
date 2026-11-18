@@ -142,13 +142,6 @@ noinst_HEADERS =						\
   $(libutil_headers) $(libstore_headers)	\
   $(guix_daemon_headers)
 
-%D%/libstore/libstore_a-local-store.o: %D%/libstore/local-store.cc %D%/libstore/local-store.hh %D%/libstore/schema.sql.hh
-	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(libstore_a_CPPFLAGS) $(CPPFLAGS) $(libstore_a_CXXFLAGS) $(CXXFLAGS) -c -o $@ $(srcdir)/nix/libstore/local-store.cc
-libstore.a: $(libstore_a_OBJECTS)
-	$(AM_V_at)-rm -f $@
-	$(AM_V_AR)$(libstore_a_AR) $@ $(libstore_a_OBJECTS) $(libstore_a_LIBADD)
-	$(AM_V_at)$(libstore_a_RANLIB) $@
-
 %D%/libstore/schema.sql.hh: guix/store/schema.sql
 	$(AM_V_GEN)$(GUILE) --no-auto-compile -c		\
 	  "(use-modules (rnrs io ports))			\

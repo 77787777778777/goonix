@@ -25,7 +25,7 @@
   (string-append (derivation->output-path guile-drv)
                  "/share/guile/2.0"))
 (define* (shell-drv name script #:key (inputs '()) (sources '())
-                    (addressing 'content) (env-vars '()))
+                    (addressing 'content) (env-vars '()) (outputs '("out")))
   ;; Keep one builder text per script. A different source path for an
   ;; otherwise identical input-addressed builder changes its derivation.
   (let* ((input-paths (map (lambda (input)
@@ -51,6 +51,7 @@
                        builder-file
                        "$NIX_BUILD_TOP/builder.scm"))
                 #:inputs `(,guile-drv ,@inputs)
+                #:outputs outputs
                 #:sources (if (eq? addressing 'input)
                               (list builder-file)
                               (list mkdir))
@@ -170,6 +171,42 @@
          (direct-store-path? (realised drv))
          (not (placeholder-path? (realised drv)))
          (string=? "resolved" (read-all (realised drv))))))
+
+(test-assert "sibling output references are rewritten and registered"
+  (let ((drv (shell-drv "ca-multi"
+                        "(mkdir-p out)\n(call-with-output-file (string-append out \"/reference\") (lambda (p) (display (getenv \"lib\") p)))\n(call-with-output-file (getenv \"lib\") (lambda (p) (display \"library\" p)))"
+                        #:outputs '("lib" "out"))))
+    (build-derivations store (list drv))
+    (let ((lib (realised-output-path store drv "lib"))
+          (out (realised-output-path store drv "out")))
+      (and (string=? lib (read-all (string-append out "/reference")))
+           (member lib (references store out))))))
+
+(test-assert "resolved-addressed paths hash the final resolved derivation"
+  (let* ((one (shell-drv "ca-resolved-cutoff" (write-output "same")
+                        #:addressing 'resolved #:env-vars '(("v" . "one"))))
+         (two (shell-drv "ca-resolved-cutoff" (write-output "same")
+                        #:addressing 'resolved #:env-vars '(("v" . "two"))))
+         (one-resolved (begin (build-derivations store (list one))
+                              (path-info-deriver
+                               (query-path-info store (realised one)))))
+         (two-resolved (begin (build-derivations store (list two))
+                              (path-info-deriver
+                               (query-path-info store (realised two))))))
+    ;; An unused environment entry is retained in R, so these are two
+    ;; different resolved derivations.  This assertion guards against
+    ;; accidentally identifying them; identical R cutoff is tested below.
+    (and (not (string=? one-resolved two-resolved))
+         (string=? "same" (read-all (realised one)))
+         (string=? "same" (read-all (realised two))))))
+
+(test-assert "identical resolved derivations have one resolved-addressed path"
+  (let ((one (shell-drv "ca-resolved-same" (write-output "same")
+                        #:addressing 'resolved))
+        (two (shell-drv "ca-resolved-same" (write-output "same")
+                        #:addressing 'resolved)))
+    (build-derivations store (list one two))
+    (string=? (realised one) (realised two))))
 
 (close-connection store)
 (test-end)

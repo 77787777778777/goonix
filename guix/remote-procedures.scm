@@ -314,7 +314,7 @@ Return #t on success."
                                (utf8-string output))
     "Return signed records of a resolved derivation output."
     id: 83
-    returns: string-list))
+    returns: build-records))
 
 (define-syntax remote-procedure-id
   (syntax-rules ()
