@@ -199,7 +199,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     path <- readStringSocket client
     _ <- assertStorePath store path
     settings <- readIORef settingsRef
-    buildThings rootFd store settings [path] Normal
+    buildThingsWithConfig config rootFd store settings (buildTrace settings client) [path] Normal
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   8 -> do

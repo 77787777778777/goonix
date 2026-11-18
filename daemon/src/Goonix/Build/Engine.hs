@@ -73,8 +73,10 @@ buildThingsInternal config rootFd store settings trace things mode = do
           let (drv, _) = B.break (== 33) thing
           buildOne drv
       | otherwise = case config of
-          Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace thing)
-          Nothing -> pure ()
+          Just serverConfig -> do
+            substituted <- trySubstitute serverConfig rootFd store settings trace thing
+            unless substituted $ throwIO (storeError ("cannot substitute path `" ++ C.unpack thing ++ "'"))
+          Nothing -> throwIO (storeError ("path `" ++ C.unpack thing ++ "' is not valid"))
 
 buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
@@ -121,6 +123,11 @@ trySubstitute config rootFd store settings trace path = do
             result <- substitutePath config settings path path
             case result of
               Left message -> do
+                when ("hash-mismatch" `B.isPrefixOf` message) $
+                  case C.words message of
+                    (_:algorithm:expected:actual:_) ->
+                      traceOutput trace ("@ hash-mismatch " <> path <> " " <> algorithm <> " " <> expected <> " " <> actual <> "\n")
+                    _ -> pure ()
                 traceOutput trace ("@ substituter-failed " <> path <> " " <> message <> "\n")
                 if settingBool "build-fallback" False settings
                   then pure False
@@ -131,12 +138,12 @@ trySubstitute config rootFd store settings trace path = do
                   _ -> throwIO (storeError "unsupported substitute hash")
                 exists <- Files.fileExist path
                 unless exists $ throwIO (storeError ("substitute did not produce path `" ++ C.unpack path ++ "'"))
-                (actualHash, actualSize) <- canonicaliseAndHash store path
+                (actualHash, _) <- canonicaliseAndHash store path
                 when (hashDigest actualHash /= digest) $ do
                   deleteTree path
                   throwIO (storeError ("corrupt output path `" ++ C.unpack path ++ "' from substitute"))
                 deduplicateTree (storeDirectory store) path
-                registerPath store path actualHash actualSize references deriver
+                registerPath store path actualHash size references deriver
                 traceOutput trace ("@ substituter-succeeded " <> path <> "\n")
                 pure True
 
