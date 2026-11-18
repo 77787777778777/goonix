@@ -12,7 +12,7 @@ guix/scripts/home.scm 6 1
 guix/scripts/perform-download.scm 3 1
 guix/scripts/shell.scm 21 6
 guix/scripts/system.scm 13 1
-guix/store.scm 8 1
+guix/store.scm 15 2
 Makefile.am 3 0
 nix/libstore/build.cc 198 6
 nix/libstore/derivations.cc 14 3
@@ -25,5 +25,6 @@ nix/libstore/store-api.hh 5 0
 nix/libstore/worker-protocol.hh 4 2
 nix/libutil/util.cc 18 1
 nix/libutil/util.hh 2 1
-nix/local.mk 26 2
+config-daemon.ac 5 0
+nix/local.mk 31 4
 nix/nix-daemon/nix-daemon.cc 32 0

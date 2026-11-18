@@ -245,6 +245,23 @@
          (file-exists? (string-append path "/" (basename path)))
          (verify-store store #:check-contents? #t #:repair? #f))))
 
+(test-group "reserved placeholder read boundaries"
+  (let* ((input (shell-drv "ca-reserved-boundary-input" (write-output "A")))
+         (reserved (placeholder (derivation->bytevector input) "out"
+                                "ca-reserved-boundary-input"))
+         (hash-index (+ 1 (string-rindex reserved #\/)))
+         (parts (list (substring reserved 0 24) (substring reserved 24)))
+         (padding (- 131040 hash-index))
+         (script (string-append
+                  "(call-with-output-file out (lambda (p) (display (make-string "
+                  (number->string padding) " #\\x) p) (display (string-append "
+                  (object->string (car parts)) " " (object->string (cadr parts))
+                  ") p) (display \"tail\" p)))")))
+    (test-equal "placeholder starting 32 bytes before a read boundary is refused"
+      "unresolved goonix placeholder"
+      (build-fails-with? (shell-drv (fresh-name "ca-reserved-boundary") script)
+                         "unresolved goonix placeholder"))))
+
 ;;; CA-2 is also runnable on its own from a small driver that loads these
 ;;; helpers first.  The full suite includes the same forms.
 (include "ca-cutoff.scm")

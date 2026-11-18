@@ -66,7 +66,10 @@ libstore_a_SOURCES =				\
   %D%/libstore/build.cc				\
   %D%/libstore/pathlocks.cc			\
   %D%/libstore/derivations.cc			\
-  %D%/libstore/builtins.cc			\
+  %D%/libstore/builtins.cc
+
+# goonix: CA store modules.
+libstore_a_SOURCES +=				\
   %D%/libstore/sqlite.cc			\
   %D%/libstore/records.cc			\
   %D%/libstore/ca.cc
@@ -80,14 +83,16 @@ libstore_headers =				\
   %D%/libstore/misc.hh				\
   %D%/libstore/local-store.hh			\
   %D%/libstore/sqlite.hh			\
-  %D%/libstore/builtins.hh			\
+  %D%/libstore/builtins.hh
+
+# goonix: CA store headers.
+libstore_headers +=				\
   %D%/libstore/store-api.hh			\
   %D%/libstore/ca.hh				\
   %D%/libstore/records.hh
 
 libstore_a_CPPFLAGS =				\
   $(libutil_a_CPPFLAGS)				\
-  $(LIBARCHIVE_CFLAGS)				\
   -I$(top_srcdir)/%D%/libstore			\
   -I$(top_builddir)/%D%/libstore		\
   -DNIX_STORE_DIR=\"$(storedir)\"		\
@@ -101,6 +106,7 @@ libstore_a_CXXFLAGS = $(AM_CXXFLAGS)		\
   $(SQLITE3_CFLAGS)
 
 bin_PROGRAMS = guix-daemon
+# goonix: tests for CA finalisation and signed records.
 noinst_PROGRAMS = nix/ca-test nix/records-test
 
 nix_ca_test_SOURCES = %D%/libstore/ca-test.cc
@@ -127,8 +133,11 @@ guix_daemon_LDFLAGS = 				\
   $(LIBGCRYPT_LDFLAGS)
 
 guix_daemon_LDADD =				\
-  libstore.a libutil.a -lz $(LIBARCHIVE_LIBS)	\
+  libstore.a libutil.a -lz		\
   $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
+
+# goonix: deep CA helper dependencies.
+guix_daemon_LDADD += $(LIBARCHIVE_LIBS)
 
 guix_daemon_headers =				\
   %D%/nix-daemon/nix-daemon.hh

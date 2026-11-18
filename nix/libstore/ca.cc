@@ -635,7 +635,9 @@ static void checkReservedFile(const Path & path)
         pending.append((const char *) buffer.data(), n);
         if (pending.size() > 32) {
             checkReserved(path, pending);
-            pending.erase(0, pending.size() - 31);
+            /* goonix: retain the reserved pattern's 32 bytes, not 31:
+               its trailing '-' may be in the next read. */
+            pending.erase(0, pending.size() - 32);
         }
     }
     checkReserved(path, pending);

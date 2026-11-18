@@ -31,6 +31,7 @@ if test "x$guix_build_daemon" = "xyes"; then
     HAVE_LIBBZ2="$ac_cv_header_bzlib_h"
   fi
 
+  # goonix: optional deep CA scanning uses libarchive in the helper.
   AC_CHECK_HEADERS([archive.h], [true],
     [AC_MSG_ERROR([goonix deep CA scanning requires libarchive.])])
   PKG_CHECK_MODULES([LIBARCHIVE], [libarchive])

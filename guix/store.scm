@@ -172,6 +172,7 @@
             topologically-sorted
             valid-derivers
             query-derivation-outputs
+            ;; goonix: resolved-output and signed-record queries.
             query-realised-output/direct
             query-build-records
             live-paths
@@ -705,6 +706,7 @@ definitions."
   (query-substitutable-paths => substitutable-paths)
   (query-substitutable-path-infos => substitutable-path-info)
   (built-in-builders => built-in-builders/direct)
+  ;; goonix: resolved-output and signed-record queries.
   (query-realised-output => query-realised-output/direct)
   query-build-records
   optimize-store
@@ -763,6 +765,7 @@ definitions."
 
                             build-cores
                             (use-substitutes? #t)
+                            ;; goonix: opt into deep CA scans on this connection.
                             (deep-scan? #f)
 
                             ;; Client-provided substitute URLs.  If it is #f,
@@ -795,6 +798,7 @@ definitions."
                #:print-build-trace print-build-trace
                #:use-substitutes? use-substitutes?
                #:settings
+               ;; goonix: opt into deep CA scans on this connection.
                `(("goonix-deep-scan" . ,(if deep-scan? "true" "false"))
                  ;; This option is honored by 'guix substitute' et al.
                  ,@(if print-build-trace
