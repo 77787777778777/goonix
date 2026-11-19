@@ -583,6 +583,16 @@ void slirpChild(Plan & plan, int tap, int readyFd)
        mounts are private; a read-only tmpfs root prevents self-overwrite. */
     const Bytes oldRoot = plan.root;
     plan.root += "/slirp";
+    /* The slirp child starts in the daemon's namespaces.  Create its own
+       user namespace first, with the host identity mapped, before creating
+       the mount/PID/IPC/UTS namespaces.  This is the C++ cloneFlags plus
+       lockMounts ordering. */
+    Plan initialIdentity = plan;
+    initialIdentity.uidMapInside = plan.uidMapOutside;
+    initialIdentity.uidMapOutside = plan.uidMapOutside;
+    initialIdentity.gidMapInside = plan.gidMapOutside;
+    initialIdentity.gidMapOutside = plan.gidMapOutside;
+    unshareAndInitUserns(initialIdentity);
     if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) == -1)
         sysError("creating slirp namespaces");
     const pid_t child = fork();
@@ -629,12 +639,18 @@ void slirpChild(Plan & plan, int tap, int readyFd)
     /* Match remapIdsTo0Action: map the requested slirp uid/gid to root in
        a fresh user namespace.  setgroups must remain enabled for slirp's
        --enable-sandbox parent setup. */
+    Plan lockIdentity = plan;
+    lockIdentity.uidMapInside = plan.uidMapOutside;
+    lockIdentity.uidMapOutside = plan.uidMapOutside;
+    lockIdentity.gidMapInside = plan.gidMapOutside;
+    lockIdentity.gidMapOutside = plan.gidMapOutside;
+    unshareAndInitUserns(lockIdentity);
     Plan identity = plan;
     identity.uidMapInside = 0;
     identity.uidMapOutside = plan.uidMapOutside;
     identity.gidMapInside = 0;
     identity.gidMapOutside = plan.gidMapOutside;
-    identity.allowSetgroups = true;
+    identity.allowSetgroups = geteuid() == 0;
     unshareAndInitUserns(identity);
     if (setgid(0) == -1)
         sysError("setting slirp gid to root");
@@ -670,57 +686,54 @@ void prepareSlirp(Plan & plan)
     slirpChildSocket = sockets[1];
     slirpHostUid = plan.uidMapOutside;
     slirpHostGid = plan.gidMapOutside;
-}
-
-void setupSlirp(Plan & plan)
-{
-    if (slirpSocket < 0) return;
-    /* TAP creation belongs to the builder's new network namespace. */
-    int tap = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
-    if (tap < 0) sysError("opening /dev/net/tun");
-    struct ifreq request {};
-    std::strncpy(request.ifr_name, "tap0", IFNAMSIZ - 1);
-    request.ifr_flags = IFF_TAP | IFF_NO_PI;
-    if (ioctl(tap, TUNSETIFF, &request) == -1) sysError("TUNSETIFF");
-    sendFd(slirpChildSocket, tap);
-    close(tap);
-    /* Keep the parent endpoint open until the child has been spawned; the
-       child receives the TAP on slirpChildSocket. */
+    /* As in spawnSlirp4netns, this child is created before the builder's
+       user and network namespaces.  It waits for the TAP descriptor, then
+       enters only its own mount/PID/IPC/UTS namespaces, not a new network
+       namespace. */
     slirpProcess = fork();
     if (slirpProcess == -1) sysError("creating slirp process");
     if (slirpProcess == 0) {
         close(slirpSocket);
-        Plan childPlan = plan;
-        childPlan.uidMapOutside = slirpHostUid;
-        childPlan.gidMapOutside = slirpHostGid;
-        int tapFd;
+        slirpSocket = -1;
+        if (setpgid(0, 0) == -1) _exit(1);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1) _exit(1);
+        if (getppid() == 1) _exit(1);
+        int tap;
         char byte;
-        char control[CMSG_SPACE(sizeof(tapFd))] = {};
+        char control[CMSG_SPACE(sizeof(tap))] = {};
         struct iovec iov { &byte, 1 };
         struct msghdr message = {};
         message.msg_iov = &iov;
         message.msg_iovlen = 1;
         message.msg_control = control;
         message.msg_controllen = sizeof(control);
-        ssize_t received = recvmsg(slirpChildSocket, &message, 0);
-        if (received != 1) _exit(1);
+        if (recvmsg(slirpChildSocket, &message, 0) != 1) _exit(1);
         auto header = CMSG_FIRSTHDR(&message);
         if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) _exit(1);
-        memcpy(&tapFd, CMSG_DATA(header), sizeof(tapFd));
-        try { slirpChild(childPlan, tapFd, slirpChildSocket); }
+        memcpy(&tap, CMSG_DATA(header), sizeof(tap));
+        /* slirp's --ready-fd is intentionally inherited across exec.  The
+           setup socket itself was created with SOCK_CLOEXEC for the builder;
+           only this slirp child's notification endpoint is made persistent. */
+        if (fcntl(slirpChildSocket, F_SETFD, 0) == -1) _exit(1);
+        try { slirpChild(plan, tap, slirpChildSocket); }
         catch (const std::exception & error) {
-            writeFull(STDERR_FILENO, Bytes("slirp child setup: ") + error.what() + "\n");
+            writeFull(STDERR_FILENO, Bytes("slirp: ") + error.what() + "\n");
         }
         _exit(1);
     }
     close(slirpChildSocket);
     slirpChildSocket = -1;
-    char ready;
-    ssize_t result;
-    do { result = read(slirpSocket, &ready, 1); } while (result < 0 && errno == EINTR);
+}
+
+void setupSlirp(Plan & plan)
+{
+    if (slirpSocket < 0) return;
+    /* The builder's namespace now owns tap0.  setupTap sends its descriptor
+       to the already-created host-namespace slirp process and waits for its
+       readiness byte. */
+    setupTap(slirpSocket, plan.has(ipv6NetworkFlag));
     close(slirpSocket);
     slirpSocket = -1;
-    if (result != 1 || ready != '1') throw Error("slirp4netns did not become ready");
 }
 
 void mountIntoSandbox(const Plan & plan, const Bytes & source,
