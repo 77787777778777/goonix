@@ -30,3 +30,4 @@ nix/libutil/util.cc 18 1
 nix/libutil/util.hh 2 1
 nix/local.mk 33 0
 nix/nix-daemon/nix-daemon.cc 41 0
+tests/publish.scm 31 0
