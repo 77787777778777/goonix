@@ -60,7 +60,7 @@ import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
 import Goonix.Build.Offload
 import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
-import System.Environment (getEnvironment, lookupEnv)
+import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
 import System.Posix.Env.ByteString (getEnv)
 
 data BuildMode = Normal | Repair | Check deriving (Eq, Show)
@@ -448,7 +448,13 @@ copyTree source destination = do
 
 spawnSandboxedBuilder :: Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
 spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = do
-  helper <- maybe (storeDirectory store <> "/../guix-sandbox") id <$> getEnv "GUIX_SANDBOX"
+  helper <- do
+    explicit <- getEnv "GUIX_SANDBOX"
+    case explicit of
+      Just path -> pure path
+      Nothing -> do
+        executable <- getExecutablePath
+        pure (C.pack (takeDirectory executable) <> "/guix-sandbox")
   root <- makeSandboxRoot store
   mkdirParents (root <> "/tmp")
   Files.setFileMode (root <> "/tmp") 0o1777

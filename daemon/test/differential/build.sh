@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
+. "$root/daemon/test/lib.sh"
 fixture=${1:-/tmp/goonix-hs4-build}
 "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db" GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
 hs=$root/guix-daemon
 daemon=${GOONIX_TEST_DAEMON:-$hs}
-"$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1 &
-pid=$!
-trap 'kill "$pid" 2>/dev/null || true' EXIT
+read -r -a daemon_options <<< "${GOONIX_TEST_DAEMON_OPTIONS:---disable-chroot --no-substitutes}"
+goonix_start_capped "$root/pre-inst-env" "$daemon" "${daemon_options[@]}" --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
+pid=$GOONIX_TEST_PID
+scope=$GOONIX_TEST_SCOPE
+trap 'goonix_stop_capped "$pid" "$scope"' EXIT
 for i in $(seq 1 200); do test -S "$GUIX_DAEMON_SOCKET" && break; kill -0 "$pid"; sleep .01; done
-"$root/pre-inst-env" guile --no-auto-compile -c '
+goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile -c '
 (use-modules (guix store) (guix derivations) (guix tests) (guix packages) (ice-9 textual-ports))
 (let* ((s (open-connection))
        (script (add-text-to-store s "build.sh" "printf hello > $out\n" (list)))

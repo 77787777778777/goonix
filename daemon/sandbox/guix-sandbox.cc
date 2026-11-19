@@ -142,6 +142,7 @@ struct Plan {
     uid_t uidMapOutside = 0;
     gid_t gidMapInside = 0;
     gid_t gidMapOutside = 0;
+    bool allowSetgroups = false;
     Bytes root;
     Bytes storeDirectory;
     Bytes hostname = "localhost";
@@ -470,6 +471,7 @@ void mkdirParents(const Bytes & path)
 std::vector<char *> stringPointers(std::vector<Bytes> & strings);
 void mountIntoSandbox(const Plan & plan, const Bytes & source,
                       const Bytes & target, bool readOnly);
+void unshareAndInitUserns(Plan & plan);
 
 /* Fixed-output networking follows setupTap and spawnSlirp4netns in
    nix/libstore/build.cc.  The descriptor never crosses exec: only the
@@ -594,8 +596,7 @@ void slirpChild(Plan & plan, int tap, int readyFd)
         sysError("making slirp mounts private");
     if (mount("tmpfs", oldRoot.c_str(), "tmpfs", 0, "mode=0755") == -1 ||
         mkdir(plan.root.c_str(), 0755) == -1 ||
-        mount(plan.root.c_str(), plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1 ||
-        mount(nullptr, plan.root.c_str(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr) == -1)
+        mount(plan.root.c_str(), plan.root.c_str(), nullptr, MS_BIND, nullptr) == -1)
         sysError("preparing slirp filesystem root");
     DIR *directory = opendir("/");
     if (!directory) sysError("reading host root for slirp");
@@ -612,15 +613,33 @@ void slirpChild(Plan & plan, int tap, int readyFd)
         if (realpath(file.c_str(), resolved))
             mountIntoSandbox(plan, resolved, file, true);
     }
-    if (mkdir((plan.root + "/run").c_str(), 0700) == -1) sysError("creating slirp /run");
-    if (mkdir((plan.root + "/proc").c_str(), 0755) == -1 ||
-        mount("proc", (plan.root + "/proc").c_str(), "proc", 0, nullptr) == -1 ||
-        chdir(plan.root.c_str()) == -1 || mkdir("real-root", 0700) == -1 ||
+    if (mkdir((plan.root + "/run").c_str(), 0700) == -1 && errno != EEXIST)
+        sysError("creating slirp /run");
+    if (mkdir((plan.root + "/proc").c_str(), 0755) == -1 && errno != EEXIST)
+        sysError("creating slirp /proc");
+    if (mount("proc", (plan.root + "/proc").c_str(), "proc", 0, nullptr) == -1 ||
+        chdir(plan.root.c_str()) == -1 ||
+        (mkdir("real-root", 0700) == -1 && errno != EEXIST) ||
         syscall(SYS_pivot_root, ".", "real-root") == -1 || chroot(".") == -1 ||
-        umount2("real-root", MNT_DETACH) == -1 || rmdir("real-root") == -1)
+        umount2("real-root", MNT_DETACH) == -1 ||
+        (rmdir("real-root") == -1 && errno != ENOENT))
         sysError("preparing slirp root");
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) == -1 ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) sysError("dropping slirp privileges");
+    /* Match remapIdsTo0Action: map the requested slirp uid/gid to root in
+       a fresh user namespace.  setgroups must remain enabled for slirp's
+       --enable-sandbox parent setup. */
+    Plan identity = plan;
+    identity.uidMapInside = 0;
+    identity.uidMapOutside = plan.uidMapOutside;
+    identity.gidMapInside = 0;
+    identity.gidMapOutside = plan.gidMapOutside;
+    identity.allowSetgroups = true;
+    unshareAndInitUserns(identity);
+    if (setgid(0) == -1)
+        sysError("setting slirp gid to root");
+    if (setuid(0) == -1)
+        sysError("setting slirp uid to root");
     if (plan.slirpSeccomp.empty() || plan.slirpSeccomp.size() > USHRT_MAX)
         throw Error("invalid slirp seccomp filter");
     struct sock_fprog filter { static_cast<unsigned short>(plan.slirpSeccomp.size()), plan.slirpSeccomp.data() };
@@ -634,7 +653,12 @@ void slirpChild(Plan & plan, int tap, int readyFd)
     sysError("executing slirp4netns");
 }
 
-void setupSlirp(Plan & plan)
+int slirpSocket = -1;
+int slirpChildSocket = -1;
+uid_t slirpHostUid = 0;
+gid_t slirpHostGid = 0;
+
+void prepareSlirp(Plan & plan)
 {
     if (!plan.has(slirpNetworkFlag)) return;
     if (plan.slirpProgram.empty() || plan.slirpProgram.front() != '/')
@@ -642,33 +666,61 @@ void setupSlirp(Plan & plan)
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
         sysError("creating slirp setup socket");
-    Fd parent(sockets[0]), child(sockets[1]);
+    slirpSocket = sockets[0];
+    slirpChildSocket = sockets[1];
+    slirpHostUid = plan.uidMapOutside;
+    slirpHostGid = plan.gidMapOutside;
+}
+
+void setupSlirp(Plan & plan)
+{
+    if (slirpSocket < 0) return;
+    /* TAP creation belongs to the builder's new network namespace. */
+    int tap = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
+    if (tap < 0) sysError("opening /dev/net/tun");
+    struct ifreq request {};
+    std::strncpy(request.ifr_name, "tap0", IFNAMSIZ - 1);
+    request.ifr_flags = IFF_TAP | IFF_NO_PI;
+    if (ioctl(tap, TUNSETIFF, &request) == -1) sysError("TUNSETIFF");
+    sendFd(slirpChildSocket, tap);
+    close(tap);
+    /* Keep the parent endpoint open until the child has been spawned; the
+       child receives the TAP on slirpChildSocket. */
     slirpProcess = fork();
     if (slirpProcess == -1) sysError("creating slirp process");
     if (slirpProcess == 0) {
-        parent.reset();
-        if (setpgid(0, 0) == -1) _exit(1);
-        int tap;
+        close(slirpSocket);
+        Plan childPlan = plan;
+        childPlan.uidMapOutside = slirpHostUid;
+        childPlan.gidMapOutside = slirpHostGid;
+        int tapFd;
         char byte;
-        char control[CMSG_SPACE(sizeof(tap))] = {};
+        char control[CMSG_SPACE(sizeof(tapFd))] = {};
         struct iovec iov { &byte, 1 };
         struct msghdr message = {};
         message.msg_iov = &iov;
         message.msg_iovlen = 1;
         message.msg_control = control;
         message.msg_controllen = sizeof(control);
-        if (recvmsg(child.get(), &message, 0) != 1) _exit(1);
+        ssize_t received = recvmsg(slirpChildSocket, &message, 0);
+        if (received != 1) _exit(1);
         auto header = CMSG_FIRSTHDR(&message);
         if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) _exit(1);
-        memcpy(&tap, CMSG_DATA(header), sizeof(tap));
-        try { slirpChild(plan, tap, child.get()); }
-        catch (const std::exception & error) { writeFull(STDERR_FILENO, Bytes("slirp: ") + error.what() + "\n"); }
+        memcpy(&tapFd, CMSG_DATA(header), sizeof(tapFd));
+        try { slirpChild(childPlan, tapFd, slirpChildSocket); }
+        catch (const std::exception & error) {
+            writeFull(STDERR_FILENO, Bytes("slirp child setup: ") + error.what() + "\n");
+        }
         _exit(1);
     }
-    child.reset();
-    setupTap(parent.get(), plan.has(ipv6NetworkFlag));
-    /* setupTap waits for the readiness byte.  Its descriptor is then closed
-       here and cannot be inherited by the builder. */
+    close(slirpChildSocket);
+    slirpChildSocket = -1;
+    char ready;
+    ssize_t result;
+    do { result = read(slirpSocket, &ready, 1); } while (result < 0 && errno == EINTR);
+    close(slirpSocket);
+    slirpSocket = -1;
+    if (result != 1 || ready != '1') throw Error("slirp4netns did not become ready");
 }
 
 void mountIntoSandbox(const Plan & plan, const Bytes & source,
@@ -695,7 +747,7 @@ void mountIntoSandbox(const Plan & plan, const Bytes & source,
         if (fd.get() == -1 && errno != EEXIST)
             sysError("creating mount destination " + destination);
     }
-    if (mount(source.c_str(), destination.c_str(), nullptr, MS_BIND, nullptr) == -1)
+    if (mount(source.c_str(), destination.c_str(), nullptr, MS_BIND | MS_REC, nullptr) == -1)
         sysError("bind mounting " + source + " to " + destination);
     if (readOnly) {
         struct statvfs filesystem;
@@ -794,7 +846,7 @@ void unshareAndInitUserns(Plan & plan)
             writeFile("/proc/" + pid + "/uid_map",
                 std::to_string(plan.uidMapInside) + " " +
                 std::to_string(plan.uidMapOutside) + " 1\n");
-            writeFile("/proc/" + pid + "/setgroups", "deny\n");
+            writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
             writeFile("/proc/" + pid + "/gid_map",
                 std::to_string(plan.gidMapInside) + " " +
                 std::to_string(plan.gidMapOutside) + " 1\n");
@@ -1021,6 +1073,7 @@ void enterPidNamespace(Plan & plan)
 }
 
 const std::vector<Phase> phases = {
+    { "prepareSlirp", prepareSlirp },
     { "unshareAndInitUserns", [](Plan & p) { if (p.has(newUserNsFlag)) unshareAndInitUserns(p); } },
     { "setupNamespaces", setupNamespaces },
     { "setupSlirp", setupSlirp },

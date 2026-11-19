@@ -121,6 +121,7 @@ encodePlan plan = LBS.toStrict $ Builder.toLazyByteString $
     <> foldMap u32 (earlyCloseFds plan)
     <> u32 (uidMapInside plan) <> u32 (uidMapOutside plan)
     <> u32 (gidMapInside plan) <> u32 (gidMapOutside plan)
+    <> bytes "" <> u32 0
 
 writeAll :: Fd -> ByteString -> IO ()
 writeAll fd value = unless (BS.null value) $ do
