@@ -83,6 +83,8 @@ goonix_ca_store_checks =			\
   symlink-modes					\
   path-validation
 
+EXTRA_DIST += doc/goonix-secrets.smd
+
 # The vectors of the token and placeholder formats, the checks of the
 # finaliser, then the unit tests of the build records against the test
 # suite's own state directory and a 'guix' that runs from the build tree.
