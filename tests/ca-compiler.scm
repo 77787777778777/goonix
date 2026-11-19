@@ -6,6 +6,7 @@
              (guix derivations)
              (ice-9 binary-ports)
              (rnrs bytevectors)
+             (rnrs io ports)
              (srfi srfi-1)
              (srfi srfi-34)
              (srfi srfi-64))
@@ -169,11 +170,9 @@
                         #:addressing 'resolved)))
       (build-derivations store (list selected))
       (let* ((glibc (realised-output-path store selected "out"))
+             (placeholder (derivation->output-path selected))
              (builder
-              (string-append
-               "(define out (getenv \"out\"))\n"
-               "(call-with-output-file out (lambda (p) (display \""
-               glibc "\" p)))"))
+              "(define out (getenv \"out\"))\n(call-with-output-file out (lambda (p) (display (getenv \"glibc\") p)))")
              (builder-file (add-text-to-store store "glibc-dependent-builder"
                                               builder))
              (dependent
@@ -181,11 +180,15 @@
                           (list "--no-auto-compile" builder-file)
                           #:inputs (list (list guile-drv) (list selected))
                           #:sources (list builder-file)
+                          #:env-vars `(("glibc" . ,placeholder))
                           #:addressing 'content)))
         (build-derivations store (list dependent))
         (let ((result (realised-output-path store dependent "out")))
-          (and (valid-path? store glibc)
+          (and (placeholder-path? placeholder)
+               (not (string=? placeholder glibc))
+               (valid-path? store glibc)
                (not (placeholder-path? glibc))
+               (string=? glibc (call-with-input-file result get-string-all))
                (member glibc (references store result))))))))
 
 (test-end "ca-compiler")

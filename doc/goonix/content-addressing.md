@@ -108,6 +108,14 @@ is not registered.  Archives of content outputs need no trusted narinfo:
 their tree hashes, round trips and store paths verify intrinsically.
 Resolved-addressed and input-addressed archives retain signed narinfos.
 
+A prebuilt archive at an already resolved path is not a token-finalisation
+proof.  In particular, the resolved glibc fixture consumes a placeholder that
+resolves to its final path, but a downloaded archive of that same item can
+carry a compiler-emitted or otherwise hidden reference to its own path without
+passing through the content-output scanner.  Such archives require their
+signed identity and, where that property matters, a separate local scan or
+rebuild; their resolved path alone does not establish self-reference freedom.
+
 ## Finalisation
 
 Canonicalise metadata, scan every file, symbolic-link target and directory
