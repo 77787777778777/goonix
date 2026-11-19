@@ -87,17 +87,32 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolv
             for (auto & input : original.inputDrvs)
                 visit(input.first, readDerivation(input.first));
             if (!goonixAddressed(original)) return;
-            try {
-                Derivation resolved = resolveDerivation(*this, originalPath, original);
-                const string resolvedHash = printHash(hashString(htSHA256,
-                    unparseDerivation(resolved)));
-                for (auto & output : original.outputs) {
-                    if (chosenOutput(originalPath, output.first).empty()) continue;
-                    auto records = queryGoonixBuildRecords(resolvedHash, output.first);
-                    result.insert(result.end(), records.begin(), records.end());
-                }
-            } catch (const Error &) {
-                /* An unchosen input or output cannot resolve this member. */
+            /* Names, not input availability, determine R.  A collected
+               choice remains a valid name; no query may repair a choice. */
+            auto nameOf = [&](const Path & path, const Derivation & drv,
+                              const string & output) -> Path {
+                auto found = drv.outputs.find(output);
+                if (found == drv.outputs.end())
+                    throw Error(std::format(
+                        "derivation has no output `{0}'", output));
+                if (!goonixAddressed(drv) || !found->second.hash.empty())
+                    return found->second.path;
+                return chosenOutput(path, output);
+            };
+            for (auto & input : original.inputDrvs) {
+                Derivation dependency = readDerivation(input.first);
+                for (auto & output : input.second)
+                    if (nameOf(input.first, dependency, output).empty())
+                        return;          // no choice: this member is unresolved
+            }
+            Derivation resolved = resolveDerivation(*this, originalPath,
+                                                    original, nameOf);
+            const string resolvedHash = printHash(hashString(htSHA256,
+                unparseDerivation(resolved)));
+            for (auto & output : original.outputs) {
+                if (chosenOutput(originalPath, output.first).empty()) continue;
+                auto records = queryGoonixBuildRecords(resolvedHash, output.first);
+                result.insert(result.end(), records.begin(), records.end());
             }
         };
     visit(unresolved, readDerivation(unresolved));

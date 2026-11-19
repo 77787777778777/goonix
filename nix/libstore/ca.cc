@@ -804,16 +804,17 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
 }
 
 Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
-    const Derivation & unresolved)
+    const Derivation & unresolved,
+    std::function<Path(const Path &, const Derivation &, const string &)> realised)
 {
     Derivation resolved = unresolved;
     std::map<string, string> replacements;
     for (auto & input : unresolved.inputDrvs) {
         auto inDrv = derivationFromPath(store, input.first);
         for (auto & output : input.second) {
-            Path realised = store.realisedOutputPath(input.first, inDrv, output);
-            replacements[inDrv.outputs.at(output).path] = realised;
-            resolved.inputSrcs.insert(realised);
+            Path chosen = realised(input.first, inDrv, output);
+            replacements[inDrv.outputs.at(output).path] = chosen;
+            resolved.inputSrcs.insert(chosen);
         }
     }
     auto substitute = [&](string value) {
@@ -855,6 +856,15 @@ Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
         resolved.env[output.first] = output.second.path;
     checkResolvedDerivation(resolved);
     return resolved;
+}
+
+Derivation resolveDerivation(LocalStore & store, const Path & unresolvedPath,
+    const Derivation & unresolved)
+{
+    return resolveDerivation(store, unresolvedPath, unresolved,
+        [&](const Path & path, const Derivation & drv, const string & output) {
+            return store.realisedOutputPath(path, drv, output);
+        });
 }
 
 Path writeResolvedDerivation(LocalStore & store, const Path & originalPath,

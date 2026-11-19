@@ -5,6 +5,7 @@
 #include "hash.hh"
 #include "store-api.hh"
 #include "derivations.hh"
+#include <functional>
 
 namespace nix {
 
@@ -53,6 +54,9 @@ std::vector<std::pair<string, Path>> contentOutputOrder(
    The resulting derivation contains only realised paths and self tokens. */
 Derivation resolveDerivation(class LocalStore & store,
     const Path & unresolvedPath, const Derivation & unresolved);
+Derivation resolveDerivation(class LocalStore & store,
+    const Path & unresolvedPath, const Derivation & unresolved,
+    std::function<Path(const Path &, const Derivation &, const string &)> realised);
 Path writeResolvedDerivation(class LocalStore & store,
     const Path & originalPath, const Derivation & resolved);
 

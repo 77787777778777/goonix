@@ -72,7 +72,7 @@
               result=
               for path in ''${GUILE_LOAD_COMPILED_PATH-}; do
                 if [ "$path" != "$goonix_guile/lib/guile/3.0/ccache" ]; then
-                  result=''${result+$result:}$path
+                  result=''${result:+$result:}$path
                 fi
               done
               printf '%s' "$result")

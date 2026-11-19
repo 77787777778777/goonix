@@ -339,6 +339,50 @@
           1 (length after))
         #t))))
 
+(test-assert "the graph query uses collected input names without changing choices"
+  (let* ((input (ca-drv "graph-collected-input" (write-output "input")))
+         (dependent
+          (ca-drv "graph-collected-dependent"
+                  (string-append
+                   "(call-with-output-file (getenv \"out\") (lambda (p) "
+                   "(display (file-exists? (getenv \"input\")) p)))")
+                  #:inputs (list input)
+                  #:env-vars `(("input" . ,(derivation->output-path input))))))
+    (build-derivations store (list dependent))
+    (let* ((input-out (realised input))
+           (dependent-out (realised dependent))
+           (before (build-graph-records store (derivation-file-name dependent)))
+           (dependent-record
+            (find (lambda (record) (string=? dependent-out (list-ref record 3)))
+                  before))
+           (expected (list-ref dependent-record 0))
+           (input-hash (resolved-hash input)))
+      (test-equal "collected-input graph starts with both records"
+        2 (length before))
+      (test-assert "the dependent does not refer to its build-time input"
+        (not (member input-out (references store dependent-out))))
+      (delete-paths store (list (list-ref dependent-record 1) input-out))
+      (test-assert "the input is collected and the dependent remains valid"
+        (and (not (valid-path? store input-out))
+             (valid-path? store dependent-out)))
+      (let* ((fresh (open-connection-for-tests))
+             (after (build-graph-records fresh (derivation-file-name dependent))))
+        (test-equal "collected-input graph retains both records"
+          (map (lambda (record) (list-ref record 0)) before)
+          (map (lambda (record) (list-ref record 0)) after))
+        (test-equal "the graph query preserves the dependent's resolved hash"
+          expected (list-ref (find (lambda (record)
+                                     (string=? dependent-out (list-ref record 3)))
+                                   after)
+                             0))
+        (test-equal "the collected input's record keeps the same resolved hash"
+          input-hash
+          (list-ref (find (lambda (record)
+                            (string=? input-out (list-ref record 3))) after)
+                    0))
+        (close-connection fresh)
+        #t))))
+
 (test-assert "the two-glibc scenario ends in one coherent closure"
   (let* ((g1 (ca-drv "glibc" (write-output "GLIBC")))
          (g2 (ca-drv "glibc" (write-output "GLIBC")
