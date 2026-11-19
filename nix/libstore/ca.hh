@@ -41,6 +41,11 @@ void checkInputAddressedPolicy(class LocalStore & store, const Derivation & drv)
    or strict final paths (resolved/fixed), environment agrees. */
 void checkResolvedDerivation(const Derivation & drv);
 void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv);
+/* Registration-time validation of the unresolved, resolved and mixed cases. */
+void checkGoonixRegistration(class LocalStore & store, const Path & path,
+    const Derivation & drv);
+void checkGoonixBatchRegistration(class LocalStore & store, const Path & path,
+    const Derivation & drv);
 std::vector<std::pair<string, Path>> contentOutputOrder(
     const Derivation & drv, const PathSet & allPaths,
     const Path & chrootRootDir = "");

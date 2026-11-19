@@ -73,6 +73,7 @@ libstore_a_SOURCES =				\
 libstore_a_SOURCES +=				\
   %D%/libstore/records.cc			\
   %D%/libstore/ca.cc				\
+  %D%/libstore/local-store-ca.cc			\
   %D%/libstore/deep-scan.cc
 
 libstore_headers =				\

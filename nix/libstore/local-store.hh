@@ -147,6 +147,10 @@ public:
     void recordGoonixBuild(const Path & resolvedPath, const string & output,
         const Path & path, const string & resolvedHash, const string & origin,
         bool relocationChecked, const string & signature);
+    // goonix: called only after upstream's authentication helper verifies it.
+    void recordGoonixBuildVerified(const Path & resolvedPath, const string & output,
+        const Path & path, const string & resolvedHash, const string & origin,
+        bool relocationChecked, const string & signature, const string & verifiedHash);
     std::vector<BuildRecord> queryGoonixBuildRecords(const string & hash,
         const string & output);
     std::vector<BuildRecord> queryGoonixRecordsByPath(const Path & path);
@@ -177,6 +181,9 @@ public:
         const PathSet & references);
     Path addTextToStoreNoDerivationOutputs(const string & name,
         const string & contents, const PathSet & references);
+
+    // goonix: validation dispatch in ca.cc calls the ordinary check as well.
+    void checkDerivationOutputs(const Path & drvPath, const Derivation & drv);
 
     /* Register the validity of a path, i.e., that `path' exists, that
        the paths referenced by it exists, and in the case of an output
@@ -302,7 +309,6 @@ private:
 
     Path importPath(Source & source);
 
-    void checkDerivationOutputs(const Path & drvPath, const Derivation & drv);
 
     typedef std::unordered_set<ino_t> InodeHash;
 

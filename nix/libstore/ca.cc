@@ -224,6 +224,45 @@ std::vector<std::pair<string, Path>> contentOutputOrder(
     return result;
 }
 
+void checkGoonixRegistration(LocalStore & store, const Path & path,
+    const Derivation & drv)
+{
+    /* Placeholders and resolved/token paths are intentionally not
+       historical output:ID paths.  Validate their shape during resolution. */
+    bool ca = drv.env.find("goonixAddressing") != drv.env.end();
+    bool resolved = resolvedDerivation(drv);
+    if (ca && !resolved) {
+        for (auto & output : drv.outputs) {
+            if (!isReservedStorePath(output.second.path))
+                throw Error(std::format("unresolved CA output `{}' is not a placeholder",
+                    output.second.path));
+            if (drv.env.at(output.first) != output.second.path)
+                throw Error(std::format("CA output `{}' disagrees with its environment",
+                    output.first));
+        }
+    } else if (resolved) {
+        checkResolvedDerivation(drv);
+    } else {
+        store.checkDerivationOutputs(path, drv);
+        checkInputAddressedPolicy(store, drv);
+    }
+}
+
+void checkGoonixBatchRegistration(LocalStore & store, const Path & path,
+    const Derivation & drv)
+{
+    if (drv.env.find("goonixAddressing") != drv.env.end())
+        checkGoonixDerivationOutputs(path, drv);
+    else if (resolvedDerivation(drv))
+        throw Error(std::format(
+            "goonix: derivation `{0}' is marked resolved without an addressing",
+            path));
+    else {
+        store.checkDerivationOutputs(path, drv);
+        checkInputAddressedPolicy(store, drv);
+    }
+}
+
 void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)
 {
     string name = storePathToName(drvPath);
