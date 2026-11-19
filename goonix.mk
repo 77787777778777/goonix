@@ -6,6 +6,7 @@ MODULES +=					\
   guix/pure-eval.scm				\
   guix/package-overrides.scm			\
   guix/ca.scm					\
+  guix/ca/policy.scm				\
   guix/download-cache.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
@@ -25,6 +26,7 @@ SCM_TESTS +=					\
   tests/ca.scm					\
   tests/ca-build.scm				\
   tests/ca-compiler.scm				\
+  tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\
   tests/ca-references.scm			\

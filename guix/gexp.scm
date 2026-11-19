@@ -1275,7 +1275,9 @@ DEPRECATION-WARNINGS determines whether to show deprecation warnings while
 compiling modules.  It can be #f, #t, or 'detailed.
 
 The other arguments are as for 'derivation'."
-  (define outputs (gexp-outputs exp))
+  (define outputs (let ((outputs (gexp-outputs exp)))
+                    ;; goonix: an ordinary gexp has an implicit `out' output.
+                    (if (null? outputs) '("out") outputs)))
   (define requested-graft? graft?)
 
   (define (graphs-file-names graphs)

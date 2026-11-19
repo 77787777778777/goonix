@@ -41,6 +41,7 @@
   #:use-module (guix records)
   #:use-module (guix store)
   #:use-module (guix monads)
+  #:autoload   (guix ca policy) (lower-with-addressing package-addressing-key) ;goonix: opt-in CA lowering
   #:use-module (guix package-overrides)          ;goonix: lowering-time overrides
   #:use-module (guix gexp)
   #:use-module (guix base32)
@@ -2122,6 +2123,7 @@ This is an internal procedure."
                                               #:guile guile)))))
                  (return drv)))
            package system #f graft?
+           (package-addressing-key)                ;goonix: addressing policy
            (package-override-key)))               ;goonix: overrides in effect
 
 (define* (package->cross-derivation package target
@@ -2146,11 +2148,20 @@ system identifying string)."
                                               #:guile guile)))))
                  (return drv)))
            package system target graft?
+           (package-addressing-key)                ;goonix: addressing policy
            (package-override-key)))               ;goonix: overrides in effect
 
 ;; goonix: both heed the overrides in effect; see (guix package-overrides).
-(set! package->derivation (overridable package->derivation))
-(set! package->cross-derivation (overridable package->cross-derivation))
+;; goonix: bind the unwrapped lowerers before installing the policy wrappers.
+(define package->derivation/plain package->derivation)
+(define package->cross-derivation/plain package->cross-derivation)
+(set! package->derivation (overridable (lambda (package . arguments)
+                                         (apply lower-with-addressing package
+                                                package->derivation/plain arguments))))
+(set! package->cross-derivation
+      (overridable (lambda (package . arguments)
+                     (apply lower-with-addressing package
+                            package->cross-derivation/plain arguments))))
 
 (define* (package-output store package
                          #:optional (output "out") (system (%current-system)))
