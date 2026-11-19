@@ -27,8 +27,9 @@ run_one() {
   goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile "$root/daemon/test/differential/collector-probe.scm" >"$out/$name.out" 2>"$out/$name.err"
   # Hold the same POSIX exclusive GC lock externally.  A live query must wait
   # until it is released, rather than observing roots during a collection.
-  goonix_run_capped "$out/gc-lock-holder" "$fixture/var/gc.lock" >"$out/$name.lock-holder" &
-  holder=$!
+  goonix_start_capped "$out/gc-lock-holder" "$fixture/var/gc.lock" >"$out/$name.lock-holder" 2>&1
+  holder=$GOONIX_TEST_PID
+  holder_scope=$GOONIX_TEST_SCOPE
   for i in $(seq 1 200); do grep -q held "$out/$name.lock-holder" && break; sleep .01; done
   grep -q held "$out/$name.lock-holder"
   goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile -c '(use-modules (guix store)) (let ((store (open-connection (getenv "GUIX_DAEMON_SOCKET")))) (live-paths store) (display "query-finished\n"))' >"$out/$name.locked-query" &
@@ -39,7 +40,7 @@ run_one() {
     return 1
   fi
   test ! -s "$out/$name.locked-query"
-  goonix_stop_capped "$holder"
+  goonix_stop_capped "$holder" "$holder_scope"
   wait "$holder" 2>/dev/null || true
   wait "$query"
   grep -q query-finished "$out/$name.locked-query"

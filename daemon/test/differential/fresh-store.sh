@@ -24,7 +24,7 @@ export GUIX_BINARY_SUBSTITUTE_URL="file://$fixture/substituter-data"
 export GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes
 export XDG_CACHE_HOME="$fixture/cache"
 export GUIX_TEST_DAEMON_OPTIONS=--disable-chroot
-export HS3_ROOT="$fixture"
+export HS3_ROOT="$fixture" HS7_FIXTURE="$fixture"
 if test -n "${WATCHDOG_PID:-}"; then
   trap 'test ! -e /proc/$WATCHDOG_PID || kill $WATCHDOG_PID 2>/dev/null || true' EXIT
 fi
