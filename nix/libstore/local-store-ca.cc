@@ -119,6 +119,29 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolv
     return result;
 }
 
+Strings LocalStore::goonixGraphChoiceHints(const Path & unresolved)
+{
+    Strings hints;
+    PathSet visited;
+    std::function<void(const Path &, const Derivation &)> visit =
+        [&](const Path & originalPath, const Derivation & original) {
+            if (!visited.insert(originalPath).second) return;
+            for (auto & input : original.inputDrvs)
+                visit(input.first, readDerivation(input.first));
+            if (!goonixAddressed(original)) return;
+            for (auto & output : original.outputs) {
+                Path chosen = chosenOutput(originalPath, output.first);
+                if (!chosen.empty()) {
+                    hints.push_back(originalPath);
+                    hints.push_back(output.first);
+                    hints.push_back(chosen);
+                }
+            }
+        };
+    visit(unresolved, readDerivation(unresolved));
+    return hints;
+}
+
 std::vector<BuildRecord> LocalStore::queryGoonixRecordsByPath(const Path & path)
 {
     return goonixRecords->queryByPath(path);

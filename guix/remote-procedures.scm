@@ -320,9 +320,10 @@ of strings, six per record; see 'build-records' in (guix ca)."
   (define (query-build-graph (store-path derivation))
     "Return the signed records of DERIVATION's whole build graph, seven
 strings per record: resolved hash, resolved derivation, output, path, origin,
-relocation flag and signature.  That is seven fields."
+relocation flag and signature.  That is seven fields.  The second string list
+contains unsigned original-derivation, output and chosen-path triples."
     id: 84
-    returns: string-list))
+    returns: string-list string-list))
 
 (define-syntax remote-procedure-id
   (syntax-rules ()

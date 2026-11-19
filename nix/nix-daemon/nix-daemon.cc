@@ -812,6 +812,8 @@ static void performOp(bool trusted, unsigned int clientVersion,
             ->queryGoonixBuildGraph(drv);
         stopWork();
         writeStrings(goonixRecordFields(records, true), to); // goonix: graph fields
+        writeStrings(dynamic_cast<LocalStore *>(store.get())
+            ->goonixGraphChoiceHints(drv), to); // goonix: unsigned resolution hints
         break;
     }
 

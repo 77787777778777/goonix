@@ -53,7 +53,7 @@
   #:use-module (guix workers)
   #:use-module (guix store)
   #:autoload (guix ca records)
-             (build-graph-records build-records->expression) ;goonix: record transport
+             (build-graph-records build-records->expression graph-response) ;goonix: record transport
   #:use-module ((guix serialization) #:select (write-file))
   #:use-module (zlib)
   #:autoload   (lzlib) (call-with-lzip-output-port
@@ -776,6 +776,13 @@ has the given HASH of type ALGO."
             (not-found request)))
       (not-found request)))
 
+(define (graph-choice-triples fields)
+  (let loop ((rest fields) (result '()))
+    (if (null? rest)
+        (reverse result)
+        (loop (cdddr rest)
+              (cons (list (car rest) (cadr rest) (caddr rest)) result)))))
+
 (define (render-goonix-records store request name) ;goonix: signed graph renderer
   "Render the signed build-record graph for the derivation named NAME."
   (let ((derivation (string-append (%store-prefix) "/" name)))
@@ -784,9 +791,11 @@ has the given HASH of type ALGO."
         (values '((content-type . (text/plain (charset . "UTF-8"))))
                 (call-with-output-string
                   (lambda (port)
-                    (write (build-records->expression
-                            (build-graph-records store derivation))
-                           port)
+                    (call-with-values (lambda () (graph-response store derivation))
+                      (lambda (records choices)
+                        (write (append (build-records->expression records)
+                                       `((choices ,(graph-choice-triples choices))))
+                               port)))
                     (newline port))))
         (not-found request))))
 

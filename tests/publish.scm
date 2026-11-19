@@ -25,7 +25,8 @@
   #:use-module (guix scripts publish)
   #:autoload (guix ca records)
              (build-graph-records build-records->expression
-                                  expression->build-records) ;goonix: record transport
+                                  expression->build-records
+                                  expression->graph-choices) ;goonix: record transport
   #:use-module (guix tests)
   #:use-module (guix config)
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
@@ -213,15 +214,24 @@ FileSize: ~a\n"
     (publish-uri
      (string-append "/" (store-path-hash-part %item) ".narinfo")))))
 
+(define %ca-record-expression
+  (call-with-input-string
+      (http-get-body
+       (publish-uri (string-append "/goonix/records/"
+                                   (basename
+                                    (derivation-file-name %ca-derivation)))))
+    read))
+
 (test-equal "/goonix/records/DERIVATION serves the signed graph" ;goonix: HTTP records
   %ca-record
-  (expression->build-records
-   (call-with-input-string
-       (http-get-body
-        (publish-uri (string-append "/goonix/records/"
-                                    (basename
-                                     (derivation-file-name %ca-derivation)))))
-     read)))
+  (expression->build-records %ca-record-expression))
+
+(test-assert "/goonix/records/DERIVATION serves unsigned choice hints"
+  (let ((choices (expression->graph-choices %ca-record-expression)))
+    (and (= 3 (length choices))
+         (equal? (list (derivation-file-name %ca-derivation) "out"
+                       (realised-output-path %store %ca-derivation "out"))
+                 choices))))
 
 (test-equal "/*.narinfo pipeline"
   (make-list 500 200)

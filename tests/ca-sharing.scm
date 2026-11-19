@@ -55,14 +55,14 @@
 
 ;; Reproduce the builder's resolution without consulting output derivers.
 ;; This is deliberately a test-side oracle for the graph protocol.
-(define (resolved-derivation drv)
+(define* (resolved-derivation drv #:key (name-of realised))
   (let* ((replacements
           (append-map
            (lambda (input)
              (let ((dependency (derivation-input-derivation input)))
                (map (lambda (output)
                       (cons (derivation->output-path dependency output)
-                            (realised dependency output)))
+                            (name-of dependency output)))
                     (derivation-input-sub-derivations input))))
            (derivation-inputs drv)))
          (substitute
@@ -91,7 +91,7 @@
                              (derivation-output-recursive? output))))))
                (derivation-outputs drv)))
          (make
-          (lambda (outputs)
+          (lambda (outputs marker?)
             (make-derivation
              outputs '()
              (sort (delete-duplicates
@@ -105,24 +105,27 @@
                           (cond ((assoc (car entry) outputs)
                                  => (lambda (output)
                                       (derivation-output-path (cdr output))))
-                                ((string=? (car entry) "goonixResolved") "1")
                                 (else (substitute (cdr entry))))))
-                  (sort (cons '("goonixResolved" . "1")
-                              (derivation-builder-environment-vars drv))
+                  (sort (if marker?
+                            (cons '("goonixResolved" . "1")
+                                  (derivation-builder-environment-vars drv))
+                            (derivation-builder-environment-vars drv))
                         (lambda (a b) (string<? (car a) (car b)))))
              #f)))
-         (initial (make (map (match-lambda
-                               ((name . output)
-                                (cons name
-                                      (if (derivation-output-hash output)
-                                          output
-                                          (make-derivation-output
-                                           (token-path
-                                            name
-                                            (store-path-package-name
-                                             (derivation-output-path output)))
-                                           #f #f #f)))))
-                             outputs)))
+         (token-outputs
+          (map (match-lambda
+                 ((name . output)
+                  (cons name
+                        (if (derivation-output-hash output)
+                            output
+                            (make-derivation-output
+                             (token-path
+                              name
+                              (store-path-package-name
+                               (derivation-output-path output)))
+                             #f #f #f)))))
+               outputs))
+         (initial (make token-outputs #f))
          (outputs
           (if (string=? addressing "resolved")
               (map (match-lambda
@@ -140,7 +143,7 @@
                                    #f #f #f))))))
                    outputs)
               outputs)))
-    (make outputs)))
+    (make outputs #t)))
 
 (define (resolved-hash drv)
   (bytevector->base16-string
@@ -305,6 +308,56 @@
       (and (= 2 (length records))
            (member (realised input) paths)
            (member (realised dependent) paths)))))
+
+(test-assert "graph choice hints name the paths used in the dependent's R"
+  (let* ((input (ca-drv "graph-hint-input"
+                        "(call-with-output-file (getenv \"out\") (lambda (p) (display (gettimeofday) p)))"))
+         (first (begin (build-derivations store (list input)) (realised input)))
+         (dependent #f))
+    (sleep 2)
+    (guard (c ((store-protocol-error? c) #t))
+      (build-derivations store (list input) (build-mode check)))
+    (let ((paths (delete-duplicates (record-paths (resolved-hash input) "out"))))
+      (test-assert "hint fixture has two records for its input"
+        (and (>= (length paths) 2) (member first paths)))
+      (set! dependent
+            (ca-drv "graph-hint-dependent"
+                    "(call-with-output-file (getenv \"out\") (lambda (p) (display (getenv \"input\") p)))"
+                    #:inputs (list input)
+                    #:env-vars `(("input" . ,(derivation->output-path input)))))
+      (build-derivations store (list dependent))
+      (call-with-values
+          (lambda () (graph-response store (derivation-file-name dependent)))
+        (lambda (records fields)
+          (let* ((choices (let loop ((rest fields))
+                            (if (null? rest) '()
+                                (cons (list (car rest) (cadr rest) (caddr rest))
+                                      (loop (cdddr rest))))))
+                 (chosen (assoc-ref (map (lambda (choice)
+                                           (cons (list (car choice) (cadr choice))
+                                                 (caddr choice)))
+                                         choices)
+                                    (list (derivation-file-name input) "out")))
+                 (name-of (lambda (drv output)
+                            (or (assoc-ref (map (lambda (choice)
+                                                  (cons (list (car choice) (cadr choice))
+                                                        (caddr choice)))
+                                                choices)
+                                           (list (derivation-file-name drv) output))
+                                (realised drv output))))
+                 (hash (bytevector->base16-string
+                        (sha256 (derivation->bytevector
+                                 (resolved-derivation dependent #:name-of name-of)))))
+                 (record (find (lambda (record)
+                                 (and (string=? hash (list-ref record 0))
+                                      (string=? (realised dependent)
+                                                (list-ref record 3))))
+                               records)))
+            (and (string=? first chosen)
+                 (member chosen paths)
+                 (not (string=? (derivation->output-path input) chosen))
+                 record
+                 (string=? hash (resolved-hash dependent)))))))))
 
 (test-assert "the graph query returns the later derivation's own record after collection"
   (let* ((name "graph-late-dedup")
