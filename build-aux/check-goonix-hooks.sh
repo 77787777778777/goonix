@@ -118,8 +118,8 @@ while IFS=$'\t' read -r status file; do
         fail "$file: not listed in $list"
     else
         read -r max_added max_removed <<<"$entry"
-        if ((added > max_added || removed > max_removed)); then
-            fail "$file: +$added -$removed exceeds the recorded +$max_added -$max_removed"
+        if ((added != max_added || removed != max_removed)); then
+            fail "$file: +$added -$removed differs from the recorded +$max_added -$max_removed"
         fi
     fi
 done <<<"$changed"
