@@ -62,6 +62,23 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ (mkGoonix pkgs) ];
+
+          # The bootstrap Guile 2.0 scripts in tests/gexp.scm must not load
+          # Guile 3.0's own ice-9/boot-9.go.  Keep the Guile libraries'
+          # compiled paths, but remove only the interpreter's private cache.
+          shellHook = ''
+            goonix_guile=${pkgs.guile}
+            GUILE_LOAD_COMPILED_PATH=$(IFS=:
+              result=
+              for path in ''${GUILE_LOAD_COMPILED_PATH-}; do
+                if [ "$path" != "$goonix_guile/lib/guile/3.0/ccache" ]; then
+                  result=''${result+$result:}$path
+                fi
+              done
+              printf '%s' "$result")
+            export GUILE_LOAD_COMPILED_PATH
+            unset goonix_guile
+          '';
         };
       });
     };
