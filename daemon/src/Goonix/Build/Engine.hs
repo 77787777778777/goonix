@@ -101,10 +101,13 @@ buildThingsInternal config rootFd store settings trace hook things mode = do
   readIORef failure >>= mapM_ throwIO
   where
     buildOne thing
-      | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace hook mode thing
+      | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace hook mode Set.empty thing
       | B.isInfixOf "!" thing = do
-          let (drv, _) = B.break (== 33) thing
-          buildOne drv
+          let (drv, selected) = B.break (== 33) thing
+              wanted = case C.split ',' (B.drop 1 selected) of
+                [""] -> Set.empty
+                names -> Set.fromList names
+          buildDerivation config rootFd store settings trace hook mode wanted drv
       | otherwise = case config of
           Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace thing)
           Nothing -> pure ()
@@ -118,8 +121,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> IO ()
-buildDerivation config rootFd store settings trace hook mode drvPath = do
+buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
+buildDerivation config rootFd store settings trace hook mode wanted drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -133,11 +136,16 @@ buildDerivation config rootFd store settings trace hook mode drvPath = do
   unless stillValid $ throwIO (storeError ("cannot build missing derivation `" ++ C.unpack drvPath ++ "'"))
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
-  forM_ (Map.keys (inputDrvs drv)) $ \input -> buildDerivation config rootFd store settings trace hook Normal input
+  forM_ (Map.toList (inputDrvs drv)) $ \(input, selected) -> buildDerivation config rootFd store settings trace hook Normal selected input
   forM_ (Set.toList (inputSrcs drv)) $ \input -> do
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
-  ready <- allOutputsValid store drv
+  let unknown = Set.difference wanted (Map.keysSet (outputs drv))
+  unless (Set.null unknown) $
+    throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' does not have requested output `" ++ C.unpack (Set.findMin unknown) ++ "'"))
+  let requestedOutputs = if Set.null wanted then outputs drv else Map.restrictKeys (outputs drv) wanted
+      requestedPaths = map outputPath (Map.elems requestedOutputs)
+  ready <- and <$> mapM (isValidPath store) requestedPaths
   failed <- if mode == Normal && not ready && settingBool "build-cache-failures" False settings
     then or <$> mapM (hasPathFailed store . outputPath) (Map.elems (outputs drv))
     else pure False
@@ -146,7 +154,7 @@ buildDerivation config rootFd store settings trace hook mode drvPath = do
     throwIO (storeError ("build of `" ++ C.unpack drvPath ++ "' failed previously (cached)"))
   substituted <- case config of
     Just serverConfig | mode /= Check && not ready && settingBool "build-use-substitutes" False settings ->
-      or <$> mapM (trySubstitute serverConfig rootFd store settings trace . outputPath) (Map.elems (outputs drv))
+      and <$> mapM (trySubstitute serverConfig rootFd store settings trace) requestedPaths
     _ -> pure False
   when (mode == Repair || mode == Check || not (ready || substituted)) $
     buildWithHook rootFd store settings trace hook mode drvPath drv
@@ -265,9 +273,14 @@ derivationInputs store seen current = do
         (if "builtin:" `B.isPrefixOf` builder current
           then inputSrcs current
           else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
-  dependencies <- mapM readStoreDerivation (filter (`Set.notMember` seen) (Map.keys (inputDrvs current)))
-  let dependencyOutputs = Set.fromList [outputPath output | dependency <- dependencies, output <- Map.elems (outputs dependency)]
-  foldM (derivationInputs store) (Set.union seen (Set.union direct dependencyOutputs)) dependencies
+  dependencies <- mapM (\(path, selected) -> (,) selected <$> readStoreDerivation path)
+    (filter (\(path, _) -> Set.notMember path seen) (Map.toList (inputDrvs current)))
+  let dependencyOutputs = Set.fromList
+        [ outputPath output
+        | (selected, dependency) <- dependencies
+        , output <- Map.elems (if Set.null selected then outputs dependency else Map.restrictKeys (outputs dependency) selected)
+        ]
+  foldM (derivationInputs store) (Set.union seen (Set.union direct dependencyOutputs)) (map snd dependencies)
   where
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
@@ -467,7 +480,7 @@ spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = d
           (sandboxFlagSlirpNetwork .|. (if ipv6 then sandboxFlagIpv6Network else 0) .|.
             (if isolate then sandboxFlagIsolateHostLoopback else 0),
             C.pack program, slirpSeccompFilter nativeArchitecture)
-  inputs <- foldM derivationInputs Set.empty [drv]
+  inputs <- derivationInputs store Set.empty drv
   let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
   let sandboxWork = "/tmp/guix-build-" <> storePathToName (storeDirectory store) drvPath <> "-0"
@@ -526,19 +539,6 @@ spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = d
     if result < 0 then throwIO (storeError "cannot spawn sandbox helper") else do
       pid <- fromIntegral <$> peek pidPointer
       pure (pid, waitForSandbox pid, Just root, map outputPath (Map.elems (outputs drv)))
-  where
-    derivationInputs seen current
-      | otherwise = do
-          let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
-                (if "builtin:" `B.isPrefixOf` builder current
-                  then inputSrcs current
-                  else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
-          dependencies <- mapM readStoreDerivation (filter (`Set.notMember` seen) (Map.keys (inputDrvs current)))
-          let dependencyOutputs = Set.fromList [outputPath output | dependency <- dependencies, output <- Map.elems (outputs dependency)]
-          foldM derivationInputs (Set.union seen (Set.union direct dependencyOutputs)) dependencies
-    readStoreDerivation path = do
-      bytes <- B.readFile (C.unpack path)
-      either (throwIO . storeError) pure (parseDerivation bytes)
 
 copyEtcFile :: RawFilePath -> RawFilePath -> IO ()
 copyEtcFile root path =
