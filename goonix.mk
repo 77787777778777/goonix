@@ -6,6 +6,7 @@ MODULES +=					\
   guix/pure-eval.scm				\
   guix/package-overrides.scm			\
   guix/ca.scm					\
+  guix/ca/derivation.scm				\
   guix/download-cache.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
@@ -45,11 +46,6 @@ SH_TESTS +=					\
   tests/guix-goonix-defaults.sh			\
   tests/guix-flake-shell.sh			\
   tests/guix-flake.sh
-
-# The hook check fails as long as upstream files hold logic of ours or
-# unmarked changes.  It is listed here so that the day it passes, the test
-# suite says so and this line goes away.
-XFAIL_TESTS = build-aux/check-goonix-hooks.sh
 
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\

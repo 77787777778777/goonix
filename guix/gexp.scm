@@ -1334,8 +1334,7 @@ The other arguments are as for 'derivation'."
                                                          #:target target)
                                        (return #f)))
                        (guile -> (lowered-gexp-guile lowered))
-                       (builder-text -> (sexp->string
-                                         (lowered-gexp-sexp lowered)))
+                       (builder-text -> (sexp->string (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
                                      (text-file script-name builder-text)
                                      (return script-name))))
@@ -1351,12 +1350,12 @@ The other arguments are as for 'derivation'."
                         ,@(append-map (lambda (directory)
                                         `("-C" ,directory))
                                       (lowered-gexp-load-compiled-path lowered))
-                        ,(if (eq? addressing 'input)
+                        ,(if (eq? addressing 'input) ;goonix: embedded builder in non-input modes
                              builder
                              (string-append "$NIX_BUILD_TOP/" builder)))
                       #:outputs outputs
                       #:env-vars
-                      `(,@env-vars
+                      `(,@env-vars ;goonix: __files and addressing are daemon metadata
                         ,@(if (eq? addressing 'input)
                               '()
                               `(("__files" . ,builder)
@@ -1370,11 +1369,11 @@ The other arguments are as for 'derivation'."
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))
                                      (#f '())))
-                      #:sources `(,@(if (eq? addressing 'input)
+                      #:sources `(,@(if (eq? addressing 'input) ;goonix: builder embedded for CA
                                         (list builder)
                                         '())
                                   ,@(if (and (string? modules)
-                                             (store-path? modules))
+                                             (store-path? modules)) ;goonix: other sources unchanged
                                         (list modules)
                                         '())
                                   ,@(lowered-gexp-sources lowered)

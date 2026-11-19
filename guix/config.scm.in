@@ -111,7 +111,7 @@
 (define %system
   "@guix_system@")
 
-(define %guile
+(define %guile ;goonix: contained evaluator used by pure evaluation
   "@GUILE@")
 
 (define %git

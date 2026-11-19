@@ -215,7 +215,12 @@
            (string-prefix? "GLIBC-P2" (read-all o2))
            (= 1 (length (glibc-items o1)))
            (= 1 (length (glibc-items o2)))
-           (equal? (glibc-items o1) (glibc-items o2))))))
+           (equal? (glibc-items o1) (glibc-items o2))
+           ;; Re-resolve after both dependents are realised: no goal may be
+           ;; left asleep when all of its CA inputs already share a result.
+           (build-derivations store (list p1 p2))
+           (and (string=? o1 (realised p1))
+                (string=? o2 (realised p2)))))))
 
 (test-assert "an input-addressed derivation may not depend on a CA input"
   (let ((ca-input (ca-drv "ca-for-mixed" (write-output "X"))))

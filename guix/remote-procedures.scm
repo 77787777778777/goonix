@@ -303,12 +303,11 @@ Return #t on success."
     id: 81
     returns: string-list)
 
-  ;; goonix: query the daemon's choice, not a mapping supplied by the client.
-  (define (query-realised-output (store-path derivation)
-                                 (utf8-string output))
+  ;; goonix: direct binding; store.scm exposes the same procedure name.
+  (define (query-realised-output/direct (store-path derivation)
+                                        (utf8-string output))
     "Return the realised store path of DERIVATION's OUTPUT."
-    id: 82
-    returns: store-path)
+    id: 82 returns: store-path)
 
   (define (query-build-records (base16 resolved-hash)
                                (utf8-string output))

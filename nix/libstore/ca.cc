@@ -224,8 +224,7 @@ std::vector<std::pair<string, Path>> contentOutputOrder(
     return result;
 }
 
-void checkGoonixRegistration(LocalStore & store, const Path & path,
-    const Derivation & drv)
+void checkGoonixRegistration(const Path & path, const Derivation & drv)
 {
     /* Placeholders and resolved/token paths are intentionally not
        historical output:ID paths.  Validate their shape during resolution. */
@@ -242,9 +241,6 @@ void checkGoonixRegistration(LocalStore & store, const Path & path,
         }
     } else if (resolved) {
         checkResolvedDerivation(drv);
-    } else {
-        store.checkDerivationOutputs(path, drv);
-        checkInputAddressedPolicy(store, drv);
     }
 }
 
@@ -257,10 +253,8 @@ void checkGoonixBatchRegistration(LocalStore & store, const Path & path,
         throw Error(std::format(
             "goonix: derivation `{0}' is marked resolved without an addressing",
             path));
-    else {
-        store.checkDerivationOutputs(path, drv);
+    else
         checkInputAddressedPolicy(store, drv);
-    }
 }
 
 void checkGoonixDerivationOutputs(const Path & drvPath, const Derivation & drv)

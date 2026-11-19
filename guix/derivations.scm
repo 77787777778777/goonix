@@ -96,7 +96,7 @@
             read-derivation
             read-derivation-from-file
             write-derivation
-            derivation->bytevector
+            derivation->bytevector           ;goonix: masked bytes for placeholders
             derivation->output-path
             derivation->output-paths
             derivation-path->output-path
@@ -105,7 +105,7 @@
             raw-derivation
             invalidate-derivation-caches!
 
-            realised-output-path
+            realised-output-path           ;goonix: query the daemon's chosen path
             map-derivation
 
             build-derivations
@@ -576,6 +576,7 @@ things as appropriate and is thus more efficient."
       (let ((drv (call-with-input-file file
                    (lambda (port)
                      (let ((drv (read-derivation port)))
+                       ;; goonix: preserve canonical file identity for resolution.
                        (make-derivation (derivation-outputs drv)
                                         (derivation-inputs drv)
                                         (derivation-sources drv)
@@ -819,7 +820,7 @@ name of each input with that input's hash."
                      allowed-references disallowed-references
                      leaked-env-vars local-build?
                      (substitutable? #t)
-                     (addressing 'input)          ;goonix: input|content|resolved
+                     (addressing 'input) ;goonix: input|content|resolved
                      (properties '())
                      (%deprecation-warning? #t))
   "Build a derivation with the given arguments, and return the resulting
@@ -853,62 +854,25 @@ output should not be used.
 PROPERTIES must be an association list describing \"properties\" of the
 derivation.  It is kept as-is, uninterpreted, in the derivation."
   (define (add-output-paths drv)
-    ;; Return DRV with an actual store path for each of its output and the
-    ;; corresponding environment variable.
-    (match drv
-      (($ <derivation> outputs inputs sources
-                       system builder args env-vars)
-       (unless (memq addressing '(input content resolved))
-         (error "unknown derivation addressing" addressing))
-       (let* ((drv-hash (derivation-hash drv))
-              (masked-bytes (derivation->bytevector drv))
-              (outputs  (map (match-lambda
-                               ((output-name . ($ <derivation-output>
-                                                  _ algo hash rec?))
-                                (let ((path
-                                       (cond
-                                        (hash
-                                         (fixed-output-path name hash
-                                                            #:hash-algo algo
-                                                            #:output output-name
-                                                            #:recursive? rec?))
-                                        ((eq? addressing 'input)
-                                         (output-path output-name
-                                                      drv-hash name))
-                                        (else
-                                         (token-path output-name
-                                          (if (string=? output-name "out")
-                                              name
-                                              (string-append name "-"
-                                                             output-name)))))))
-                                  (cons output-name
-                                        (make-derivation-output path algo
-                                                                hash rec?)))))
-                             outputs)))
-         (make-derivation
-          (map (match-lambda
-                 ((output-name . output)
-                  (cons output-name
-                        (if (or (eq? addressing 'input)
-                                (derivation-output-hash output))
-                            output
-                            (make-derivation-output
-                             (placeholder masked-bytes output-name
-                                          (store-path-package-name
-                                           (derivation-output-path output)))
-                             (derivation-output-hash-algo output)
-                             (derivation-output-hash output)
-                             (derivation-output-recursive? output))))))
-               outputs)
-          inputs sources system builder args
-          (map (match-lambda
-                 ((name . value)
-                  (cons name
-                        (or (and=> (assoc-ref outputs name)
-                                   derivation-output-path)
-                            value))))
-               env-vars)
-          #f)))))
+    ;; goonix: output addressing and placeholders are implemented in our module.
+    ((module-ref (resolve-interface '(guix ca derivation))
+                 'validate-addressing) addressing)
+    ((module-ref (resolve-interface '(guix ca derivation))
+                 'add-addressed-output-paths)
+     drv name addressing output-path
+     (lambda (output-name algo hash rec?)
+       (fixed-output-path name hash #:hash-algo algo
+                          #:output output-name #:recursive? rec?))
+     derivation-output-path derivation-output-hash
+     derivation-output-hash-algo derivation-output-recursive?
+     make-derivation-output
+     (lambda (drv)
+       (list (derivation-outputs drv) (derivation-inputs drv)
+             (derivation-sources drv) (derivation-system drv)
+             (derivation-builder drv) (derivation-builder-arguments drv)
+             (derivation-builder-environment-vars drv)))
+     derivation->bytevector derivation-hash
+     store-path-package-name make-derivation))
 
   (define (user+system-env-vars)
     ;; Some options are passed to the build daemon via the env. vars of
@@ -936,10 +900,8 @@ derivation.  It is kept as-is, uninterpreted, in the derivation."
                           (() '())
                           (lst `(("guix properties"
                                   . ,(object->string properties)))))
-                      ,@(if (eq? addressing 'input)
-                            '()
-                            `(("goonixAddressing"
-                               . ,(symbol->string addressing))))
+                      ,@((module-ref (resolve-interface '(guix ca derivation))
+                                     'addressing-environment) addressing) ;goonix: addressing marker
                       ,@env-vars)))
       (match references-graphs
         (((file . path) ...)
@@ -1166,7 +1128,7 @@ recursively."
 
 (define (realised-output-path store drv output)
   "Return DRV's chosen realised OUTPUT from STORE, never a placeholder."
-  (query-realised-output/direct store (derivation-file-name drv) output))
+  (query-realised-output/direct store (derivation-file-name drv) output)) ;goonix: daemon choice
 
 (define* (build-derivations store derivations
                             #:optional (mode (build-mode normal)))

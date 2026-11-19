@@ -5,6 +5,7 @@
 #include "pathlocks.hh"
 #include "worker-protocol.hh"
 #include "derivations.hh"
+#include "ca-auth.hh" // goonix: narrow signature-verification bridge
 #include "records.hh" // goonix: resolved build records
 #include "ca.hh"
 
@@ -528,8 +529,13 @@ uint64_t LocalStore::addValidPath(const ValidPathInfo & info, bool checkOutputs)
            derivations).  Note that if this throws an error, then the
            DB transaction is rolled back, so the path validity
            registration above is undone. */
-        // goonix: all addressing-specific registration validation lives in ca.cc.
-        if (checkOutputs) checkGoonixRegistration(*this, info.path, drv);
+        // goonix: address-specific validation is ours; the ordinary check stays upstream.
+        if (checkOutputs && drv.env.find("goonixAddressing") != drv.env.end())
+            checkGoonixRegistration(info.path, drv);
+        else if (checkOutputs) {
+            checkDerivationOutputs(info.path, drv);
+            checkInputAddressedPolicy(*this, drv); // goonix: mixed policy
+        }
 
         for (auto & i : drv.outputs) {
             stmtAddDerivationOutput.use()
@@ -987,7 +993,13 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 // derivation in addValidPath().
                 Derivation drv = readDerivation(i.path);
                 // goonix: validate output identities after references are valid.
-                checkGoonixBatchRegistration(*this, i.path, drv);
+                if (drv.env.find("goonixAddressing") != drv.env.end() ||
+                    resolvedDerivation(drv))
+                    checkGoonixBatchRegistration(*this, i.path, drv);
+                else {
+                    checkDerivationOutputs(i.path, drv);
+                    checkInputAddressedPolicy(*this, drv);
+                }
             }
 
         /* Do a topological sort of the paths.  This will throw an
@@ -1168,7 +1180,7 @@ static std::shared_ptr<Agent> authenticationAgent()
 
     if (!agent) {
 	Strings args = { "authenticate" };
-        const std::map<string, string> env = {
+        const std::map<string, string> env = { // goonix: authenticate with this store's keys
             { "GUIX_CONFIGURATION_DIRECTORY", settings.nixConfDir }
         };
 	agent = std::make_shared<Agent>(settings.guixProgram, args, env, true);
@@ -1257,13 +1269,10 @@ string LocalStore::signBuildRecord(const string & payload)
     return signHash(secretKey, hashString(htSHA256, payload));
 }
 
-// goonix: authenticate first, then validate and store the record in our module.
-void LocalStore::recordGoonixBuild(const Path & resolvedPath,
-    const string & output, const Path & path, const string & resolvedHash,
-    const string & origin, bool relocationChecked, const string & signature)
+// goonix: forward only the store-authenticated digest to the record module.
+string verifyGoonixRecordSignature(LocalStore &, const string & signature)
 {
-    recordGoonixBuildVerified(resolvedPath, output, path, resolvedHash,
-        origin, relocationChecked, signature, verifySignature(signature));
+    return verifySignature(signature);
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,

@@ -1491,7 +1491,7 @@ void commonChildInit(Pipe & logPipe)
 
 //////////////////////////////////////////////////////////////////////
 
-Agent::Agent(const string &command, const Strings &args,
+Agent::Agent(const string &command, const Strings &args, // goonix: separate binary replies from logs
     const std::map<string, string> &env, bool separateStderr)
 {
     debug(std::format("starting agent '{}'", command));

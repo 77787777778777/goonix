@@ -6,7 +6,7 @@
 
 #include "pathlocks.hh"
 #include "store-api.hh"
-#include "records.hh"
+#include "records.hh" // goonix: build-record types
 #include "util.hh"
 
 
@@ -139,7 +139,7 @@ public:
        remain. */
     bool verifyStore(bool checkContents, bool repair);
 
-    // goonix: persistent facts, choices and cryptographic record signatures.
+    // goonix: persistent facts and choices; records survive store collection.
     Path realisedOutputPath(const Path & drvPath, const Derivation & drv,
         const string & output);
     void recordBuild(const Path & resolvedPath, const string & output,
@@ -147,25 +147,16 @@ public:
     void recordGoonixBuild(const Path & resolvedPath, const string & output,
         const Path & path, const string & resolvedHash, const string & origin,
         bool relocationChecked, const string & signature);
-    // goonix: called only after upstream's authentication helper verifies it.
-    void recordGoonixBuildVerified(const Path & resolvedPath, const string & output,
-        const Path & path, const string & resolvedHash, const string & origin,
-        bool relocationChecked, const string & signature, const string & verifiedHash);
     std::vector<BuildRecord> queryGoonixBuildRecords(const string & hash,
         const string & output);
     std::vector<BuildRecord> queryGoonixRecordsByPath(const Path & path);
     std::vector<BuildRecord> queryGoonixRecordsByResolved(const Path & resolved);
     std::vector<RecordConflict> queryGoonixConflicts(const string & hash,
         const string & output);
-    /* Record-driven reachability: an output keeps every derivation whose
-       records name it, and vice versa (plan 10).  Several derivers. */
     PathSet goonixDerivationsForPath(const Path & path);
     PathSet goonixOriginalsForPath(const Path & path);
     PathSet goonixChosenPaths(const Path & unresolved);
-    /* Set this machine's choice from a record for a resolved derivation.
-       Keeps a valid existing choice (default policy), records any
-       disagreement, and repairs a collected choice.  `adopt' forces the
-       given path even over a valid choice (explicit policy). */
+    /* Select from facts; adopt=true explicitly replaces a valid local choice. */
     Path selectGoonixOutput(const Path & unresolved, const string & output,
         const string & resolvedHash, const Path & preferred, bool adopt);
     void chooseGoonixOutput(const Path & unresolved, const string & output,
@@ -181,9 +172,6 @@ public:
         const PathSet & references);
     Path addTextToStoreNoDerivationOutputs(const string & name,
         const string & contents, const PathSet & references);
-
-    // goonix: validation dispatch in ca.cc calls the ordinary check as well.
-    void checkDerivationOutputs(const Path & drvPath, const Derivation & drv);
 
     /* Register the validity of a path, i.e., that `path' exists, that
        the paths referenced by it exists, and in the case of an output
@@ -309,6 +297,7 @@ private:
 
     Path importPath(Source & source);
 
+    void checkDerivationOutputs(const Path & drvPath, const Derivation & drv);
 
     typedef std::unordered_set<ino_t> InodeHash;
 

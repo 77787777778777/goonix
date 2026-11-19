@@ -120,7 +120,7 @@ static Derivation parseDerivation(const string & s)
 }
 
 
-Derivation parseDerivationText(const string & contents)
+Derivation parseDerivationText(const string & contents) // goonix: parse resolved bytes
 {
     return parseDerivation(contents);
 }

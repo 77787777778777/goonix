@@ -74,6 +74,12 @@ libstore_a_SOURCES +=				\
   %D%/libstore/records.cc			\
   %D%/libstore/ca.cc				\
   %D%/libstore/local-store-ca.cc			\
+  %D%/libstore/build-ca.cc			\
+  %D%/libstore/build-ca.hh			\
+  %D%/libstore/build-have.inc			\
+  %D%/libstore/build-output.inc			\
+  %D%/libstore/build-input.inc			\
+  %D%/libstore/build-register.inc			\
   %D%/libstore/deep-scan.cc
 
 libstore_headers =				\

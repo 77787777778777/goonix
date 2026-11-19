@@ -707,7 +707,7 @@ definitions."
   (query-substitutable-path-infos => substitutable-path-info)
   (built-in-builders => built-in-builders/direct)
   ;; goonix: resolved-output and signed-record queries.
-  (query-realised-output => query-realised-output/direct)
+  query-realised-output/direct
   query-build-records
   optimize-store
   (verify-store => verify-store/direct)

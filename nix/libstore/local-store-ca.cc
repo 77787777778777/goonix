@@ -1,5 +1,6 @@
 // goonix: local-store record, choice and resolved-path implementation.
 #include "local-store.hh"
+#include "ca-auth.hh" // goonix: authentication remains in upstream's module
 #include "ca.hh"
 #include "derivations.hh"
 #include "globals.hh"
@@ -39,11 +40,11 @@ void LocalStore::recordBuild(const Path & resolvedPath,
     goonixRecords->add(record);
 }
 
-void LocalStore::recordGoonixBuildVerified(const Path & resolvedPath,
+void LocalStore::recordGoonixBuild(const Path & resolvedPath,
     const string & output, const Path & path, const string & resolvedHash,
-    const string & origin, bool relocationChecked, const string & signature,
-    const string & verifiedHash)
+    const string & origin, bool relocationChecked, const string & signature)
 {
+    const string verifiedHash = verifyGoonixRecordSignature(*this, signature);
     BuildRecord record{resolvedHash, resolvedPath, output, path, origin,
         relocationChecked, signature};
     /* Authenticate first: an unsigned or unauthorized mapping is refused

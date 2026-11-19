@@ -47,7 +47,7 @@ typedef enum {
     wopBuiltinBuilders = 80,
     wopSubstituteURLs = 81,
     wopQueryRealisedOutput = 82, // goonix
-    wopQueryBuildRecords = 83
+    wopQueryBuildRecords = 83 // goonix: signed records for a resolved derivation
 } WorkerOp;
 
 
