@@ -2091,6 +2091,19 @@ This is an internal procedure."
            #:system system #:target target
            (bag-arguments bag))))
 
+(define bag->derivation/plain bag->derivation) ;goonix: retain upstream lowerer
+(define bag->cross-derivation/plain bag->cross-derivation) ;goonix: retain upstream lowerer
+(set! bag->derivation
+      (lambda args
+        (apply (module-ref (resolve-module '(guix ca policy))
+                           'lower-bag-with-addressing)
+               bag->derivation/plain args))) ;goonix: exact package bag boundary
+(set! bag->cross-derivation
+      (lambda args
+        (apply (module-ref (resolve-module '(guix ca policy))
+                           'lower-bag-with-addressing)
+               bag->cross-derivation/plain args))) ;goonix: exact cross package bag boundary
+
 (define bag->derivation*
   (store-lower bag->derivation))
 
@@ -2153,8 +2166,8 @@ system identifying string)."
 ;; goonix: both heed the overrides in effect; see (guix package-overrides).
 (define package->derivation/plain package->derivation) ;goonix: retain upstream lowerer
 (define package->cross-derivation/plain package->cross-derivation) ;goonix: retain upstream lowerer
-(set! package->derivation (overridable (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'lower-package-with-addressing) package->derivation/plain args)))) ;goonix: bind policy
-(set! package->cross-derivation (overridable (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'lower-package-with-addressing) package->cross-derivation/plain args)))) ;goonix: bind policy
+(set! package->derivation (overridable package->derivation/plain)) ;goonix: heed overrides
+(set! package->cross-derivation (overridable package->cross-derivation/plain)) ;goonix: heed overrides
 
 (define* (package-output store package
                          #:optional (output "out") (system (%current-system)))

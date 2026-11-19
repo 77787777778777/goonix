@@ -344,7 +344,9 @@ OBJ must be an object that has an associated gexp compiler, such as a
                               (loop lowered)
                               (return lowered)))
                         obj
-                        system target graft?))))))))
+                        system target graft?
+                        ((module-ref (resolve-module '(guix ca policy))
+                                     'package-addressing-key)))))))))) ;goonix: mode-sensitive object cache
 
 (define* (lower+expand-object obj
                               #:optional (system (%current-system))
@@ -364,7 +366,9 @@ expand to file names, but it's possible to expand to a plain data type."
                                            (return obj)
                                            (mcached (lower obj system target)
                                                     obj
-                                                    system target graft?))))
+                                                    system target graft?
+                                                    ((module-ref (resolve-module '(guix ca policy))
+                                                                 'package-addressing-key)))))) ;goonix: mode-sensitive object cache
            ;; LOWER might return something that needs to be further
            ;; lowered.
            (if (struct? lowered)
@@ -1334,6 +1338,9 @@ The other arguments are as for 'derivation'."
                                                          #:target target)
                                        (return #f)))
                        (guile -> (lowered-gexp-guile lowered))
+                       (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
+                                       addressing (lowered-gexp-guile lowered)
+                                       (lowered-gexp-inputs lowered) graphs allowed disallowed)) ;goonix: actual inputs and references
                        (builder-text -> (sexp->string
                                          (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
