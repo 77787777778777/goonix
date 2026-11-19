@@ -602,6 +602,12 @@ void slirpChild(Plan & plan, int tap, int readyFd)
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
         _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
     }
+    /* This second fork enters slirp's PID namespace.  Its immediate parent
+       exits when the outer helper dies, so propagate death across that
+       boundary as well.  getppid() is zero for a healthy PID 1 here, so it
+       cannot be used as the race sentinel. */
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+        sysError("setting slirp parent-death signal");
     if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1)
         sysError("making slirp mounts private");
     if (mount("tmpfs", oldRoot.c_str(), "tmpfs", 0, "mode=0755") == -1 ||
@@ -677,6 +683,12 @@ gid_t slirpHostGid = 0;
 void prepareSlirp(Plan & plan)
 {
     if (!plan.has(slirpNetworkFlag)) return;
+    /* slirp is reparented to the persistent outer helper when the builder
+       enters its PID namespace.  Install this before fork: a SIGKILL to
+       that helper cannot run forwardTermination(), and the slirp child's
+       own PDEATHSIG relationship is with an intermediate fork parent. */
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1 || getppid() == 1)
+        sysError("setting helper parent-death signal");
     if (plan.slirpProgram.empty() || plan.slirpProgram.front() != '/')
         throw Error("slirp program is not absolute");
     int sockets[2];
@@ -1066,7 +1078,7 @@ void enterPidNamespace(Plan & plan)
     if (child == 0) {
         /* The helper is the daemon's direct child; if it is killed, do not
            leave the builder running as PID 1 in the new PID namespace. */
-        if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1 || getppid() == 1)
             sysError("setting builder parent-death signal");
         return;
     }

@@ -12,8 +12,15 @@ if BUILD_HASKELL_DAEMON
 bin_PROGRAMS =
 noinst_LIBRARIES =
 BUILT_SOURCES += daemon/src/Goonix/Config.hs
-CLEANFILES += daemon/src/Goonix/Config.hs guix-daemon
+CLEANFILES += daemon/src/Goonix/Config.hs guix-daemon guix-sandbox \
+  guix-daemon.tmp guix-sandbox.tmp
 
+# The sandbox helper is built in the source tree with the daemon, so Guix's
+# existing GUIX_SANDBOX override and tests can select this exact binary.
+guix-sandbox: $(top_srcdir)/daemon/sandbox/guix-sandbox.cc
+	$(AM_V_CXX)$(CXX) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS) -std=c++17 \
+	  -O2 -Wall -Wextra -Wpedantic $(LDFLAGS) $(LDLIBS) -o $@.tmp $<; \
+	  mv $@.tmp $@
 # Keep the direct build independent of Cabal's package database and of Hackage.
 DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
   -threaded -with-rtsopts=-N \
@@ -23,15 +30,12 @@ DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
   $(LIBGCRYPT_LDFLAGS) $(LIBGCRYPT_LIBS) $(SQLITE3_CFLAGS) $(SQLITE3_LIBS) \
   -lz -lbz2
 
-# All Haskell modules are prerequisites through the generated dependency file.
--include daemon/.depends.mk
+# Keep source prerequisites explicit: GHC writes objects under ghc-build, not
+# at the paths emitted by ghc -M. A source edit must always dirty this target.
+DAEMON_SOURCES = $(shell find $(top_srcdir)/daemon/app $(top_srcdir)/daemon/src \
+  $(top_srcdir)/daemon/cbits \( -name '*.hs' -o -name '*.c' -o -name '*.h' \))
 
-daemon/.depends.mk:
-	$(AM_V_GEN)$(MKDIR_P) daemon; \
-	$(GHC) -M -dep-makefile=$@.tmp $(DAEMON_GHC_FLAGS) \
-	  $(top_srcdir)/daemon/app/Main.hs; mv $@.tmp $@
-
-guix-daemon: daemon/src/Goonix/Config.hs daemon/.depends.mk
+guix-daemon: guix-sandbox $(DAEMON_SOURCES) daemon/src/Goonix/Config.hs
 	$(AM_V_GEN)$(GHC) --make $(DAEMON_GHC_FLAGS) \
 	  -outputdir daemon/ghc-build -o $@.tmp \
 	  $(top_srcdir)/daemon/cbits/sockets.c \
@@ -40,13 +44,14 @@ guix-daemon: daemon/src/Goonix/Config.hs daemon/.depends.mk
   $(top_srcdir)/daemon/cbits/logs.c \
 	  $(top_srcdir)/daemon/app/Main.hs; mv $@.tmp $@
 
-install-exec-local: guix-daemon
+install-exec-local: guix-daemon guix-sandbox
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"
 	$(INSTALL_PROGRAM) guix-daemon "$(DESTDIR)$(bindir)/guix-daemon"
+	$(INSTALL_PROGRAM) guix-sandbox "$(DESTDIR)$(bindir)/guix-sandbox"
 
 uninstall-local: uninstall-haskell-daemon
 uninstall-haskell-daemon:
-	rm -f "$(DESTDIR)$(bindir)/guix-daemon"
+	rm -f "$(DESTDIR)$(bindir)/guix-daemon" "$(DESTDIR)$(bindir)/guix-sandbox"
 
 daemon/src/Goonix/Config.hs: Makefile guix/store/schema.sql
 	$(AM_V_GEN)$(MKDIR_P) daemon/src/Goonix; \
@@ -87,7 +92,8 @@ EXTRA_DIST += \
   daemon/test/differential/read-only.sh daemon/test/differential/transports.sh \
   daemon/test/differential/guix-readonly.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
-  daemon/sandbox/Makefile \
+  daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
+  daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
   daemon/test/sandbox-probe/README.md \
   daemon/test/sandbox-probe/UPSTREAM-REUSE.md \
   daemon/test/sandbox-probe/ThreadedUnshareProbe.hs \
