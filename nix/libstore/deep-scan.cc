@@ -25,7 +25,7 @@ Path deepScanHelperPath()
     return override.empty() ? string(GOONIX_LIBEXEC_DIR) + "/goonix-ca-scan" : override;
 }
 
-void checkDeepOutput(const Path & tree, const StringSet & tokens,
+static void runDeepScanHelper(const Path & tree, const StringSet & tokens,
     uid_t buildUID, gid_t buildGID)
 {
     if (!settings.get("goonix-deep-scan", false)) return;
@@ -145,6 +145,21 @@ void checkDeepOutput(const Path & tree, const StringSet & tokens,
     if (code == 127)
         throw BuildError(std::format("deep CA scan helper could not be executed: `{}'", helper));
     throw BuildError(std::format("deep CA scan helper failed (status {}): {}", code, diagnostic));
+}
+
+void checkDeepOutput(const Path & tree, const StringSet & tokens,
+    uid_t buildUID, gid_t buildGID, std::function<void()> cleanup)
+{
+    if (!settings.get("goonix-deep-scan", false)) return;
+    try {
+        runDeepScanHelper(tree, tokens, buildUID, buildGID);
+    } catch (...) {
+        if (cleanup) {
+            try { cleanup(); } catch (...) { ignoreException(); }
+        }
+        throw;
+    }
+    if (cleanup) cleanup();
 }
 
 }

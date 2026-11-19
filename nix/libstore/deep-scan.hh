@@ -1,6 +1,7 @@
 // goonix: run deep CA decoding in a separate, unprivileged process.
 #pragma once
 #include "types.hh"
+#include <functional>
 
 namespace nix {
 
@@ -11,6 +12,7 @@ namespace nix {
 Path deepScanHelperPath();
 
 void checkDeepOutput(const Path & tree, const StringSet & tokens,
-    uid_t buildUID = (uid_t) -1, gid_t buildGID = (gid_t) -1);
+    uid_t buildUID = (uid_t) -1, gid_t buildGID = (gid_t) -1,
+    std::function<void()> cleanup = {});
 
 }

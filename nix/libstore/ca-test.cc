@@ -814,6 +814,36 @@ static void checkDeepCompressedSelfToken(const Path & root)
         timeoutRefused = string(error.what()).find("exceeded") != string::npos;
     }
     check(timeoutRefused, "helper timeout refuses finalisation");
+
+    unsigned cleanups = 0;
+    auto countCleanup = [&] { ++cleanups; };
+    settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
+    bool foundAgain = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            countCleanup);
+    } catch (const Error &) { foundAgain = true; }
+    check(foundAgain && cleanups == 1, "deep scan cleanup runs after a refusal");
+    settings.set("goonix-deep-scan-helper", root + "/missing-helper");
+    bool missingAgain = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            countCleanup);
+    } catch (const Error &) { missingAgain = true; }
+    check(missingAgain && cleanups == 2, "deep scan cleanup runs after helper failure");
+    settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
+    bool originalError = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            [] { throw Error("cleanup failure"); });
+    } catch (const Error & error) {
+        originalError = string(error.what()).find("unresolved goonix self token") != string::npos;
+    }
+    check(originalError, "cleanup failure does not replace a scan refusal");
+    settings.set("goonix-deep-scan", "false");
+    checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+        countCleanup);
+    check(cleanups == 2, "disabled deep scan does not run cleanup");
 }
 
 int main(int argc, char ** argv)
