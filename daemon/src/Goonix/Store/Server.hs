@@ -243,6 +243,8 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeStrings paths)
   20 -> do
+    settings <- readIORef settingsRef
+    when (remote settings) (throwIO (storeError "Garbage collection is disabled for remote hosts."))
     action <- readIntSocket client
     paths <- readStorePathsSocket client
     ignoreLiveness <- readIntSocket client
