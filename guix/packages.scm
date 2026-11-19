@@ -2122,6 +2122,7 @@ This is an internal procedure."
                                               #:guile guile)))))
                  (return drv)))
            package system #f graft?
+           ((module-ref (resolve-module '(guix ca policy)) 'package-addressing-key)) ;goonix: current policy and origins
            (package-override-key)))               ;goonix: overrides in effect
 
 (define* (package->cross-derivation package target
@@ -2146,11 +2147,14 @@ system identifying string)."
                                               #:guile guile)))))
                  (return drv)))
            package system target graft?
+           ((module-ref (resolve-module '(guix ca policy)) 'package-addressing-key)) ;goonix: current policy and origins
            (package-override-key)))               ;goonix: overrides in effect
 
 ;; goonix: both heed the overrides in effect; see (guix package-overrides).
-(set! package->derivation (overridable package->derivation))
-(set! package->cross-derivation (overridable package->cross-derivation))
+(define package->derivation/plain package->derivation) ;goonix: retain upstream lowerer
+(define package->cross-derivation/plain package->cross-derivation) ;goonix: retain upstream lowerer
+(set! package->derivation (overridable (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'lower-package-with-addressing) package->derivation/plain args)))) ;goonix: bind policy
+(set! package->cross-derivation (overridable (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'lower-package-with-addressing) package->cross-derivation/plain args)))) ;goonix: bind policy
 
 (define* (package-output store package
                          #:optional (output "out") (system (%current-system)))

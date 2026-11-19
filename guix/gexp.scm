@@ -1392,6 +1392,10 @@ The other arguments are as for 'derivation'."
                       #:substitutable? substitutable?
                       #:properties properties))))
 
+;; goonix: only CA package builders get the package's addressing at run time.
+(define gexp->derivation/plain gexp->derivation) ;goonix: retain upstream lowerer
+(set! gexp->derivation (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'gexp-with-addressing) gexp->derivation/plain args))) ;goonix: embed builders
+
 (define (fold/tree proc seed lst)
   "Like 'fold', but recurse into sub-lists of LST and accept improper lists."
   (let loop ((obj lst)
