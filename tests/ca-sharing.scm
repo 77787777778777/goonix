@@ -7,12 +7,14 @@
 (use-modules (guix)
              (guix tests)
              (guix ca)
+             (guix ca records)
              (guix store)
              (guix serialization)
              (guix base16)
              (gcrypt hash)
              (gnu packages bootstrap)
              (guix derivations)
+             ((guix utils) #:select (string-replace-substring))
              (ice-9 match)
              (srfi srfi-1)
              (srfi srfi-34)
@@ -44,21 +46,120 @@
                  (object->string text) " p)))"))
 
 (define (read-all file) (call-with-input-file file get-string-all))
-(define (realised drv) (realised-output-path store drv "out"))
+(define* (realised drv #:optional (output "out"))
+  (realised-output-path store drv output))
 
-;; The resolved derivation is the deriver recorded on the realised output.
+(define make-derivation-output (@ (guix derivations) make-derivation-output))
+(define make-derivation (@ (guix derivations) make-derivation))
+(define make-store-path (@@ (guix store) make-store-path))
+
+;; Reproduce the builder's resolution without consulting output derivers.
+;; This is deliberately a test-side oracle for the graph protocol.
 (define (resolved-derivation drv)
-  (path-info-deriver (query-path-info store (realised drv))))
+  (let* ((replacements
+          (append-map
+           (lambda (input)
+             (let ((dependency (derivation-input-derivation input)))
+               (map (lambda (output)
+                      (cons (derivation->output-path dependency output)
+                            (realised dependency output)))
+                    (derivation-input-sub-derivations input))))
+           (derivation-inputs drv)))
+         (substitute
+          (lambda (text)
+            (fold (lambda (replacement result)
+                    (string-replace-substring result
+                                              (car replacement)
+                                              (cdr replacement)))
+                  text replacements)))
+         (addressing (assoc-ref (derivation-builder-environment-vars drv)
+                                "goonixAddressing"))
+         (outputs
+          (map (match-lambda
+                 ((name . output)
+                  (cons name
+                        (if (or (derivation-output-hash output)
+                                (not addressing))
+                            output
+                            (make-derivation-output
+                             (token-path
+                              name
+                              (store-path-package-name
+                               (derivation-output-path output)))
+                             (derivation-output-hash-algo output)
+                             (derivation-output-hash output)
+                             (derivation-output-recursive? output))))))
+               (derivation-outputs drv)))
+         (make
+          (lambda (outputs)
+            (make-derivation
+             outputs '()
+             (sort (delete-duplicates
+                    (append (derivation-sources drv) (map cdr replacements)))
+                   string<?)
+             (derivation-system drv)
+             (substitute (derivation-builder drv))
+             (map substitute (derivation-builder-arguments drv))
+             (map (lambda (entry)
+                    (cons (car entry)
+                          (cond ((assoc (car entry) outputs)
+                                 => (lambda (output)
+                                      (derivation-output-path (cdr output))))
+                                ((string=? (car entry) "goonixResolved") "1")
+                                (else (substitute (cdr entry))))))
+                  (sort (cons '("goonixResolved" . "1")
+                              (derivation-builder-environment-vars drv))
+                        (lambda (a b) (string<? (car a) (car b)))))
+             #f)))
+         (initial (make (map (match-lambda
+                               ((name . output)
+                                (cons name
+                                      (if (derivation-output-hash output)
+                                          output
+                                          (make-derivation-output
+                                           (token-path
+                                            name
+                                            (store-path-package-name
+                                             (derivation-output-path output)))
+                                           #f #f #f)))))
+                             outputs)))
+         (outputs
+          (if (string=? addressing "resolved")
+              (map (match-lambda
+                     ((name . output)
+                      (let ((original (assoc-ref (derivation-outputs drv) name)))
+                        (cons name
+                              (if (derivation-output-hash original)
+                                  output
+                                  (make-derivation-output
+                                   (resolved-addressed-path
+                                    name
+                                    (store-path-package-name
+                                     (derivation-output-path original))
+                                    (derivation->bytevector initial))
+                                   #f #f #f))))))
+                   outputs)
+              outputs)))
+    (make outputs)))
 
 (define (resolved-hash drv)
   (bytevector->base16-string
-   (sha256 (call-with-input-file (resolved-derivation drv) get-bytevector-all))))
+   (sha256 (derivation->bytevector (resolved-derivation drv)))))
 
 (define (build-records hash output)
   ((@ (guix ca) build-records) store (base16-string->bytevector hash) output))
 
 (define (record-paths hash output)
   (map (lambda (r) (list-ref r 2)) (build-records hash output)))
+
+(define (resolved-store-path drv resolved)
+  (let* ((name (string-append (derivation-name drv) ".drv"))
+         (text (with-fluids ((%default-port-encoding "UTF-8"))
+                 (call-with-output-string
+                   (lambda (port) (write-derivation resolved port)))))
+         (references (derivation-sources resolved)))
+    (make-store-path (string-append "text:" (string-join references ":"))
+                     (sha256 (string->utf8 text)) name)))
 
 (test-assert "record query leaves the daemon connection synchronized"
   (let* ((drv (ca-drv "rec-sync" (write-output "sync")))
@@ -139,15 +240,16 @@
 (test-assert "gc-keep-outputs keeps an output via its record deriver"
   (let* ((drv (ca-drv "rec-keeprec" (write-output "keeprec")))
          (out (begin (build-derivations store (list drv)) (realised drv)))
-         (resolved (resolved-derivation drv)))
+         (hash (resolved-hash drv))
+         (resolved-path (list-ref (car (build-records hash "out")) 0)))
     ((@@ (guix store) set-options) store
      #:keep-failed? #f #:keep-going? #f #:fallback? #f #:verbosity 0
      #:offload? #f #:build-verbosity 0 #:log-type 0 #:print-build-trace #t
      #:use-substitutes? #f #:settings '(("gc-keep-outputs" . "true")))
     ;; Root ONLY the resolved derivation; the output is kept via the record.
-    (add-permanent-root resolved)
+    (add-permanent-root resolved-path)
     (let ((alive (member out (live-paths store))))
-      (remove-permanent-root resolved)
+      (remove-permanent-root resolved-path)
       ((@@ (guix store) set-options) store
        #:keep-failed? #f #:keep-going? #f #:fallback? #f #:verbosity 0
        #:offload? #f #:build-verbosity 0 #:log-type 0 #:print-build-trace #t
@@ -203,6 +305,39 @@
       (and (= 2 (length records))
            (member (realised input) paths)
            (member (realised dependent) paths)))))
+
+(test-assert "the graph query returns the later derivation's own record after collection"
+  (let* ((name "graph-late-dedup")
+         (one (ca-drv name (write-output "same")
+                      #:env-vars '(("unused" . "one"))))
+         (two (ca-drv name (write-output "same")
+                      #:env-vars '(("unused" . "two")))))
+    (build-derivations store (list one))
+    (build-derivations store (list two))
+    (let* ((expected (resolved-hash two))
+           (out (realised two))
+           (first-resolved (list-ref (car (build-records
+                                           (resolved-hash one) "out")) 0))
+           (records (build-graph-records store (derivation-file-name two))))
+      (test-equal "the graph query uses the later derivation's resolved hash"
+        expected (list-ref (car records) 0))
+      (test-equal "the graph query returns the later derivation's result"
+        out (list-ref (car records) 3))
+      (test-equal "the graph query returns one record for the later derivation"
+        1 (length records))
+      (test-assert "the later resolved derivation differs from the first"
+        (not (string=? first-resolved
+                       (resolved-store-path two (resolved-derivation two)))))
+      (delete-paths store (list first-resolved out))
+      (let* ((fresh (open-connection-for-tests))
+             (after (build-graph-records fresh (derivation-file-name two))))
+        (close-connection fresh)
+        (test-equal "the later record survives output and first deriver collection"
+          (list expected out)
+          (list (list-ref (car after) 0) (list-ref (car after) 3)))
+        (test-equal "the collected graph query returns one record"
+          1 (length after))
+        #t))))
 
 (test-assert "the two-glibc scenario ends in one coherent closure"
   (let* ((g1 (ca-drv "glibc" (write-output "GLIBC")))

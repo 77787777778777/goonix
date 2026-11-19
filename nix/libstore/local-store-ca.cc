@@ -87,16 +87,17 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolv
             for (auto & input : original.inputDrvs)
                 visit(input.first, readDerivation(input.first));
             if (!goonixAddressed(original)) return;
-            /* Content/resolved outputs have choices rather than final names in
-               the original derivation.  Follow the resolved derivation edge. */
-            for (auto & output : original.outputs) {
-                Path chosen = chosenOutput(originalPath, output.first);
-                if (chosen.empty()) continue;
-                auto info = queryPathInfo(chosen);
-                if (isValidPath(info.deriver)) {
-                    auto records = queryGoonixRecordsByResolved(info.deriver);
+            try {
+                Derivation resolved = resolveDerivation(*this, originalPath, original);
+                const string resolvedHash = printHash(hashString(htSHA256,
+                    unparseDerivation(resolved)));
+                for (auto & output : original.outputs) {
+                    if (chosenOutput(originalPath, output.first).empty()) continue;
+                    auto records = queryGoonixBuildRecords(resolvedHash, output.first);
                     result.insert(result.end(), records.begin(), records.end());
                 }
+            } catch (const Error &) {
+                /* An unchosen input or output cannot resolve this member. */
             }
         };
     visit(unresolved, readDerivation(unresolved));
