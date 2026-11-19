@@ -21,7 +21,7 @@ struct GoonixResolvedState {
 GoonixResolvedState prepareResolvedBuild(LocalStore & store,
     const Path & originalPath, const Derivation & original,
     const Derivation & resolved, BuildMode mode);
-enum class GoonixGoalAction { ordinary, done, build, substituteInputs };
+enum class GoonixGoalAction { ordinary, done, build, substituteInputs, substituteOutputs };
 struct GoonixGoalState {
     Derivation drv;
     Path originalPath;

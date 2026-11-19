@@ -77,6 +77,8 @@ libstore_a_SOURCES +=				\
   %D%/libstore/build-ca.cc			\
   %D%/libstore/build-ca.hh			\
   %D%/libstore/build-goonix.hh			\
+  %D%/libstore/build-goonix-goal.hh		\
+  %D%/libstore/local-store-goonix.hh		\
   %D%/libstore/build-goonix.inc			\
   %D%/libstore/deep-scan.cc
 

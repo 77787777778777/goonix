@@ -8,6 +8,8 @@ MODULES +=					\
   guix/ca.scm					\
   guix/ca/derivation.scm				\
   guix/ca/policy.scm				\
+  guix/ca/sharing.scm				\
+  guix/ca/records.scm				\
   guix/download-cache.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\

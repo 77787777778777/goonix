@@ -139,7 +139,7 @@ class Goal : public std::enable_shared_from_this<Goal>
 {
 public:
     size_t waiteeCount() const { return waitees.size(); } // goonix: stall diagnostics
-    const string & goalName() const { return name; } // goonix
+    const string & goalName() const { return name; } // goonix: scheduler diagnostics
     typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters, ecIncompleteClosure} ExitCode;
 
 protected:
@@ -241,6 +241,7 @@ struct Child
     bool inBuildSlot;
     time_t lastOutput; /* time we last got output on stdout/stderr */
     time_t timeStarted;
+    time_t deadline = 0; // goonix: graph requests have an independent deadline
 };
 
 typedef map<pid_t, Child> Children;
@@ -274,6 +275,7 @@ private:
        same derivation / path. */
     WeakGoalMap derivationGoals;
     WeakGoalMap substitutionGoals;
+    WeakGoalMap goonixGraphGoals; // goonix: asynchronous record requests
 
     /* Goals waiting for busy paths to be unlocked. */
     WeakGoals waitingForAnyGoal;
@@ -304,6 +306,8 @@ public:
     /* Make a goal (with caching). */
     GoalPtr makeDerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, BuildMode buildMode = bmNormal);
     GoalPtr makeSubstitutionGoal(const Path & storePath, bool repair = false);
+    bool isTopGoal(const GoalPtr & goal) const { return topGoals.count(goal); } // goonix: roots only request graphs
+    GoalPtr makeGoonixGraphGoal(const Path & path); // goonix: graph factory
 
     /* Remove a dead goal. */
     void removeGoal(GoalPtr goal);
@@ -320,6 +324,7 @@ public:
        the process counts towards the jobs limit. */
     void childStarted(GoalPtr goal, pid_t pid,
         const set<int> & fds, bool inBuildSlot, bool respectTimeouts);
+    void goonixSetChildDeadline(pid_t pid, time_t deadline); // goonix: graph deadline
 
     /* Unregisters a running child process.  `wakeSleepers' should be
        false if there is no sense in waking up goals that are sleeping
@@ -599,6 +604,7 @@ string rewriteHashes(string s, const HashRewrites & rewrites)
 typedef enum {rpAccept, rpDecline, rpPostpone} HookReply;
 
 class SubstitutionGoal;
+#include "build-goonix-goal.hh" // goonix: graph goal visible to its factory
 
 class DerivationGoal : public Goal
 {
@@ -992,6 +998,7 @@ void DerivationGoal::outputsSubstituted()
         return;
     }
 
+    if (goonixSelectedOutputsSubstituted()) return; // goonix: imported candidate fetched
     if (goonixRealiseInputsFirst()) return; // goonix: placeholders resolve inputs first
     unsigned int nrInvalid = checkPathValidity(false, buildMode == bmRepair).size();
     if (buildMode == bmNormal && nrInvalid == 0) {
@@ -1007,6 +1014,7 @@ void DerivationGoal::outputsSubstituted()
 
     /* Otherwise, at least one of the output paths could not be
        produced using a substitute.  So we have to build instead. */
+    goonixPrepareLocalBuild(); // goonix: restore token outputs for local builds
 
     /* Make sure checkPathValidity() from now on checks all
        outputs. */
@@ -4180,6 +4188,7 @@ void Worker::removeGoal(GoalPtr goal)
 {
     nix::removeGoal(goal, derivationGoals);
     nix::removeGoal(goal, substitutionGoals);
+    nix::removeGoal(goal, goonixGraphGoals); // goonix: graph goal lifecycle
     if (topGoals.find(goal) != topGoals.end()) {
         topGoals.erase(goal);
         /* If a top-level goal failed, then kill all other goals
@@ -4350,6 +4359,8 @@ void Worker::waitForInput()
     assert(sizeof(time_t) >= sizeof(long));
     time_t nearest = LONG_MAX; // nearest deadline
     for (auto& i : children) {
+        if (i.second.deadline) // goonix: graph-specific deadline
+            nearest = std::min(nearest, i.second.deadline);
         if (!i.second.respectTimeouts) continue;
         if (settings.maxSilentTime != 0)
             nearest = std::min(nearest, i.second.lastOutput + settings.maxSilentTime);
@@ -4431,7 +4442,14 @@ void Worker::waitForInput()
             }
         }
 
-        if (goal->getExitCode() == Goal::ecBusy &&
+        if (goal->getExitCode() == Goal::ecBusy && j->second.deadline && // goonix: graph deadline
+            after >= j->second.deadline)
+        {
+            printMsg(lvlError, std::format("{} reached its graph deadline",
+                                          goal->getName()));
+            goal->timedOut();
+        }
+        else if (goal->getExitCode() == Goal::ecBusy &&
             settings.maxSilentTime != 0 &&
             j->second.respectTimeouts &&
             after - j->second.lastOutput >= (time_t) settings.maxSilentTime)

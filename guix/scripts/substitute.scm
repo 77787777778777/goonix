@@ -68,6 +68,7 @@
   #:use-module (web uri)
   #:use-module (web response)
   #:use-module (guix http-client)
+  #:use-module ((guix ca sharing) #:select (run-graph-loop)) ; goonix: helper-only graph transport
   #:export (%allow-unauthenticated-substitutes?
             %allow-unsafe-substitute-uris?
             %reply-file-descriptor
@@ -748,6 +749,9 @@ This requires that, in the case that FROM is a directory, it is readable."
                                  #:cache-urls (substitute-urls)
                                  #:acl acl)
                   (loop (read-line)))))))
+       (("--goonix-graph")
+        (run-graph-loop reply-port (substitute-urls)
+                        open-connection-for-uri/cached %fetch-timeout)) ; goonix: graph-only helper agent
        (("--substitute")
         ;; Download STORE-PATH and store it as a Nar in file DESTINATION.
         ;; Specify the number of columns of the terminal so the progress

@@ -32,16 +32,23 @@ GoonixResolvedState prepareResolvedBuild(LocalStore & store,
             output.first, resolvedHash, "", false);
         if (!selected.empty()) {
             output.second.path = selected;
-            store.addTempRoot(selected);
+            if (mode == bmNormal && store.isValidPath(selected)) {
+                store.addTempRoot(selected);
+            } else {
+                /* The record names a candidate; it is not valid until the
+                   ordinary substitution has fetched and verified it. */
+                store.addTempRoot(selected);
+                allRealised = false;
+            }
         } else {
             store.addTempRoot(output.second.path);
             allRealised = false;
         }
         drv.env[output.first] = output.second.path;
     }
-    /* A check builds at the logical token, never at the selected final path. */
-    if (addressingOf(drv) == Addressing::content &&
-        (mode != bmNormal || !allRealised))
+    /* A check builds at the logical token, never at the selected final path.
+       A normal build keeps the selected candidate through substitution. */
+    if (addressingOf(drv) == Addressing::content && mode != bmNormal)
         for (auto & output : drv.outputs) {
             if (!output.second.hash.empty()) continue;
             output.second.path = tokenPath(output.first,
@@ -61,6 +68,17 @@ GoonixGoalState prepareGoonixGoal(LocalStore & store, const Path & path,
     if (!goonixAddressed(input)) return state;
     const Derivation & originalDrv = original.outputs.empty() ? input : original;
     if (!resolvedDerivation(input)) {
+        if (mode == bmNormal) {
+            for (auto & output : originalDrv.outputs) {
+                Path chosen = store.chosenGoonixOutput(state.originalPath,
+                                                       output.first);
+                if (!chosen.empty() && !store.isValidPath(chosen)) {
+                    state.action = GoonixGoalAction::substituteOutputs;
+                    state.missingPaths.insert(chosen);
+                    return state;
+                }
+            }
+        }
         state.action = GoonixGoalAction::substituteInputs;
         return state;
     }
@@ -73,10 +91,20 @@ GoonixGoalState prepareGoonixGoal(LocalStore & store, const Path & path,
     }
     goonixInputPaths(store, state.drv, state.inputPaths, state.allPaths);
     state.missingPaths = outputPaths(state.drv);
+    if (mode == bmNormal)
+        for (auto & output : state.drv.outputs)
+            if (!store.isValidPath(output.second.path))
+                state.missingPaths.insert(output.second.path);
     auto kind = goonixBuildKind(state.drv, repeat);
     state.fixedOutput = kind.fixedOutput;
     state.rounds = kind.rounds;
     state.action = GoonixGoalAction::build;
+    if (mode == bmNormal)
+        for (auto & output : state.drv.outputs)
+            if (!store.isValidPath(output.second.path) &&
+                store.chosenGoonixOutput(state.originalPath, output.first) ==
+                output.second.path)
+                state.action = GoonixGoalAction::substituteOutputs;
     return state;
 }
 

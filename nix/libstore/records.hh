@@ -42,6 +42,7 @@ class BuildRecords {
 public:
     BuildRecords(sqlite3 * db);
     void initialise();
+    SQLiteTxn transaction();
     void add(const BuildRecord & record);
     std::vector<BuildRecord> query(const string & resolvedHash,
         const string & output = "");

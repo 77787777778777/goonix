@@ -11,13 +11,17 @@
   #:use-module (guix base16)
   #:use-module (guix store)
   #:use-module (ice-9 match)
+  #:use-module (rnrs io ports)
+  #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:export (build-graph-records
             graph-response
             build-graph-expression
             build-records->expression
             expression->build-records
-            expression->graph-choices))
+            expression->graph-choices
+            read-graph-expression
+            write-graph-fields))
 
 ;;; Commentary:
 ;;;
@@ -113,3 +117,26 @@
       choices)
      choices)
     (_ (error "missing goonix graph choice hints" expression))))
+
+;;; goonix: the daemon's substituter speaks a bounded hex-line protocol.  The
+;;; expression is data only; importGoonixBuildGraph authenticates every record.
+(define (read-graph-expression port limit)
+  "Read at most LIMIT+1 characters from PORT and parse one graph expression."
+  (let ((text (get-string-n port (1+ limit))))
+    (when (or (eof-object? text) (> (string-length text) limit))
+      (error "goonix graph expression exceeds its size limit"))
+    (let ((expression (call-with-input-string text read)))
+      (expression->build-records expression)
+      (expression->graph-choices expression)
+      expression)))
+
+(define (write-graph-fields port records hints)
+  "Write the daemon's hex-line graph protocol.  Fields are opaque bytes."
+  (define (field value)
+    (format port "~a~%" (bytevector->base16-string (string->utf8 value))))
+  (display "goonix-records 1\n" port)
+  (format port "~a~%" (length records))
+  (for-each (lambda (record) (for-each field record)) records)
+  (format port "~a~%" (length hints))
+  (for-each (lambda (hint) (for-each field hint)) hints)
+  (force-output port))

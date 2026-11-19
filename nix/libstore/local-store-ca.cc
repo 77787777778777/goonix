@@ -6,6 +6,8 @@
 #include "globals.hh"
 #include "pathlocks.hh"
 #include <format>
+#include <sys/wait.h>
+#include <poll.h>
 
 namespace nix {
 
@@ -44,6 +46,27 @@ void LocalStore::recordGoonixBuild(const Path & resolvedPath,
     const string & output, const Path & path, const string & resolvedHash,
     const string & origin, bool relocationChecked, const string & signature)
 {
+    recordGoonixBuildWithResolved(resolvedPath, output, path, resolvedHash,
+        origin, relocationChecked, signature, "");
+}
+
+Path LocalStore::resolvedDerivationPath(const Path & originalPath,
+    const Derivation & resolved)
+{
+    checkResolvedDerivation(resolved);
+    PathSet references;
+    for (auto & source : resolved.inputSrcs) references.insert(source);
+    string name = storePathToName(originalPath);
+    if (name.ends_with(drvExtension)) name.resize(name.size() - drvExtension.size());
+    return computeStorePathForText(name + drvExtension,
+                                   unparseDerivation(resolved), references);
+}
+
+void LocalStore::recordGoonixBuildWithResolved(const Path & resolvedPath,
+    const string & output, const Path & path, const string & resolvedHash,
+    const string & origin, bool relocationChecked, const string & signature,
+    const string & resolvedBytes)
+{
     const string verifiedHash = verifyGoonixRecordSignature(*this, signature);
     BuildRecord record{resolvedHash, resolvedPath, output, path, origin,
         relocationChecked, signature};
@@ -62,7 +85,8 @@ void LocalStore::recordGoonixBuild(const Path & resolvedPath,
         throw AuthenticationError(
             "goonix build record does not name a resolved derivation");
     const string actual = printHash(hashString(htSHA256,
-        unparseDerivation(readDerivation(resolvedPath))));
+        resolvedBytes.empty() ? unparseDerivation(readDerivation(resolvedPath))
+                              : resolvedBytes));
     if (actual != resolvedHash)
         throw AuthenticationError(
             "goonix build record does not match resolved derivation content");
@@ -129,6 +153,102 @@ LocalStore::queryGoonixBuildGraph(const Path & unresolved)
         };
     visit(unresolved, readDerivation(unresolved));
     return {result, hints};
+}
+
+std::pair<std::vector<BuildRecord>, Strings>
+LocalStore::importGoonixBuildGraph(
+    const Path & unresolved, const std::vector<BuildRecord> & offered,
+    const OutputChoices & serverChoices)
+{
+    /* First compute local R bottom-up.  Resolved derivation registration has
+       its own transaction, so it must finish before record adoption starts. */
+    std::map<std::pair<Path, string>, Path> names;
+    std::map<Path, std::pair<Derivation, Path>> resolved;
+    PathSet visiting;
+    std::function<void(const Path &)> resolve = [&](const Path & originalPath) {
+        if (!visiting.insert(originalPath).second) return;
+        Derivation original = readDerivation(originalPath);
+        for (auto & input : original.inputDrvs) resolve(input.first);
+        if (!goonixAddressed(original)) return;
+        auto nameOf = [&](const Path & path, const Derivation & drv,
+                          const string & output) -> Path {
+            auto found = drv.outputs.find(output);
+            if (found == drv.outputs.end())
+                throw Error(std::format("derivation has no output `{0}'", output));
+            if (!goonixAddressed(drv) || !found->second.hash.empty())
+                return found->second.path;
+            Path own = chosenOutput(path, output);
+            if (!own.empty()) return own;
+            auto hint = serverChoices.find(std::make_pair(path, output));
+            if (hint == serverChoices.end()) return Path();
+            for (auto & record : offered)
+                if (record.output == output && record.path == hint->second)
+                    return hint->second; // authenticated below before adoption
+            return Path();
+        };
+        for (auto & input : original.inputDrvs)
+            for (auto & output : input.second)
+                if (nameOf(input.first, readDerivation(input.first), output).empty())
+                    return;
+        Derivation r = resolveDerivation(*this, originalPath, original, nameOf);
+        Path path = resolvedDerivationPath(originalPath, r);
+        resolved.emplace(originalPath, std::make_pair(r, path));
+        for (auto & output : original.outputs) {
+            Path own = chosenOutput(originalPath, output.first);
+            if (!own.empty()) names[std::make_pair(originalPath, output.first)] = own;
+            else {
+                auto hint = serverChoices.find(std::make_pair(originalPath, output.first));
+                if (hint != serverChoices.end())
+                    names[std::make_pair(originalPath, output.first)] = hint->second;
+            }
+        }
+    };
+    resolve(unresolved);
+
+    /* Authenticate every matching record, then settle this member before its
+       dependents.  Any bad record rolls back all records and choices. */
+    auto txn = goonixRecords->transaction();
+    PathSet settled;
+    std::function<void(const Path &)> adopt = [&](const Path & originalPath) {
+        if (!settled.insert(originalPath).second) return;
+        Derivation original = readDerivation(originalPath);
+        for (auto & input : original.inputDrvs) adopt(input.first);
+        auto found = resolved.find(originalPath);
+        if (found == resolved.end()) return;
+        const Derivation & r = found->second.first;
+        const Path & resolvedPath = found->second.second;
+        const string hash = printHash(hashString(htSHA256, unparseDerivation(r)));
+        for (auto & output : original.outputs) {
+            Path current = chosenOutput(originalPath, output.first);
+            Path hinted;
+            auto hint = serverChoices.find(std::make_pair(originalPath, output.first));
+            if (hint != serverChoices.end()) hinted = hint->second;
+            bool backed = false;
+            for (auto & record : offered) {
+                if (record.resolvedHash != hash || record.output != output.first)
+                    continue;
+                if (record.resolvedDerivation != resolvedPath)
+                    throw AuthenticationError(
+                        "goonix graph record does not match local resolved derivation");
+                recordGoonixBuildWithResolved(record.resolvedDerivation,
+                    record.output, record.path, record.resolvedHash,
+                    record.origin, record.relocationChecked, record.signature,
+                    unparseDerivation(r));
+                if (record.path == hinted) backed = true;
+            }
+            if (!current.empty()) {
+                if (backed && hinted != current)
+                    selectGoonixOutput(originalPath, output.first, hash,
+                                       hinted, false);
+            } else if (backed) {
+                goonixRecords->rechoose(originalPath, output.first, hinted);
+            }
+        }
+    };
+    adopt(unresolved);
+    auto result = queryGoonixBuildGraph(unresolved);
+    txn.commit();
+    return result;
 }
 
 std::vector<BuildRecord> LocalStore::queryGoonixRecordsByPath(const Path & path)

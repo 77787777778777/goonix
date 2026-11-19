@@ -12,6 +12,10 @@
 
 namespace nix {
 
+class Worker;
+class Goal;
+typedef std::shared_ptr<Goal> GoalPtr; // goonix: asynchronous graph goal factory
+
 
 /* Nix store and database schema version.  Version 1 (or 0) was Nix <=
    0.7.  Version 2 was Nix 0.8 and 0.9.  Version 3 is Nix 0.10.
@@ -48,6 +52,10 @@ private:
     /* Ensure the substituter is running and return it.  */
     std::shared_ptr<Agent> substituter();
 
+public:
+#include "local-store-goonix.hh" // goonix: content-addressing API
+
+private:
     Path linksDir;
 
 public:
@@ -138,42 +146,6 @@ public:
     /* Check the integrity of the Nix store.  Returns true if errors
        remain. */
     bool verifyStore(bool checkContents, bool repair);
-
-    // goonix: persistent facts and choices; records survive store collection.
-    Path realisedOutputPath(const Path & drvPath, const Derivation & drv,
-        const string & output);
-    void recordBuild(const Path & resolvedPath, const string & output,
-        const Path & path, const string & origin, bool relocationChecked);
-    void recordGoonixBuild(const Path & resolvedPath, const string & output,
-        const Path & path, const string & resolvedHash, const string & origin,
-        bool relocationChecked, const string & signature);
-    std::vector<BuildRecord> queryGoonixBuildRecords(const string & hash,
-        const string & output);
-    std::vector<BuildRecord> queryGoonixRecordsByPath(const Path & path);
-    std::vector<BuildRecord> queryGoonixRecordsByResolved(const Path & resolved);
-    std::pair<std::vector<BuildRecord>, Strings>
-        queryGoonixBuildGraph(const Path & unresolved);
-    std::vector<RecordConflict> queryGoonixConflicts(const string & hash,
-        const string & output);
-    PathSet goonixDerivationsForPath(const Path & path);
-    PathSet goonixOriginalsForPath(const Path & path);
-    PathSet goonixChosenPaths(const Path & unresolved);
-    /* Select from facts; adopt=true explicitly replaces a valid local choice. */
-    Path selectGoonixOutput(const Path & unresolved, const string & output,
-        const string & resolvedHash, const Path & preferred, bool adopt);
-    void chooseGoonixOutput(const Path & unresolved, const string & output,
-        const Path & realised);
-    Path chosenGoonixOutput(const Path & unresolved, const string & output);
-    void chooseOutput(const Path & unresolved, const string & output,
-        const Path & realised);
-    Path chosenOutput(const Path & unresolved, const string & output);
-    OutputChoices choices(const Path & unresolved);
-    string signBuildRecord(const string & payload);
-    void initialiseGoonixRecords();
-    Path addResolvedDerivation(const string & name, const string & contents,
-        const PathSet & references);
-    Path addTextToStoreNoDerivationOutputs(const string & name,
-        const string & contents, const PathSet & references);
 
     /* Register the validity of a path, i.e., that `path' exists, that
        the paths referenced by it exists, and in the case of an output

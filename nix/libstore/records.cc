@@ -15,6 +15,8 @@ static void execute(sqlite3 * db, const string & sql)
 
 BuildRecords::BuildRecords(sqlite3 * db) : db(db) { }
 
+SQLiteTxn BuildRecords::transaction() { return SQLiteTxn(db); }
+
 void BuildRecords::initialise()
 {
     execute(db, R"sql(
