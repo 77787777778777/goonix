@@ -75,7 +75,7 @@ substitutablePaths :: ServerConfig -> Settings -> [ByteString] -> IO [ByteString
 substitutablePaths config settings paths
   | null paths = pure []
   | otherwise = withAgent config settings "--query" $ \agent -> do
-      sendLine agent ("have" <> foldMap (" " <>) paths)
+      sendLine agent ("have" <> foldMap (" " <>) paths <> " ")
       readPaths agent []
 
 substitutableInfo :: ServerConfig -> Settings -> ByteString -> IO (Maybe (ByteString, [ByteString], Word64, Word64))
@@ -89,7 +89,7 @@ substitutableInfos :: ServerConfig -> Settings -> [ByteString] -> IO [Substituta
 substitutableInfos config settings paths
   | null paths = pure []
   | otherwise = withAgent config settings "--query" $ \agent -> do
-      sendLine agent ("info" <> foldMap (" " <>) paths)
+      sendLine agent ("info" <> foldMap (" " <>) paths <> " ")
       readInfos agent []
 
 substitutePath :: ServerConfig -> Settings -> ByteString -> ByteString -> IO (Either ByteString (ByteString, Word64))

@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+daemon=$(CDPATH= cd -- "$here/../.." && pwd)
+. "$daemon/test/lib.sh"
 if test "$#" -ne 1; then
     echo "usage: run.sh GHC" >&2
     exit 2
@@ -21,16 +24,16 @@ daemon=$(CDPATH= cd -- "$here/../.." && pwd)
 build="$here/.build"
 mkdir -p "$build"
 
-"$ghc" -fforce-recomp -Wall -Wcompat -Widentities \
+goonix_run_capped "$ghc" -fforce-recomp -Wall -Wcompat -Widentities \
     -Wincomplete-record-updates -Wincomplete-uni-patterns \
     -Wredundant-constraints -Wmissing-export-lists \
     -threaded -with-rtsopts=-N -package network -i"$daemon/src" -outputdir "$build/proxy" \
     -o "$build/wire-proxy" "$daemon/proxy/Main.hs"
 
-"$ghc" -fforce-recomp -Wall -Wcompat -Widentities \
+goonix_run_capped "$ghc" -fforce-recomp -Wall -Wcompat -Widentities \
     -Wincomplete-record-updates -Wincomplete-uni-patterns \
     -Wredundant-constraints -Wmissing-export-lists \
     -i"$daemon/src" -outputdir "$build/tests" \
     -o "$build/wire-proxy-test" "$here/Main.hs"
 
-"$build/wire-proxy-test" "$build/wire-proxy"
+goonix_run_capped "$build/wire-proxy-test" "$build/wire-proxy"

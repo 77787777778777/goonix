@@ -61,7 +61,7 @@ startOffloadHook program system silent trace timeout =
     pid <- withCString (C.unpack program) $ \program' ->
       withCString (C.unpack system) $ \system' ->
         withCString (show silent) $ \silent' ->
-          withCString (if trace then "1" else "0") $ \trace' ->
+          withCString (if trace then "true" else "false") $ \trace' ->
             withCString (show timeout) $ \timeout' -> alloca $ \pidPointer -> do
               result <- c_spawn_offload program' (fdNumber inputRead) (fdNumber outputWrite)
                 (fdNumber builderWrite) system' silent' trace' timeout' pidPointer
