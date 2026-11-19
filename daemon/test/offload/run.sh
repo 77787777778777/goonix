@@ -65,6 +65,7 @@ if test "${GOONIX_REAL_OFFLOAD:-0}" = 1; then
   run_case decline unused unused 0
 else
   run_case accept accept success 0
+  run_case accept-twice accept success 0
   run_case decline decline unused 0
   run_case no-offload decline unused 0
   run_case postpone postpone success 0 'postpone accept'
@@ -79,9 +80,13 @@ if test "${GOONIX_REAL_OFFLOAD:-0}" = 1; then
   exit 0
 fi
 # No local builder may have run in accepted cases, including failures.
-for name in accept postpone fail17 fail100 unregistered; do
+for name in accept accept-twice postpone fail17 fail100 unregistered; do
   test ! -e "$out/$name/local-builds"
 done
+# An accepted helper exits after the build and cannot be reused by the next
+# derivation on the same connection.
+test "$(grep -c '^args ' "$out/accept-twice/helper.log")" = 2
+test "$(grep -c '^registered ' "$out/accept-twice/helper.log")" = 2
 # A decline is the one case where a local builder is required.
 test -e "$out/decline/local-builds"
 # An explicit client opt-out must build locally without starting a helper.
