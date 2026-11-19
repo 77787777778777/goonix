@@ -808,12 +808,11 @@ static void performOp(bool trusted, unsigned int clientVersion,
         // goonix: read-only graph facts; clients cannot register mappings.
         Path drv = readStorePathStrict(from);
         startWork();
-        auto records = dynamic_cast<LocalStore *>(store.get())
+        auto response = dynamic_cast<LocalStore *>(store.get())
             ->queryGoonixBuildGraph(drv);
         stopWork();
-        writeStrings(goonixRecordFields(records, true), to); // goonix: graph fields
-        writeStrings(dynamic_cast<LocalStore *>(store.get())
-            ->goonixGraphChoiceHints(drv), to); // goonix: unsigned resolution hints
+        writeStrings(goonixRecordFields(response.first, true), to); // goonix: graph fields
+        writeStrings(response.second, to); // goonix: record-backed unsigned hints
         break;
     }
 

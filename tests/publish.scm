@@ -227,11 +227,9 @@ FileSize: ~a\n"
   (expression->build-records %ca-record-expression))
 
 (test-assert "/goonix/records/DERIVATION serves unsigned choice hints"
-  (let ((choices (expression->graph-choices %ca-record-expression)))
-    (and (= 3 (length choices))
-         (equal? (list (derivation-file-name %ca-derivation) "out"
-                       (realised-output-path %store %ca-derivation "out"))
-                 choices))))
+  (equal? (list (list (derivation-file-name %ca-derivation) "out"
+                      (realised-output-path %store %ca-derivation "out")))
+          (expression->graph-choices %ca-record-expression)))
 
 (test-equal "/*.narinfo pipeline"
   (make-list 500 200)

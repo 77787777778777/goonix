@@ -328,21 +328,16 @@
       (build-derivations store (list dependent))
       (call-with-values
           (lambda () (graph-response store (derivation-file-name dependent)))
-        (lambda (records fields)
-          (let* ((choices (let loop ((rest fields))
-                            (if (null? rest) '()
-                                (cons (list (car rest) (cadr rest) (caddr rest))
-                                      (loop (cdddr rest))))))
-                 (chosen (assoc-ref (map (lambda (choice)
-                                           (cons (list (car choice) (cadr choice))
-                                                 (caddr choice)))
-                                         choices)
+        (lambda (records choices)
+          (let* ((choice-alist
+                  (map (lambda (choice)
+                         (cons (list (car choice) (cadr choice))
+                               (caddr choice)))
+                       choices))
+                 (chosen (assoc-ref choice-alist
                                     (list (derivation-file-name input) "out")))
                  (name-of (lambda (drv output)
-                            (or (assoc-ref (map (lambda (choice)
-                                                  (cons (list (car choice) (cadr choice))
-                                                        (caddr choice)))
-                                                choices)
+                            (or (assoc-ref choice-alist
                                            (list (derivation-file-name drv) output))
                                 (realised drv output))))
                  (hash (bytevector->base16-string
@@ -358,6 +353,68 @@
                  (not (string=? (derivation->output-path input) chosen))
                  record
                  (string=? hash (resolved-hash dependent)))))))))
+
+(test-assert "a moved choice cannot leave a hint without its record"
+  (let* ((tag (number->string (random 1000000000 (random-state-from-platform))))
+         (input (ca-drv (string-append "graph-moved-input-" tag)
+                        "(call-with-output-file (getenv \"out\") (lambda (p) (display (gettimeofday) p)))"))
+         (dependent-of
+          (lambda (name)
+            (ca-drv (string-append name "-" tag)
+                    (string-append
+                     "(call-with-output-file (getenv \"out\") (lambda (p) "
+                     "(display (string-reverse (basename (getenv \"input\"))) p)))")
+                    #:inputs (list input)
+                    #:env-vars `(("input" . ,(derivation->output-path input))))))
+         (one (dependent-of "graph-moved-one"))
+         (two (dependent-of "graph-moved-two")))
+    (build-derivations store (list one))
+    (let ((p1 (realised input))
+          (d1 (realised one)))
+      (sleep 2)
+      (guard (c ((store-protocol-error? c) #t))
+        (build-derivations store (list input) (build-mode check)))
+      (call-with-values
+          (lambda () (graph-response store (derivation-file-name one)))
+        (lambda (records hints)
+          (let ((record (find (lambda (record)
+                                (string=? d1 (list-ref record 3))) records)))
+            (test-assert "moved-choice fixture starts with the dependent's record"
+              (and record
+                   (member (list (derivation-file-name one) "out" d1) hints)))
+            (delete-paths store (list (list-ref record 1) p1)))))
+      (let ((fresh (open-connection-for-tests)))
+        (dynamic-wind
+          (const #t)
+          (lambda ()
+            (build-derivations fresh (list two))
+            (let ((p2 (realised-output-path fresh input "out"))
+                  (d2 (realised-output-path fresh two "out")))
+              (test-assert "building the second dependent moves the input choice"
+                (and (not (string=? p1 p2)) (not (string=? d1 d2))))
+              (call-with-values
+                  (lambda ()
+                    (graph-response fresh (derivation-file-name one)))
+                (lambda (records hints)
+                  (test-assert "the moved input hint still has a signed record"
+                    (and (member (list (derivation-file-name input) "out" p2)
+                                 hints)
+                         (find (lambda (record)
+                                 (string=? p2 (list-ref record 3))) records)))
+                  (test-assert "the old dependent gets no hint for its stale choice"
+                    (not (member (list (derivation-file-name one) "out" d1)
+                                 hints)))
+                  (test-equal "every moved-choice hint is backed by a record"
+                    '()
+                    (filter (lambda (hint)
+                              (not (find (lambda (record)
+                                           (and (string=? (cadr hint)
+                                                          (list-ref record 2))
+                                                (string=? (caddr hint)
+                                                          (list-ref record 3))))
+                                         records)))
+                            hints))))))
+          (lambda () (close-connection fresh)))))))
 
 (test-assert "the graph query returns the later derivation's own record after collection"
   (let* ((name "graph-late-dedup")

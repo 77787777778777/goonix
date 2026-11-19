@@ -75,11 +75,13 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildRecords(
     return goonixRecords->query(hash, output);
 }
 
-std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolved)
+std::pair<std::vector<BuildRecord>, Strings>
+LocalStore::queryGoonixBuildGraph(const Path & unresolved)
 {
-    /* A query is read-only.  Resolve against choices already made, walk the
-       resolved build graph bottom-up, and return permanent signed facts. */
+    /* Resolve against choices already made and produce facts and their
+       record-backed routing hints in one bottom-up walk. */
     std::vector<BuildRecord> result;
+    Strings hints;
     PathSet visited;
     std::function<void(const Path &, const Derivation &)> visit =
         [&](const Path & originalPath, const Derivation & original) {
@@ -110,28 +112,15 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolv
             const string resolvedHash = printHash(hashString(htSHA256,
                 unparseDerivation(resolved)));
             for (auto & output : original.outputs) {
-                if (chosenOutput(originalPath, output.first).empty()) continue;
+                Path chosen = chosenOutput(originalPath, output.first);
+                if (chosen.empty()) continue;
                 auto records = queryGoonixBuildRecords(resolvedHash, output.first);
                 result.insert(result.end(), records.begin(), records.end());
-            }
-        };
-    visit(unresolved, readDerivation(unresolved));
-    return result;
-}
-
-Strings LocalStore::goonixGraphChoiceHints(const Path & unresolved)
-{
-    Strings hints;
-    PathSet visited;
-    std::function<void(const Path &, const Derivation &)> visit =
-        [&](const Path & originalPath, const Derivation & original) {
-            if (!visited.insert(originalPath).second) return;
-            for (auto & input : original.inputDrvs)
-                visit(input.first, readDerivation(input.first));
-            if (!goonixAddressed(original)) return;
-            for (auto & output : original.outputs) {
-                Path chosen = chosenOutput(originalPath, output.first);
-                if (!chosen.empty()) {
+                if (std::any_of(records.begin(), records.end(),
+                        [&](const BuildRecord & record) {
+                            return record.output == output.first &&
+                                record.path == chosen;
+                        })) {
                     hints.push_back(originalPath);
                     hints.push_back(output.first);
                     hints.push_back(chosen);
@@ -139,7 +128,7 @@ Strings LocalStore::goonixGraphChoiceHints(const Path & unresolved)
             }
         };
     visit(unresolved, readDerivation(unresolved));
-    return hints;
+    return {result, hints};
 }
 
 std::vector<BuildRecord> LocalStore::queryGoonixRecordsByPath(const Path & path)
