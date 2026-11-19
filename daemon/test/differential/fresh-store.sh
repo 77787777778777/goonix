@@ -2,11 +2,12 @@
 # goonix: run Guix's daemon tests with a fresh store for every invocation.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
+. "$root/daemon/test/lib.sh"
 if test "$#" -lt 1; then
   echo "usage: fresh-store.sh TEST [ARG ...]" >&2
   exit 2
 fi
-fixture=${GOONIX_TEST_FIXTURE:-$root/hs-current-fixture}
+fixture=${GOONIX_TEST_FIXTURE:-$root/.scratch/hs-current-fixture}
 daemon=${GOONIX_TEST_DAEMON:-$root/guix-daemon}
 "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
 mkdir -p "$fixture/etc" "$fixture/substituter-data" "$fixture/cache"
@@ -30,14 +31,14 @@ fi
 # Use a clean compiled-module path for generated bootstrap Guile programs.
 unset GUILE_LOAD_COMPILED_PATH
 # Extra options are for isolated test daemons, never the host daemon.
-"$root/pre-inst-env" "$daemon" --disable-chroot --allow-aslr \
+goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --allow-aslr \
   --substitute-urls="$GUIX_BINARY_SUBSTITUTE_URL" \
   ${GOONIX_DAEMON_OPTIONS:-} \
-  --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1 &
-pid=$!
+  --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
+pid=$GOONIX_TEST_PID
+daemon_scope=$GOONIX_TEST_SCOPE
 cleanup() {
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  goonix_stop_capped "$pid" "$daemon_scope"
 }
 trap cleanup EXIT
 for i in $(seq 1 300); do
@@ -46,4 +47,4 @@ for i in $(seq 1 300); do
   sleep .01
 done
 test -S "$GUIX_DAEMON_SOCKET"
-"$root/pre-inst-env" guile --no-auto-compile "$@"
+goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile "$@"

@@ -3,12 +3,14 @@
 
 module Goonix.Store.Collector
   ( livePaths
+  , GCLimitReached (..)
   , collectPaths
   , deleteSpecificPaths
   , verifyStorePaths
   ) where
 
-import Control.Exception (IOException, SomeException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeException, handle, throwIO, try)
+import Data.Typeable (Typeable)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -78,15 +80,23 @@ canReachRoot settings roots store = go
             then pure (next { liveSet = Set.insert path (liveSet next) }, True)
             else walk next visited path rest
 
+data GCLimitReached = GCLimitReached deriving (Show, Typeable)
+instance Exception GCLimitReached
+
 collectPaths :: Settings -> [ByteString] -> Word64 -> Store -> IO ([ByteString], Word64)
 collectPaths settings roots maximumFreed store = do
   let rootSet = Set.fromList roots
   paths <- queryAllValidPaths store
   freed <- newIORef 0
   deleted <- newIORef []
-  forM_ paths $ \path -> do
-    (_, live) <- canReachRoot settings rootSet store (Reachability Set.empty Set.empty) path
-    unless live $ deleteRecursive settings rootSet maximumFreed freed deleted store path
+  handle (\GCLimitReached -> collectResult freed deleted) $ do
+    forM_ paths $ \path -> do
+      (_, live) <- canReachRoot settings rootSet store (Reachability Set.empty Set.empty) path
+      unless live $ deleteRecursive settings rootSet maximumFreed freed deleted store path
+    collectResult freed deleted
+
+collectResult :: IORef Word64 -> IORef [ByteString] -> IO ([ByteString], Word64)
+collectResult freed deleted = do
   result <- reverse <$> readIORef deleted
   amount <- readIORef freed
   pure (result, amount)
@@ -99,17 +109,15 @@ deleteSpecificPaths settings roots paths maximumFreed store = do
   deleted <- newIORef []
   forM_ paths $ \path -> do
     (_, live) <- canReachRoot settings rootSet store (Reachability Set.empty Set.empty) path
-    unless live $ deleteRecursive settings rootSet maximumFreed freed deleted store path
-  result <- reverse <$> readIORef deleted
-  amount <- readIORef freed
-  pure (result, amount)
+    when live $ throwIO (storeError ("cannot delete path `" ++ C.unpack path ++ "' since it is still alive"))
+    deleteRecursive settings rootSet maximumFreed freed deleted store path
+  collectResult freed deleted
 
 deleteRecursive :: Settings -> Set.Set ByteString -> Word64 -> IORef Word64
   -> IORef [ByteString] -> Store -> ByteString -> IO ()
 deleteRecursive settings roots maximumFreed freed deleted store path = do
-  amount <- readIORef freed
   already <- elem path <$> readIORef deleted
-  unless (already || (maximumFreed /= 0 && amount >= maximumFreed)) $ do
+  unless already $ do
     valid <- isValidPath store path
     when valid $ do
       (_, live) <- canReachRoot settings roots store (Reachability Set.empty Set.empty) path
@@ -119,15 +127,28 @@ deleteRecursive settings roots maximumFreed freed deleted store path = do
           deleteRecursive settings roots maximumFreed freed deleted store referrer
         info <- queryPathInfo store path
         -- C++ invalidates and schedules deletion without checking maxFreed.
-        invalidatePath store path
+        invalidatePathChecked store path
         modifyIORef' deleted (path:)
         modifyIORef' freed (+ infoNarSize info)
         deleteTree path
+        amount' <- readIORef freed
+        when (amount' > maximumFreed) $ throwIO GCLimitReached
 
 invalidatePath :: Store -> ByteString -> IO ()
-invalidatePath store path = withTransaction (database store) $ do
+invalidatePath store = withTransaction (database store) . invalidatePathSQL store
+
+invalidatePathSQL :: Store -> ByteString -> IO ()
+invalidatePathSQL store path = do
   execute (database store) "delete from Refs where referrer in (select id from ValidPaths where path = ?);" [Bytes path]
   execute (database store) "delete from ValidPaths where path = ?;" [Bytes path]
+
+invalidatePathChecked :: Store -> ByteString -> IO ()
+invalidatePathChecked store path = withTransaction (database store) $ do
+  valid <- isValidPath store path
+  when valid $ do
+    referrers <- filter (/= path) <$> queryReferrers store path
+    unless (null referrers) $ throwIO (storeError ("cannot delete path `" ++ C.unpack path ++ "' because it is in use by " ++ C.unpack (C.intercalate ", " referrers)))
+    invalidatePathSQL store path
 
 data VerifyState = VerifyState
   { verifyDone :: !(Set.Set ByteString)

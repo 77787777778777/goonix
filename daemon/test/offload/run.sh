@@ -3,14 +3,15 @@
 # This is deliberately a probe, not the HS-5 Guix test-suite gate.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-out="$root/hs5-offload-fixture"
+. "$root/daemon/test/lib.sh"
+out="$root/.scratch/hs5-offload-fixture"
 daemon=${GOONIX_TEST_DAEMON:-$root/guix-daemon}
 helper_program=${GOONIX_OFFLOAD_PROGRAM:-$root/daemon/test/offload/helper.sh}
 if test -e "$out"; then chmod -R u+rwX "$out"; rm -rf "$out"; fi
 mkdir -p "$out"
 if test "$#" -gt 1; then
   shift
-  exec "$@"
+  exec goonix_run_capped "$@"
 fi
 export GOONIX_OFFLOAD_PROGRAM="$helper_program"
 export GOONIX_DAEMON_OPTIONS="--disable-chroot --no-substitutes"
@@ -39,21 +40,22 @@ run_case() {
   cp "$root/tests/keys/openpgp/signing-key.pub" "$GUIX_CONFIGURATION_DIRECTORY/signing-key.pub"
   chmod 0400 "$GUIX_CONFIGURATION_DIRECTORY/signing-key.sec"
   # The daemon is intentionally started on a fresh, private store.
-  "$root/pre-inst-env" "$daemon" --disable-chroot --no-substitutes \
+  goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --no-substitutes \
     --disable-log-compression \
-    --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1 &
-  pid=$!
-  trap 'kill '"$pid"' 2>/dev/null || true; wait '"$pid"' 2>/dev/null || true' EXIT
+    --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
+  pid=$GOONIX_TEST_PID
+  daemon_scope=$GOONIX_TEST_SCOPE
+  trap 'goonix_stop_capped "$pid" "$daemon_scope"' EXIT
   for i in $(seq 1 300); do
     test -S "$GUIX_DAEMON_SOCKET" && break
     kill -0 "$pid"
     sleep .01
   done
   test -S "$GUIX_DAEMON_SOCKET"
-  "$root/pre-inst-env" guile --no-auto-compile \
+  goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile \
     "$root/daemon/test/offload/client.scm" "$name" "$status" \
     >"$fixture/client.log" 2>&1
-  kill "$pid" 2>/dev/null || true
+  goonix_stop_capped "$pid" "$daemon_scope"
   wait "$pid" 2>/dev/null || true
   trap - EXIT
   cat "$fixture/client.log"

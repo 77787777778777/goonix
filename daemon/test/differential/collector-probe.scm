@@ -31,7 +31,8 @@
     (let* ((phantom (string-append (dirname root) "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hs7-phantom"))
            (live-with-phantom
             (let-values (((paths freed obsolete)
-                          (run-gc/direct store #:action (gc-action return-live)
+                          ((module-ref (resolve-module '(guix store)) 'run-gc/direct)
+                           store #:action 0 ; return-live
                                          #:to-delete (list phantom)
                                          #:min-freed (- (expt 2 64) 1)
                                          #:obsolete1 #f #:obsolete2 0
@@ -56,11 +57,20 @@
            (protected-link (string-append fixture "/protected")))
       (symlink protected protected-link)
       (add-indirect-root store protected-link)
-      (let-values (((paths freed) (delete-paths store (list dependency) 1)))
-        (assert (member dependency paths) "dependency not deleted")
-        (assert (member dependent paths) "dead dependent not deleted")
+      (let ((limited
+             (guard (condition
+                     ;; GCLimitReached is not an Error in C++, so its daemon
+                     ;; closes the socket instead of returning a GC result.
+                     ((nar-error? condition) #t))
+               (delete-paths store (list dependency) 1)
+               #f)))
+        (assert limited "bounded explicit deletion unexpectedly succeeded")
+        (close-connection store)
+        (set! store (open-connection (getenv "GUIX_DAEMON_SOCKET")))
+        (set-build-options store #:use-substitutes? #f)
         (assert (not (valid-path? store dependent)) "dependent DB entry remains")
-        (assert (not (file-exists? dependent)) "dependent file remains")
+        (assert (valid-path? store dependency) "dependency was deleted before referrer")
+        (assert (file-exists? dependency) "dependency file was deleted before referrer")
         (assert (file-exists? protected) "live referrer was deleted")
         (assert (file-exists? protected-ref) "live referrer reference was deleted")))
 
@@ -74,19 +84,33 @@
       (delete-file needed)
       (assert (not (verify-store store)) "missing needed reference not reported")
       (assert (valid-path? store needed) "needed reference was invalidated despite live referrer")
-      (assert (valid-path? store user) "live referrer lost"))
+      (assert (valid-path? store user) "live referrer lost")
+      (assert (not (verify-store store #:repair? #t))
+              "unrepairable missing reference was not reported")
+      (assert (valid-path? store needed) "unrepairable reference was invalidated")
 
-    (let* ((repair-drv (derivation store "hs7-diff-repair" "/does-not-exist" '()))
-           (corrupt (derivation->output-path repair-drv)))
-      (with-derivation-substitute repair-drv "original"
-        (ensure-path store corrupt)
-        (chmod corrupt #o644)
-        (call-with-output-file corrupt (lambda (port) (display "tampered" port)))
-        (assert (not (verify-store store #:check-contents? #t)) "modified content was accepted")
-        (set-build-options store #:use-substitutes? #t
-                           #:substitute-urls (%test-substitute-urls))
-        (assert (verify-store store #:check-contents? #t #:repair? #t) "substitution repair failed")
-        (assert (string=? (call-with-input-file corrupt get-string-all) "original") "repair did not restore content")))
+      ;; Do not carry intentional corruption into the clean concurrency check.
+      (delete-paths store (list user needed))
+      (assert (not (valid-path? store user)) "corrupted verifier fixture remains"))
+
+    ;; Substitution repair uses fresh-store.sh's private substituter setup;
+    ;; see repair-probe.scm and repair.sh.
+
+    (let ((dangling (add-text-to-store store "hs7-diff-dangling"
+                                       "dangling-symlink")))
+      (delete-file dangling)
+      (symlink "/definitely/not/a/store/target" dangling)
+      (assert (eq? 'symlink (stat:type (lstat dangling)))
+              "fixture is not a dangling symlink")
+      (assert (not (file-exists? dangling)) "dangling fixture unexpectedly resolves")
+      (assert (not (verify-store store #:check-contents? #t))
+              "dangling symlink content change was not detected")
+      (assert (valid-path? store dangling) "lstat verifier removed a symlink")
+      (let-values (((paths freed) (collect-garbage store)))
+        (assert (member dangling paths) "dangling store symlink not collected")
+        (assert (not (valid-path? store dangling)) "dangling symlink still registered")
+        (assert (not (file-exists? dangling)) "dangling symlink target was followed")
+        (assert (not (file-exists? dangling)) "dangling symlink was not unlinked")))
 
     ;; Twelve genuinely distinct concurrent inputs.  Guile worker exceptions do
     ;; not propagate through join-thread, so record and re-raise them here.

@@ -15,7 +15,7 @@ module Goonix.Store.Server
   ) where
 
 import Control.Concurrent (forkFinally)
-import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
+import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (IOException, SomeException, bracket, catch, fromException, throwIO, try)
 import Control.Monad (forever, unless, when)
 import Data.Bits ((.&.))
@@ -41,7 +41,7 @@ import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import System.Posix.Env.ByteString (getEnv)
-import Goonix.Store.Files (withTempRootFile, withGCLock, appendTempRoot, deleteTree, mkdirParents, directoryEntries, tryExclusiveLock, catchMissing, deduplicateTree)
+import Goonix.Store.Files (withTempRootFile, withGCLock, withTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
 import qualified System.Posix.Files.ByteString as Files
 import System.Posix.User (getUserEntryForID, userName)
@@ -121,10 +121,9 @@ handleClient config counter client = do
   settingsRef <- newIORef settings
   pid <- getProcessID
   credentialId <- pure (maybe 0 id credential)
-  connectionId <- modifyMVar counter (\n -> pure (n + 1, n + 1))
-  let rootName = "goonix-" <> C.pack (show pid) <> "-" <> C.pack (show credentialId) <> "-" <> C.pack (show connectionId)
+  let rootName = C.pack (show pid)
   catch
-    (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) $ \rootFd ->
+    (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
       bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->
         catch (handleConnection config store { storeStateDirectory = configStateDirectory config } client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
@@ -133,8 +132,13 @@ handleClient config counter client = do
 
 temporaryRootsPath :: ServerConfig -> ByteString
 temporaryRootsPath config = case configStateDirectory config of
-  Just state -> state <> "/temproots/goonix"
+  Just state -> state <> "/temproots"
   Nothing -> "/tmp/goonix-temproots"
+
+storeGcLockPath :: ServerConfig -> ByteString
+storeGcLockPath config = case configStateDirectory config of
+  Just state -> state <> "/gc.lock"
+  Nothing -> configStore config <> "/.gc.lock"
 
 handleConnection :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
 handleConnection config store client settingsRef rootFd rootPath = do
@@ -160,6 +164,9 @@ handleConnection config store client settingsRef rootFd rootPath = do
           result <- try (dispatch config store client settingsRef rootFd rootPath clientVersion operation)
           case result of
             Left exception -> do
+              case fromException exception of
+                Just Collector.GCLimitReached -> throwIO exception
+                Nothing -> pure ()
               case fromException exception of
                 Just (StoreError message status) -> writeSocket client (encodeInt stderrError <> encodeString message <> if clientVersion .&. 0xff >= 8 then encodeInt status else B.empty)
                 Nothing -> writeSocket client (encodeInt stderrError <> encodeString (C.pack (show (exception :: SomeException))) <> encodeInt 1)
@@ -247,18 +254,19 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       pure ()
     when (ignoreLiveness == 1) (throwIO (storeError "you are not allowed to ignore liveness"))
     settings <- readIORef settingsRef
-    (deleted, freed) <- withGCLock (rootPath <> "/gc.lock") $ if action == 3
-      then do
-        live <- livePaths rootPath rootFd store
-        Collector.deleteSpecificPaths settings live paths minFreed store
-      else do
-        live <- livePaths rootPath rootFd store
-        allPaths <- queryAllValidPaths store
-        case action of
-          0 -> pure (live, 0)
-          1 -> pure (filter (`notElem` live) allPaths, 0)
-          2 -> Collector.collectPaths settings live minFreed store
-          _ -> throwIO (storeError "unsupported garbage-collection action")
+    (deleted, freed) <- withGCLock (storeGcLockPath config) $ do
+      roots <- findRoots store
+      withTemporaryRoots (temporaryRootsPath config) $ \temporary -> do
+        live <- Collector.livePaths (map snd roots ++ temporary) store
+        if action == 3
+          then Collector.deleteSpecificPaths settings live paths minFreed store
+          else do
+            allPaths <- queryAllValidPaths store
+            case action of
+              0 -> pure (live, 0)
+              1 -> pure (filter (`notElem` live) allPaths, 0)
+              2 -> Collector.collectPaths settings live minFreed store
+              _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
   1 -> queryOnePath $ \_ path -> do
@@ -512,46 +520,6 @@ readArchiveChunk client = do
     Right value -> pure (fromIntegral value)
   bytes <- readExactly client (len + paddingLength len)
   pure (B.take len bytes)
-
-otherTemporaryRoots :: ByteString -> Store -> IO [ByteString]
-otherTemporaryRoots currentPath store = case storeStateDirectory store of
-  Nothing -> pure []
-  Just state -> do
-    entries <- directoryEntries (state <> "/temproots/goonix")
-    paths <- mapM readOne entries
-    pure (concat paths)
-  where
-    readOne file = do
-      let path = maybe "" (<> "/temproots/goonix/" <> file) (storeStateDirectory store)
-      if path == currentPath then pure [] else do
-        stale <- tryExclusiveLock path
-        case stale of
-          Just fd -> do
-            closeFd fd
-            Files.removeLink path `catchMissing` pure ()
-            pure []
-          Nothing -> do
-            result <- try (B.readFile (C.unpack path))
-            case result of
-              Left (_ :: IOException) -> pure []
-              Right bytes -> pure (filter (not . B.null) (B.split 0 bytes))
-
-livePaths :: ByteString -> Fd -> Store -> IO [ByteString]
-livePaths currentPath _rootFd store = do
-  roots <- findRoots store
-  temporary <- otherTemporaryRoots currentPath store
-  let rootPaths = map snd roots ++ temporary
-  closure <- go Set.empty rootPaths
-  pure (Set.toList closure)
-  where
-    go seen [] = pure seen
-    go seen (path:rest)
-      | Set.member path seen = go seen rest
-      | otherwise = do
-          valid <- isValidPath store path
-          if not valid then go seen rest else do
-            references <- queryReferences store path
-            go (Set.insert path seen) (references ++ rest)
 
 readStorePathsSocket :: Socket -> IO [ByteString]
 readStorePathsSocket = readStringsSocket

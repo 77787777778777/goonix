@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-build="$root/hs6-seccomp-fixture"
+. "$root/daemon/test/lib.sh"
+build="$root/.scratch/hs6-seccomp-fixture"
 rm -rf "$build"
 mkdir -p "$build/ghc" "$build/include"
 cp "$root/nix/libutil/seccomp.cc" "$root/nix/libutil/seccomp.hh" "$build/include/"
 : "${CXX:=c++}"
 : "${GHC:=ghc}"
-"$CXX" -std=c++20 -O2 -I"$build/include" -I"$root/daemon/test/seccomp" \
+goonix_run_capped "$CXX" -std=c++20 -O2 -I"$build/include" -I"$root/daemon/test/seccomp" \
   "$root/daemon/test/seccomp/oracle.cc" "$build/include/seccomp.cc" \
   -o "$build/oracle"
-"$GHC" -O1 -package base -package bytestring -i"$root/daemon/src" \
+goonix_run_capped "$GHC" -O1 -package base -package bytestring -i"$root/daemon/src" \
   -outputdir "$build/ghc" -o "$build/emit" \
   "$root/daemon/test/seccomp/Emit.hs"
-"$build/oracle" > "$build/cxx.bin"
-"$build/emit" > "$build/hs.bin"
+goonix_run_capped "$build/oracle" > "$build/cxx.bin"
+goonix_run_capped "$build/emit" > "$build/hs.bin"
 cmp "$build/cxx.bin" "$build/hs.bin"
 test "$(stat -c %s "$build/cxx.bin")" -gt 16
 cp "$build/hs.bin" "$build/mutated.bin"

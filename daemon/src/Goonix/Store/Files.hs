@@ -9,7 +9,9 @@ module Goonix.Store.Files
   , withPathLock
   , withGCLock
   , withTempRootFile
-  , tryExclusiveLock
+  , readTemporaryRootFile
+  , withTemporaryRoots
+  , readLock
   , appendTempRoot
   , deduplicateTree
   , makeSymlinkAtomic
@@ -21,10 +23,14 @@ module Goonix.Store.Files
   ) where
 
 import Control.Exception (IOException, bracket, bracketOnError, finally, throwIO, try)
-import Control.Monad (forM_, unless, when)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Monad (foldM, forM_, unless, when)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import Foreign.C.Error (Errno (..), getErrno)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.C.Error (Errno (..), eAGAIN, eNOENT, getErrno)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CUInt (..))
 import Data.Word (Word64)
@@ -102,7 +108,13 @@ withPathLock path action = do
       when (result < 0) (errnoIO "cannot release store path lock")
 
 withGCLock :: RawFilePath -> IO a -> IO a
-withGCLock path action = do
+withGCLock = gcLock True
+
+withGCReadLock :: RawFilePath -> IO a -> IO a
+withGCReadLock = gcLock False
+
+gcLock :: Bool -> RawFilePath -> IO a -> IO a
+gcLock exclusive path action = do
   mkdirParents (parent path)
   bracket acquire closeFd (const action)
   where
@@ -110,31 +122,102 @@ withGCLock path action = do
       fd <- withCStringBytes path (\p -> c_lock_shared p 1)
       if fd < 0 then errnoIO "cannot acquire global GC lock"
         else do
-          checkIO "cannot upgrade global GC lock" (c_lock_upgrade fd 1)
+          when exclusive (checkIO "cannot upgrade global GC lock" (c_lock_upgrade fd 1))
           pure (Fd fd)
 
-withTempRootFile :: RawFilePath -> (Fd -> IO a) -> IO a
-withTempRootFile path action = do
+withTempRootFile :: RawFilePath -> RawFilePath -> (Fd -> IO a) -> IO a
+withTempRootFile path gcPath action = do
   mkdirParents (parent path)
-  bracket acquire closeFd action
+  bracket (withMVar tempRootLock (const acquire)) (const release) action
   where
     acquire = do
-      fd <- withCStringBytes path (\p -> c_lock_shared p 1)
-      if fd < 0 then errnoIO "cannot acquire temporary roots lock" else pure (Fd fd)
+      existing <- readIORef tempRoot
+      case existing of
+        Just (fd, count) -> writeIORef tempRoot (Just (fd, count + 1)) >> pure fd
+        Nothing -> withGCReadLock gcPath $ do
+          fd <- openFresh
+          modifyIORef' tempRoot (const (Just (fd, 1)))
+          pure fd
+    openFresh = do
+      fd <- withCStringBytes path c_lock_exclusive
+      if fd >= 0 then readLock (Fd fd) >> pure (Fd fd) else do
+        Errno errno <- getErrno
+        if Errno errno == eAGAIN then Files.removeLink path `catchMissing` pure () >> openFresh
+          else errnoIO "cannot acquire temporary roots lock"
+    release = withMVar tempRootLock $ \() -> do
+      Just (fd, count) <- readIORef tempRoot
+      if count == 1 then do
+        writeIORef tempRoot Nothing
+        closeFd fd
+        Files.removeLink path `catchMissing` pure ()
+      else writeIORef tempRoot (Just (fd, count - 1))
 
-tryExclusiveLock :: RawFilePath -> IO (Maybe Fd)
-tryExclusiveLock path = do
-  fd <- withCStringBytes path (\p -> c_lock_shared p 0)
-  if fd < 0 then pure Nothing else do
-    result <- c_lock_nonblocking fd 1
-    if result == 0 then pure (Just (Fd fd)) else closeFd (Fd fd) >> pure Nothing
+{-# NOINLINE tempRoot #-}
+tempRoot :: IORef (Maybe (Fd, Int))
+tempRoot = unsafePerformIO (newIORef Nothing)
+
+{-# NOINLINE tempRootLock #-}
+tempRootLock :: MVar ()
+tempRootLock = unsafePerformIO (newMVar ())
+
+withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
+withTemporaryRoots directory action = withMVar tempRootLock $ \() ->
+  bracket (readRoots []) (mapM_ closeFd . snd) (action . fst)
+  where
+    readRoots locks = do
+      entries <- directoryEntries directory
+      foldM readOne ([], locks) entries
+    readOne (roots, locks) file = do
+      own <- readIORef tempRoot
+      let path = directory <> "/" <> file
+          sameFd fd = case own of
+            Just (owner, _) -> owner == Fd fd
+            Nothing -> False
+      fd <- withCStringBytes path (\p -> c_lock_shared p 0)
+      if fd < 0 then do
+        Errno errno <- getErrno
+        if Errno errno == eNOENT then pure (roots, locks)
+          else ioError (userError "cannot open temporary roots file")
+      else if sameFd fd then do
+        ownRoots <- readTemporaryRootFile (Fd fd)
+        pure (roots ++ ownRoots, Fd fd : locks)
+      else do
+        result <- c_lock_nonblocking fd 1
+        if result == 0 then do
+          Files.removeLink path `catchMissing` pure ()
+          _ <- fdWrite (Fd fd) "d"
+          closeFd (Fd fd)
+          pure (roots, locks)
+        else do
+          readLock (Fd fd)
+          temporary <- readTemporaryRootFile (Fd fd)
+          pure (roots ++ temporary, Fd fd : locks)
+
+readTemporaryRootFile :: Fd -> IO [ByteString]
+readTemporaryRootFile (Fd fd) = filter (not . B.null) . B.split 0 . B.concat . reverse <$> readChunks 0 []
+  where
+    readChunks offset acc = do
+      (buffer, count) <- allocaBytes 65536 $ \buffer -> do
+        count <- c_read fd buffer 65536 offset
+        pure (buffer, count)
+      if count < 0 then errnoIO "cannot read temporary roots file"
+        else if count == 0 then pure acc
+          else do
+            bytes <- B.packCStringLen (castPtr buffer, count)
+            readChunks (offset + fromIntegral count) (bytes : acc)
 
 appendTempRoot :: Fd -> RawFilePath -> IO ()
+readLock :: Fd -> IO ()
+readLock (Fd fd) = checkIO "cannot acquire temporary roots read lock" (c_lock_upgrade fd 0)
+
 appendTempRoot (Fd fd) path = do
   checkIO "cannot upgrade temporary roots lock" (c_lock_upgrade fd 1)
   result <- B.useAsCStringLen (path <> "\0") $ \(bytes, len) -> c_write_at_end fd (castPtr bytes) (fromIntegral len)
   when (result < 0) (errnoIO "cannot write temporary root")
   checkIO "cannot downgrade temporary roots lock" (c_lock_upgrade fd 0)
+
+foreign import ccall safe "pread"
+  c_read :: CInt -> Ptr () -> Word64 -> Word64 -> IO Int
 
 deduplicateTree :: RawFilePath -> RawFilePath -> IO ()
 deduplicateTree store path = do

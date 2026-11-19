@@ -146,16 +146,46 @@ int goonix_dedup_link(const char *path, const char *link_path, const char *temp_
   struct stat parent_stat;
   if (stat(parent, &parent_stat) < 0) return -1;
   if (chmod(parent, parent_stat.st_mode | S_IWUSR | S_IXUSR) < 0) return -1;
-  int result;
-  if (link(path, link_path) == 0) result = 1;
-  else if (errno != EEXIST) result = -1;
-  else if (link(link_path, temp_path) < 0) result = -1;
-  else if (rename(temp_path, path) < 0) {
-    int saved = errno;
-    unlink(temp_path);
-    errno = saved;
+  int result = 0;
+  for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+    struct stat source_stat, link_stat;
+    if (lstat(path, &source_stat) < 0) { result = -1; break; }
+    if (lstat(link_path, &link_stat) == 0) {
+      if (source_stat.st_ino == link_stat.st_ino) { result = 1; break; }
+      if (source_stat.st_size != link_stat.st_size) {
+        if (unlink(link_path) < 0) { result = -1; break; }
+        continue;
+      }
+    } else if (errno != ENOENT) { result = -1; break; }
+    if (link(path, link_path) == 0) { result = 1; break; }
+    if (errno == EEXIST) continue;
+    if (errno == ENOSPC) break;
     result = -1;
-  } else result = 2;
+    break;
+  }
+  if (result == 0) {
+    for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+      size_t length = strlen(temp_path);
+      if (snprintf((char *)temp_path + length, 32, "-%ld-%u", (long)getpid(), attempt) >= 32) {
+        result = -1;
+        errno = ENAMETOOLONG;
+        break;
+      }
+      if (link(link_path, temp_path) == 0) {
+        if (rename(temp_path, path) == 0) result = 2;
+        else {
+          result = errno == EMLINK ? 1 : -1;
+          int saved = errno;
+          unlink(temp_path);
+          errno = saved;
+        }
+        break;
+      }
+      if (errno == EEXIST) continue;
+      result = errno == EMLINK ? 1 : -1;
+      break;
+    }
+  }
   int saved = errno;
   if (chmod(parent, parent_stat.st_mode) < 0 && result >= 0) { saved = errno; result = -1; }
   errno = saved;
