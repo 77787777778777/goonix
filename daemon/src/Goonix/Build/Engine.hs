@@ -162,41 +162,47 @@ buildWithHook rootFd store settings trace pool mode drvPath drv = do
       tryBuild Nothing = runBuilder rootFd store settings trace mode drvPath drv
       tryBuild (Just currentPool)
         | mode /= Normal || willBuildLocally settings drv = localBuild
-        | otherwise = withOutputLocks $ bracketOnError (acquireHook settings currentPool)
-            (\hook -> releaseHook currentPool hook >> stopHook hook) $ \hook ->
-            offer currentPool hook
+        | otherwise = withOutputLocks $ do
+            outcome <- bracketOnError (acquireHook settings currentPool)
+              (\hook -> writeIORef (fst currentPool) Nothing >> stopHook hook) $ \hook ->
+              offer currentPool hook
+            case outcome of
+              BuildRemotely hook -> do
+                -- An accepted hook owns the build.  In particular, a helper
+                -- failure is not a request to retry locally.
+                inputRoots <- Set.toList <$> foldM (derivationInputs store) Set.empty [drv]
+                inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
+                let outputPaths = map outputPath (Map.elems (outputs drv))
+                logPath <- buildLogPath settings store drvPath
+                mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
+                traceStarted trace drvPath (platform drv) logPath (fromIntegral (hookPid hook))
+                acceptOffload hook inputs outputPaths
+                bracket (openLog settings logPath) closeLog $ \logHandle -> do
+                  outputLock <- newMVar ()
+                  let emit bytes = withMVar outputLock $ \_ -> writeLog logHandle bytes >> traceOutput trace bytes
+                  status <- finishOffload hook emit
+                  releaseHook currentPool hook
+                  valid <- and <$> mapM (isValidPath store) outputPaths
+                  case (status, valid) of
+                    (HelperExited 0, True) -> traceSucceeded trace drvPath
+                    _ -> offloadFailed settings store trace drvPath drv status
+              BuildLocally -> localBuild
       offer currentPool hook = do
         ready <- allOutputsValid store drv
-        if ready then releaseHook currentPool hook else do
+        if ready then releaseHook currentPool hook >> pure BuildLocally else do
           -- C++ holds the output locks while offering the job to the hook.
           reply <- requestOffload hook (traceOutput trace) True (platform drv) drvPath
             (C.words (Map.findWithDefault "" "requiredSystemFeatures" (environment drv)))
           case reply of
-            HookDecline -> releaseHook currentPool hook >> localBuild
+            HookDecline -> releaseHook currentPool hook >> pure BuildLocally
             HookPostpone -> do
               -- waitForAWhile: keep the same live hook for the next offer.
               threadDelay 5000000
               offer currentPool hook
-            HookAccept -> do
-              -- An accepted hook owns the build.  In particular, a helper
-              -- failure is not a request to retry locally.
-              inputRoots <- Set.toList <$> foldM (derivationInputs store) Set.empty [drv]
-              inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
-              let outputPaths = map outputPath (Map.elems (outputs drv))
-              logPath <- buildLogPath settings store drvPath
-              mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
-              traceStarted trace drvPath (platform drv) logPath (fromIntegral (hookPid hook))
-              acceptOffload hook inputs outputPaths
-              bracket (openLog settings logPath) closeLog $ \logHandle -> do
-                outputLock <- newMVar ()
-                let emit bytes = withMVar outputLock $ \_ -> writeLog logHandle bytes >> traceOutput trace bytes
-                status <- finishOffload hook emit
-                releaseHook currentPool hook
-                valid <- and <$> mapM (isValidPath store) outputPaths
-                case (status, valid) of
-                  (HelperExited 0, True) -> traceSucceeded trace drvPath
-                  _ -> offloadFailed settings store trace drvPath drv status
+            HookAccept -> pure (BuildRemotely hook)
   tryBuild pool
+
+data HookOutcome = BuildLocally | BuildRemotely Hook
 
 acquireHook :: Settings -> HookPool -> IO Hook
 acquireHook settings (state, program) = do
