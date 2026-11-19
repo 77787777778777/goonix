@@ -137,10 +137,9 @@ typedef map<Path, WeakGoalPtr> WeakGoalMap;
 
 class Goal : public std::enable_shared_from_this<Goal>
 {
-    friend class Worker; // goonix: stalled-goal diagnostics
-public: // goonix: goal diagnostics are public for the worker
-    size_t waiteeCount() const { return waitees.size(); }
-    const string & goalName() const { return name; }
+public:
+    size_t waiteeCount() const { return waitees.size(); } // goonix: stall diagnostics
+    const string & goalName() const { return name; } // goonix
     typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters, ecIncompleteClosure} ExitCode;
 
 protected:
@@ -679,10 +678,6 @@ private:
     /* RAII object to delete the chroot directory. */
     std::shared_ptr<AutoDelete> autoDelChroot;
 
-    /* goonix: original derivation and its realised, buildable form. */
-    Path originalDrvPath;
-    Derivation originalDrv;
-
     /* Whether this is a fixed-output derivation. */
     bool fixedOutput;
 
@@ -753,7 +748,7 @@ private:
     void outputsSubstituted();
     void closureRepaired();
     void inputsRealised();
-    void addInputWaitees(); // goonix: unresolved CA input scheduling
+#include "build-goonix.hh" // goonix: private CA members, defined in our file
     void tryToBuild();
     void buildDone();
 
@@ -800,6 +795,8 @@ private:
     void done(BuildResult::Status status, const string & msg = "");
 };
 
+
+#include "build-goonix.inc" // goonix: member definitions for CA-only hooks
 
 DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, Worker & worker, BuildMode buildMode)
     : Goal(worker)
@@ -923,8 +920,112 @@ void DerivationGoal::init()
 }
 
 
-#include "build-have.inc" // goonix: CA scheduler body in our file
-#include "build-output.inc" // goonix: CA scheduler body in our file
+void DerivationGoal::haveDerivation()
+{
+    trace("loading derivation");
+
+    if (nrFailed != 0) {
+        printMsg(lvlError, std::format("cannot build missing derivation `{}'", drvPath));
+        done(BuildResult::MiscFailure);
+        return;
+    }
+
+    /* `drvPath' should already be a root, but let's be on the safe
+       side: if the user forgot to make it a root, we wouldn't want
+       things being garbage collected while we're busy. */
+    worker.store.addTempRoot(drvPath);
+
+    assert(worker.store.isValidPath(drvPath));
+
+    /* Get the derivation. */
+    drv = derivationFromPath(worker.store, drvPath);
+    if (goonixHaveDerivation()) return; // goonix: CA goal preparation in our file
+
+    for (auto& i : drv.outputs)
+        worker.store.addTempRoot(i.second.path);
+
+    /* Check what outputs paths are not already valid. */
+    PathSet invalidOutputs = checkPathValidity(false, buildMode == bmRepair);
+
+    /* If they are all valid, then we're done. */
+    if (invalidOutputs.size() == 0 && buildMode == bmNormal) {
+        done(BuildResult::AlreadyValid);
+        return;
+    }
+
+    /* Check whether any output previously failed to build.  If so,
+       don't bother. */
+    for (auto& i : invalidOutputs)
+        if (pathFailed(i)) return;
+
+    /* We are first going to try to create the invalid output paths
+       through substitutes.  If that doesn't work, we'll build
+       them. */
+    if (settings.useSubstitutes && substitutesAllowed(drv))
+        for (auto& i : invalidOutputs)
+            addWaitee(worker.makeSubstitutionGoal(i, buildMode == bmRepair));
+
+    if (waitees.empty()) /* to prevent hang (no wake-up event) */
+        outputsSubstituted();
+    else
+        state = &DerivationGoal::outputsSubstituted;
+}
+
+
+void DerivationGoal::outputsSubstituted()
+{
+    trace("all outputs substituted (maybe)");
+
+    if (nrFailed > 0 && nrFailed > nrNoSubstituters + nrIncompleteClosure && !settings.tryFallback)
+        throw Error(std::format("some substitutes for the outputs of derivation `{}' failed (usually happens due to networking issues); try `--fallback' to build derivation from source ", drvPath));
+
+    /*  If the substitutes form an incomplete closure, then we should
+        build the dependencies of this derivation, but after that, we
+        can still use the substitutes for this derivation itself. */
+    if (nrIncompleteClosure > 0 && !retrySubstitution) retrySubstitution = true;
+
+    nrFailed = nrNoSubstituters = nrIncompleteClosure = 0;
+
+    if (needRestart) {
+        needRestart = false;
+        haveDerivation();
+        return;
+    }
+
+    if (goonixRealiseInputsFirst()) return; // goonix: placeholders resolve inputs first
+    unsigned int nrInvalid = checkPathValidity(false, buildMode == bmRepair).size();
+    if (buildMode == bmNormal && nrInvalid == 0) {
+        done(BuildResult::Substituted);
+        return;
+    }
+    if (buildMode == bmRepair && nrInvalid == 0) {
+        repairClosure();
+        return;
+    }
+    if (buildMode == bmCheck && nrInvalid > 0)
+        throw Error(std::format("`{}' is missing outputs; build it normally before using `--check'", drvPath));
+
+    /* Otherwise, at least one of the output paths could not be
+       produced using a substitute.  So we have to build instead. */
+
+    /* Make sure checkPathValidity() from now on checks all
+       outputs. */
+    wantedOutputs = PathSet();
+
+    /* The inputs must be built before we can build this goal. */
+    for (auto& i : drv.inputDrvs)
+        addWaitee(worker.makeDerivationGoal(i.first, i.second, buildMode == bmRepair ? bmRepair : bmNormal));
+
+    for (auto& i : drv.inputSrcs)
+        addWaitee(worker.makeSubstitutionGoal(i));
+
+    if (waitees.empty()) /* to prevent hang (no wake-up event) */
+        inputsRealised();
+    else
+        state = &DerivationGoal::inputsRealised;
+}
+
+
 void DerivationGoal::repairClosure()
 {
     /* If we're repairing, we now know that our own outputs are valid.
@@ -986,7 +1087,76 @@ void DerivationGoal::closureRepaired()
 }
 
 
-#include "build-input.inc" // goonix: CA scheduler body in our file
+void DerivationGoal::inputsRealised()
+{
+    trace("all inputs realised");
+
+    if (nrFailed != 0) {
+        printMsg(lvlError,
+            std::format("cannot build derivation `{}': {} dependencies couldn't be built",
+            drvPath, nrFailed));
+        done(BuildResult::DependencyFailed);
+        return;
+    }
+
+    if (goonixResolveInputs()) return; // goonix: resolve CA inputs and reschedule
+    if (retrySubstitution) {
+        haveDerivation();
+        return;
+    }
+
+    /* Gather information necessary for computing the closure and/or
+       running the build hook. */
+
+    /* The outputs are referenceable paths. */
+    for (auto& i : drv.outputs) {
+        debug(std::format("building path `{}'", i.second.path));
+        allPaths.insert(i.second.path);
+    }
+
+    /* Determine the full set of input paths. */
+
+    /* First, the input derivations. */
+    for (auto& i : drv.inputDrvs) {
+        /* Add the relevant output closures of the input derivation
+           `*i' as input paths.  Only add the closures of output paths
+           that are specified as inputs. */
+        assert(worker.store.isValidPath(i.first));
+        Derivation inDrv = derivationFromPath(worker.store, i.first);
+        for (auto& j : i.second)
+            if (inDrv.outputs.find(j) != inDrv.outputs.end())
+                computeFSClosure(worker.store, inDrv.outputs[j].path, inputPaths);
+            else
+                throw Error(
+                    std::format("derivation `{}' requires non-existent output `{}' from input derivation `{}'",
+                    drvPath, j, i.first));
+    }
+
+    /* Second, the input sources. */
+    for (auto& i : drv.inputSrcs)
+        computeFSClosure(worker.store, i, inputPaths);
+
+    debug(std::format("added input paths {}", showPaths(inputPaths)));
+
+    allPaths.insert(inputPaths.begin(), inputPaths.end());
+
+    /* Is this a fixed-output derivation? */
+    fixedOutput = true;
+    for (auto & i : drv.outputs)
+	if (i.second.hash == "") fixedOutput = false;
+
+    /* Don't repeat fixed-output derivations since they're already
+       verified by their output hash.*/
+    nrRounds = fixedOutput ? 1 : settings.get("build-repeat", 0) + 1;
+
+    /* Okay, try to build.  Note that here we don't wait for a build
+       slot to become available, since we don't need one if there is a
+       build hook. */
+    state = &DerivationGoal::tryToBuild;
+    worker.wakeUp(shared_from_this());
+}
+
+
 static bool canBuildLocally(const string & platform)
 {
     return platform == settings.thisSystem
@@ -1051,14 +1221,7 @@ void DerivationGoal::tryToBuild()
        omitted, but that would be less efficient.)  Note that since we
        now hold the locks on the output paths, no other process can
        build this derivation, so no further checks are necessary. */
-    /* goonix: recheck facts while holding the token output lock. */
-    if (buildMode == bmNormal &&
-        goonixBuildAlreadyRealised(worker.store, originalDrvPath, drv)) {
-        outputLocks.setDeletion(true);
-        outputLocks.unlock();
-        done(BuildResult::AlreadyValid);
-        return;
-    }
+    if (goonixRecheckRealised()) return; // goonix: recheck records under output locks
     validPaths = checkPathValidity(true, buildMode == bmRepair);
     if (buildMode != bmCheck && validPaths.size() == drv.outputs.size()) {
         debug(std::format("skipping build of derivation `{}', someone beat us to it", drvPath));
@@ -2441,7 +2604,6 @@ void DerivationGoal::startBuilder()
 
     // goonix: reserved entries and embedded files are daemon metadata.
     removeGoonixEnvironment(ctx.env);
-
     /* Create a temporary directory where the build will take
        place. */
     auto drvName = storePathToName(drvPath);
@@ -2486,7 +2648,6 @@ void DerivationGoal::startBuilder()
 
     // goonix: materialise __files after placeholder resolution.
     materialiseGoonixFiles(drv, ctx.args, tmpDir, tmpDirInSandbox);
-
     /* *Only* if this is a fixed-output derivation, propagate the
        values of the environment variables specified in the
        `impureEnvVars' attribute to the builder.  This allows for
@@ -2980,7 +3141,284 @@ PathSet parseReferenceSpecifiers(const Derivation & drv, string attr)
 }
 
 
-#include "build-register.inc" // goonix: CA scheduler body in our file
+void DerivationGoal::registerOutputs()
+{
+    /* When using a build hook, the build hook can register the output
+       as valid (by doing `nix-store --import').  If so we don't have
+       to do anything here. */
+    if (hook) {
+        bool allValid = true;
+        for (auto& i : drv.outputs)
+            if (!worker.store.isValidPath(i.second.path)) allValid = false;
+        if (allValid) return;
+    }
+
+    ValidPathInfos infos;
+
+    /* Set of inodes seen during calls to canonicalisePathMetaData()
+       for this build's outputs.  This needs to be shared between
+       outputs to allow hard links between outputs. */
+    InodesSeen inodesSeen;
+
+    goonixRegisterOutputs(inodesSeen, infos); // goonix: finalise CA outputs in our file
+    Path checkSuffix = "-check";
+
+    /* Check whether the output paths were created, and grep each
+       output path to determine what other paths it references.  Also make all
+       output paths read-only. */
+    for (auto& i : drv.outputs) {
+        Path path = i.second.path;
+        if (missingPaths.find(path) == missingPaths.end()) continue;
+        if (goonixOutputResult.finalOutputs.count(path)) continue; // goonix: already finalised
+
+        Path actualPath = path;
+        if (useChroot) {
+            actualPath = chrootRootDir + path;
+        } else {
+            Path redirected = redirectedOutputs[path];
+            if (buildMode == bmRepair
+                && redirectedBadOutputs.find(path) != redirectedBadOutputs.end()
+                && pathExists(redirected))
+                replaceValidPath(path, redirected);
+            if (buildMode == bmCheck && redirected != "")
+                actualPath = redirected;
+        }
+
+        struct stat st;
+        if (lstat(actualPath.c_str(), &st) == -1) {
+            if (errno == ENOENT)
+                throw BuildError(
+                    std::format("builder for `{}' failed to produce output path `{}'",
+                        drvPath, path));
+            throw SysError(std::format("getting attributes of path `{}'", actualPath));
+        }
+
+#ifndef __CYGWIN__
+        /* Check that the output is not group or world writable, as
+           that means that someone else can have interfered with the
+           build.  Also, the output should be owned by the build
+           user. */
+        if ((!S_ISLNK(st.st_mode) && (st.st_mode & (S_IWGRP | S_IWOTH))) ||
+            (buildUser.enabled() && st.st_uid != buildUser.getUID()))
+            throw BuildError(std::format("suspicious ownership or permission on `{}'; rejecting this build output", path));
+#endif
+
+        /* Apply hash rewriting if necessary. */
+        bool rewritten = false;
+        if (!rewritesFromTmp.empty()) {
+            printMsg(lvlError, std::format("warning: rewriting hashes in `{}'; cross fingers", path));
+
+            /* Canonicalise first.  This ensures that the path we're
+               rewriting doesn't contain a hard link to /etc/shadow or
+               something like that. */
+            canonicalisePathMetaData(actualPath, buildUser.enabled() ? buildUser.getUID() : -1, inodesSeen);
+
+            /* FIXME: this is in-memory. */
+            StringSink sink;
+            dumpPath(actualPath, sink);
+            deletePath(actualPath);
+            sink.s = rewriteHashes(sink.s, rewritesFromTmp);
+            StringSource source(sink.s);
+            restorePath(actualPath, source);
+
+            rewritten = true;
+        }
+
+        startNest(nest, lvlTalkative,
+            std::format("scanning for references inside `{}'", path));
+
+        /* Check that fixed-output derivations produced the right
+           outputs (i.e., the content hash should match the specified
+           hash). */
+        if (i.second.hash != "") {
+
+            bool recursive; HashType ht; Hash h;
+            i.second.parseHashInfo(recursive, ht, h);
+
+            if (!recursive) {
+                /* The output path should be a regular file without
+                   execute permission. */
+                if (!S_ISREG(st.st_mode) || (st.st_mode & S_IXUSR) != 0)
+                    throw BuildError(
+                        std::format("output path `{}' should be a non-executable regular file", path));
+            }
+
+            /* Check the hash. */
+            Hash h2 = recursive ? hashPath(ht, actualPath).first : hashFile(ht, actualPath);
+            if (h != h2) {
+		if (settings.printBuildTrace)
+		    printMsg(lvlError, std::format("@ hash-mismatch {} {} {} {}",
+			    path, i.second.hashAlgo,
+                printHash16or32(h), printHash16or32(h2)));
+                throw BuildError(std::format("hash mismatch for store item '{}'", path));
+	    }
+        }
+
+        /* Get rid of all weird permissions.  This also checks that
+           all files are owned by the build user, if applicable. */
+        canonicalisePathMetaData(actualPath,
+            buildUser.enabled() && !rewritten ? buildUser.getUID() : -1, inodesSeen);
+
+        if (useChroot) {
+          if (pathExists(actualPath)) {
+            /* Now that output paths have been canonicalized (in particular
+               there are no setuid files left), move them outside of the
+               chroot and to the store. */
+            if (buildMode == bmRepair)
+              replaceValidPath(path, actualPath);
+            else
+		if (buildMode != bmCheck) {
+		    if (S_ISDIR(st.st_mode)) {
+                        if (lstat(actualPath.c_str(), &st) == -1)
+                            throw SysError(std::format("getting canonicalized permissions of directory `{}'", actualPath));
+			/* Change mode on the directory to allow for
+			   rename(2).  */
+			if (chmod(actualPath.c_str(), st.st_mode | 0700) == -1)
+                            throw SysError(std::format("making `{}' writable for move from chroot to store", actualPath));
+                    }
+		    if (rename(actualPath.c_str(), path.c_str()) == -1)
+			throw SysError(std::format("moving build output `{}' from the chroot to the store", path));
+		    if (S_ISDIR(st.st_mode) && chmod(path.c_str(), st.st_mode) == -1)
+			throw SysError(std::format("restoring permissions on directory `{}'", actualPath));
+		}
+          }
+          if (buildMode != bmCheck) actualPath = path;
+        }
+
+        /* For this output path, find the references to other paths
+           contained in it.  Compute the SHA-256 NAR hash at the same
+           time.  The hash is stored in the database so that we can
+           verify later on whether nobody has messed with the store. */
+        HashResult hash;
+        PathSet references = scanForReferences(actualPath, allPaths, hash);
+
+        if (buildMode == bmCheck) {
+            if (!store->isValidPath(path)) continue;
+            ValidPathInfo info = worker.store.queryPathInfo(path);
+            if (hash.first != info.hash) {
+                if (settings.keepFailed) {
+                    Path dst = path + checkSuffix;
+                    if (pathExists(dst)) deletePath(dst);
+                    if (rename(actualPath.c_str(), dst.c_str()))
+                        throw SysError(std::format("renaming `{}' to `{}'", actualPath, dst));
+                    throw Error(std::format("derivation `{}' may not be deterministic: output `{}' differs from `{}'",
+                        drvPath, path, dst));
+                } else
+                    throw Error(std::format("derivation `{}' may not be deterministic: output `{}' differs",
+                        drvPath, path));
+            }
+
+            if (settings.printBuildTrace)
+                printMsg(lvlError, std::format("@ build-succeeded {} -", drvPath));
+
+            continue;
+        }
+
+        /* For debugging, print out the referenced and unreferenced
+           paths. */
+        for (auto& i : inputPaths) {
+            PathSet::iterator j = references.find(i);
+            if (j == references.end())
+                debug(std::format("unreferenced input: `{}'", i));
+            else
+                debug(std::format("referenced input: `{}'", i));
+        }
+
+        /* Enforce `allowedReferences' and friends. */
+        auto checkRefs = [&](const string & attrName, bool allowed, bool recursive) {
+            if (drv.env.find(attrName) == drv.env.end()) return;
+
+            PathSet spec = parseReferenceSpecifiers(drv, get(drv.env, attrName));
+
+            PathSet used;
+            if (recursive) {
+                /* Our requisites are the union of the closures of our references. */
+                for (auto & i : references)
+                    /* Don't call computeFSClosure on ourselves. */
+                    if (actualPath != i)
+                        computeFSClosure(worker.store, i, used);
+            } else
+                used = references;
+
+            for (auto & i : used)
+                if (allowed) {
+                    if (spec.find(i) == spec.end())
+                        throw BuildError(std::format("output (`{}') is not allowed to refer to path `{}'", actualPath, i));
+                } else {
+                    if (spec.find(i) != spec.end())
+                        throw BuildError(std::format("output (`{}') is not allowed to refer to path `{}'", actualPath, i));
+                }
+        };
+
+        checkRefs("allowedReferences", true, false);
+        checkRefs("allowedRequisites", true, true);
+        checkRefs("disallowedReferences", false, false);
+        checkRefs("disallowedRequisites", false, true);
+
+        if (curRound == nrRounds) {
+            worker.store.optimisePath(path); // FIXME: combine with scanForReferences()
+
+            worker.store.markContentsGood(path);
+        }
+
+        goonixRecordResolvedOutput(i.first, path); // goonix: signed fact after checks
+        ValidPathInfo info;
+        info.path = path;
+        info.hash = hash.first;
+        info.narSize = hash.second;
+        info.references = references;
+        info.deriver = drvPath;
+        infos.push_back(info);
+    }
+
+    /* Compare the result with the previous round, and report which
+       path is different, if any.*/
+    if (curRound > 1 && prevInfos != infos) {
+        assert(prevInfos.size() == infos.size());
+        for (auto i = prevInfos.begin(), j = infos.begin(); i != prevInfos.end(); ++i, ++j)
+            if (!(*i == *j)) {
+                Path prev = i->path + checkSuffix;
+                if (pathExists(prev))
+                    throw NotDeterministic(
+                        std::format("output `{}' of `{}' differs from `{}' from previous round",
+                            i->path, drvPath, prev));
+                else
+                    throw NotDeterministic(
+                        std::format("output `{}' of `{}' differs from previous round",
+                            i->path, drvPath));
+            }
+        assert(false); // shouldn't happen
+    }
+
+    /* Rename the built package when doing multiple rounds, but
+       don't move the package when running in check mode, since
+       that would remove the valid package from the store. */
+    if (settings.keepFailed && buildMode != bmCheck) {
+        for (auto & i : drv.outputs) {
+            Path prev = i.second.path + checkSuffix;
+            if (pathExists(prev)) deletePath(prev);
+            if (curRound < nrRounds) {
+                Path dst = i.second.path + checkSuffix;
+                if (rename(i.second.path.c_str(), dst.c_str()))
+                    throw SysError(std::format("renaming `{}' to `{}'", i.second.path, dst));
+            }
+        }
+
+    }
+
+    if (curRound < nrRounds) {
+        prevInfos = infos;
+        goonixDiscardOutputs(); // goonix: discard unregistered staged outputs between rounds
+        return;
+    }
+
+    /* Register each output path as valid, and register the sets of
+       paths referenced by each of them.  If there are cycles in the
+       outputs, this will fail. */
+    goonixRegisterValidPaths(infos); // goonix: register, commit facts and clean on failure
+}
+
+
 Path DerivationGoal::openLogFile()
 {
     logSize = 0;

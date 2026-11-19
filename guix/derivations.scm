@@ -854,25 +854,36 @@ output should not be used.
 PROPERTIES must be an association list describing \"properties\" of the
 derivation.  It is kept as-is, uninterpreted, in the derivation."
   (define (add-output-paths drv)
-    ;; goonix: output addressing and placeholders are implemented in our module.
-    ((module-ref (resolve-interface '(guix ca derivation))
-                 'validate-addressing) addressing)
-    ((module-ref (resolve-interface '(guix ca derivation))
-                 'add-addressed-output-paths)
-     drv name addressing output-path
-     (lambda (output-name algo hash rec?)
-       (fixed-output-path name hash #:hash-algo algo
-                          #:output output-name #:recursive? rec?))
-     derivation-output-path derivation-output-hash
-     derivation-output-hash-algo derivation-output-recursive?
-     make-derivation-output
-     (lambda (drv)
-       (list (derivation-outputs drv) (derivation-inputs drv)
-             (derivation-sources drv) (derivation-system drv)
-             (derivation-builder drv) (derivation-builder-arguments drv)
-             (derivation-builder-environment-vars drv)))
-     derivation->bytevector derivation-hash
-     store-path-package-name make-derivation))
+    ;; Return DRV with an actual store path for each of its output and the
+    ;; corresponding environment variable.
+    (match drv
+      (($ <derivation> outputs inputs sources
+                       system builder args env-vars)
+       (let* ((drv-hash (derivation-hash drv))
+              (outputs  (map (match-lambda
+                               ((output-name . ($ <derivation-output>
+                                                  _ algo hash rec?))
+                                (let ((path
+                                       (if hash
+                                           (fixed-output-path name hash
+                                                              #:hash-algo algo
+                                                              #:output output-name
+                                                              #:recursive? rec?)
+                                           (output-path output-name
+                                                        drv-hash name))))
+                                  (cons output-name
+                                        (make-derivation-output path algo
+                                                                hash rec?)))))
+                             outputs)))
+         (make-derivation outputs inputs sources system builder args
+                          (map (match-lambda
+                                 ((name . value)
+                                  (cons name
+                                        (or (and=> (assoc-ref outputs name)
+                                                   derivation-output-path)
+                                            value))))
+                               env-vars)
+                          #f)))))
 
   (define (user+system-env-vars)
     ;; Some options are passed to the build daemon via the env. vars of
@@ -980,7 +991,25 @@ derivation.  It is kept as-is, uninterpreted, in the derivation."
                              (string<? (car e1) (car e2)))))
          (drv-masked (make-derivation outputs inputs sources
                                       system builder args env-vars #f))
-         (drv        (add-output-paths drv-masked)))
+         (drv        (if (eq? addressing 'input) ;goonix: preserve upstream input paths
+                           (add-output-paths drv-masked)
+                           ((module-ref (resolve-interface '(guix ca derivation))
+                                        'add-addressed-output-paths)
+                            drv-masked name addressing output-path
+                            (lambda (output-name algo hash rec?)
+                              (fixed-output-path name hash #:hash-algo algo
+                                                 #:output output-name
+                                                 #:recursive? rec?))
+                            derivation-output-path
+                            derivation-output-hash derivation-output-hash-algo
+                            derivation-output-recursive? make-derivation-output
+                            (lambda (drv)
+                              (list (derivation-outputs drv) (derivation-inputs drv)
+                                    (derivation-sources drv) (derivation-system drv)
+                                    (derivation-builder drv) (derivation-builder-arguments drv)
+                                    (derivation-builder-environment-vars drv)))
+                            derivation->bytevector derivation-hash
+                            store-path-package-name make-derivation))))
 
     (let* ((file (add-data-to-store store (string-append name ".drv")
                                     (derivation->bytevector drv)

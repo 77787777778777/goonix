@@ -22,6 +22,7 @@
                                     package-name make)
   "Construct the addressed derivation from opaque data and supplied accessors.
 The caller owns the record representation; this module owns addressing rules."
+  (validate-addressing addressing)
   (let* ((fields (fields masked))
          (outputs (car fields))
          (env-vars (list-ref fields 6))

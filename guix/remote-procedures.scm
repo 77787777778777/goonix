@@ -307,7 +307,8 @@ Return #t on success."
   (define (query-realised-output/direct (store-path derivation)
                                         (utf8-string output))
     "Return the realised store path of DERIVATION's OUTPUT."
-    id: 82 returns: store-path)
+    id: 82
+    returns: store-path)
 
   (define (query-build-records (base16 resolved-hash)
                                (utf8-string output))

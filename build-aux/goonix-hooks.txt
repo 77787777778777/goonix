@@ -1,10 +1,10 @@
 # Upstream files that goonix changes, with the lines added and removed.
 # Checked by build-aux/check-goonix-hooks.sh; rewrite with --record.
 guix/config.scm.in 4 0
-guix/derivations.scm 42 31
-guix/gexp.scm 20 7
+guix/derivations.scm 42 2
+guix/gexp.scm 20 6
 guix/packages.scm 9 2
-guix/remote-procedures.scm 14 1
+guix/remote-procedures.scm 15 1
 guix/scripts/build.scm 22 2
 guix/scripts/deploy.scm 4 1
 guix/scripts/environment.scm 2 0
@@ -15,7 +15,7 @@ guix/scripts/system.scm 13 1
 guix/store.scm 15 2
 Makefile.am 5 0
 build-aux/pre-inst-env.in 3 0
-nix/libstore/build.cc 40 451
+nix/libstore/build.cc 31 4
 nix/libstore/derivations.cc 14 3
 nix/libstore/derivations.hh 1 0
 nix/libstore/gc.cc 21 0
@@ -27,5 +27,5 @@ nix/libstore/worker-protocol.hh 4 2
 nix/libutil/util.cc 18 1
 nix/libutil/util.hh 2 1
 config-daemon.ac 7 0
-nix/local.mk 35 0
+nix/local.mk 33 0
 nix/nix-daemon/nix-daemon.cc 39 0

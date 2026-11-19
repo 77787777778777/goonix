@@ -1334,7 +1334,8 @@ The other arguments are as for 'derivation'."
                                                          #:target target)
                                        (return #f)))
                        (guile -> (lowered-gexp-guile lowered))
-                       (builder-text -> (sexp->string (lowered-gexp-sexp lowered))) ;goonix: builder text
+                       (builder-text -> (sexp->string
+                                         (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
                                      (text-file script-name builder-text)
                                      (return script-name))))
@@ -1373,7 +1374,7 @@ The other arguments are as for 'derivation'."
                                         (list builder)
                                         '())
                                   ,@(if (and (string? modules)
-                                             (store-path? modules)) ;goonix: other sources unchanged
+                                             (store-path? modules))
                                         (list modules)
                                         '())
                                   ,@(lowered-gexp-sources lowered)

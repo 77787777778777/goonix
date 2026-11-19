@@ -13,7 +13,10 @@
 #     removed lines do not exceed what is recorded there, so that a hook
 #     cannot grow without the list changing in the same commit;
 #   - it adds no more than LIMIT lines: beyond that it is logic, which
-#     belongs in a file of ours.
+#     belongs in a file of ours;
+#   - no group removes more than REMOVE_LIMIT upstream lines: upstream's
+#     code stays where upstream has it.  Moved into a file of ours, or
+#     written again there, it no longer merges with upstream's changes.
 #
 # Files that upstream does not have are ours and are not checked.
 #
@@ -23,6 +26,7 @@
 set -euo pipefail
 
 LIMIT=50
+REMOVE_LIMIT=8
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -51,16 +55,18 @@ fail() {
     failures=1
 }
 
-# Print "ADDED REMOVED UNMARKED REMOVALS" for FILE: its added and removed
-# lines, the number of groups of added lines without the mark, and the
-# number of groups that only remove lines.
+# Print "ADDED REMOVED UNMARKED REMOVALS MOVED" for FILE: its added and
+# removed lines, the number of groups of added lines without the mark, the
+# number of groups that only remove lines, and the number of groups that
+# remove more than REMOVE_LIMIT lines.
 measure() {
     git diff --no-ext-diff --no-renames --unified=0 "$base" -- "$1" |
-        awk '
+        awk -v remove_limit="$REMOVE_LIMIT" '
           function close_hunk() {
               if (inhunk) {
                   if (plus > 0 && !marked) unmarked++
                   if (plus == 0 && minus > 0) removals++
+                  if (minus > remove_limit) moved++
               }
               plus = 0; minus = 0; marked = 0
           }
@@ -69,7 +75,8 @@ measure() {
           /^\+/ { plus++; added++; if ($0 ~ /goonix:/) marked = 1; next }
           /^-/ { minus++; removed++; next }
           END { close_hunk()
-                printf "%d %d %d %d\n", added, removed, unmarked, removals }'
+                printf "%d %d %d %d %d\n", added, removed, unmarked,
+                       removals, moved }'
 }
 
 recorded() {
@@ -90,7 +97,7 @@ while IFS=$'\t' read -r status file; do
             continue ;;
     esac
 
-    read -r added removed unmarked removals < <(measure "$file")
+    read -r added removed unmarked removals moved < <(measure "$file")
     rows+=("$file $added $removed")
     [[ "$mode" == check ]] || continue
 
@@ -99,6 +106,9 @@ while IFS=$'\t' read -r status file; do
     fi
     if ((removals > 0)); then
         fail "$file: $removals group(s) only remove upstream lines"
+    fi
+    if ((moved > 0)); then
+        fail "$file: $moved group(s) remove more than $REMOVE_LIMIT upstream lines: restore them and call into a file of ours"
     fi
     if ((added > LIMIT)); then
         fail "$file: adds $added lines, more than $LIMIT: move the logic into a file of ours"
