@@ -151,6 +151,7 @@ public:
         const string & output);
     std::vector<BuildRecord> queryGoonixRecordsByPath(const Path & path);
     std::vector<BuildRecord> queryGoonixRecordsByResolved(const Path & resolved);
+    std::vector<BuildRecord> queryGoonixBuildGraph(const Path & unresolved);
     std::vector<RecordConflict> queryGoonixConflicts(const string & hash,
         const string & output);
     PathSet goonixDerivationsForPath(const Path & path);

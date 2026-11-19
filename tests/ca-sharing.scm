@@ -185,6 +185,25 @@
            (string=? out (realised drv))
            (member out paths)))))
 
+(test-assert "the graph query returns dependency and dependent records"
+  (let* ((input (ca-drv "graph-input" (write-output "input")))
+         (dependent #f))
+    (build-derivations store (list input))
+    (set! dependent
+          (ca-drv "graph-dependent"
+                  (string-append
+                   "(call-with-output-file (getenv \"out\") "
+                   "(lambda (p) (display (getenv \"input\") p)))")
+                  #:inputs (list input)
+                  #:env-vars `(("input" . ,(realised input)))))
+    (build-derivations store (list dependent))
+    (let* ((records ((@ (guix ca records) build-graph-records)
+                     store (derivation-file-name dependent)))
+           (paths (map (lambda (record) (list-ref record 3)) records)))
+      (and (= 2 (length records))
+           (member (realised input) paths)
+           (member (realised dependent) paths)))))
+
 (test-assert "the two-glibc scenario ends in one coherent closure"
   (let* ((g1 (ca-drv "glibc" (write-output "GLIBC")))
          (g2 (ca-drv "glibc" (write-output "GLIBC")

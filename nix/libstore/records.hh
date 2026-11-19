@@ -30,6 +30,8 @@ struct RecordConflict {
 
 /* Domain-separated, length-prefixed bytes of every signed record field. */
 string canonicalBuildRecordPayload(const BuildRecord & record);
+Strings goonixRecordFields(const std::vector<BuildRecord> & records,
+    bool includeHash = false);
 
 typedef std::map<std::pair<Path, string>, Path> OutputChoices;
 

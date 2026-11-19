@@ -800,16 +800,18 @@ static void performOp(bool trusted, unsigned int clientVersion,
         /* One list of strings, six per record: a type that the client's
            (guix serialization) has, so that the module stays upstream's.
            Its text is part of the derivations of most packages.  */
-        Strings fields;
-        for (auto & record : records) {
-            fields.push_back(record.resolvedDerivation);
-            fields.push_back(record.output);
-            fields.push_back(record.path);
-            fields.push_back(record.origin);
-            fields.push_back(record.relocationChecked ? "1" : "0");
-            fields.push_back(record.signature);
-        }
-        writeStrings(fields, to);
+        writeStrings(goonixRecordFields(records), to); // goonix: record fields
+        break;
+    }
+
+    case wopQueryBuildGraph: {
+        // goonix: read-only graph facts; clients cannot register mappings.
+        Path drv = readStorePathStrict(from);
+        startWork();
+        auto records = dynamic_cast<LocalStore *>(store.get())
+            ->queryGoonixBuildGraph(drv);
+        stopWork();
+        writeStrings(goonixRecordFields(records, true), to); // goonix: graph fields
         break;
     }
 

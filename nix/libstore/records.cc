@@ -205,6 +205,22 @@ std::vector<RecordConflict> BuildRecords::conflicts(const string & resolvedHash,
     return result;
 }
 
+Strings goonixRecordFields(const std::vector<BuildRecord> & records,
+    bool includeHash)
+{
+    Strings fields;
+    for (auto & record : records) {
+        if (includeHash) fields.push_back(record.resolvedHash);
+        fields.push_back(record.resolvedDerivation);
+        fields.push_back(record.output);
+        fields.push_back(record.path);
+        fields.push_back(record.origin);
+        fields.push_back(record.relocationChecked ? "1" : "0");
+        fields.push_back(record.signature);
+    }
+    return fields;
+}
+
 void BuildRecords::choose(const Path & unresolved, const string & output,
     const Path & realised)
 {

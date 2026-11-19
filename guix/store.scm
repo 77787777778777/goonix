@@ -175,6 +175,7 @@
             ;; goonix: resolved-output and signed-record queries.
             query-realised-output/direct
             query-build-records
+            query-build-graph
             live-paths
             dead-paths
             collect-garbage
@@ -709,6 +710,7 @@ definitions."
   ;; goonix: resolved-output and signed-record queries.
   query-realised-output/direct
   query-build-records
+  query-build-graph
   optimize-store
   (verify-store => verify-store/direct)
   (collect-garbage => run-gc/direct)

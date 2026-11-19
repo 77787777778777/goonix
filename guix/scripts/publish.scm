@@ -52,6 +52,8 @@
   #:use-module (gcrypt pk-crypto)
   #:use-module (guix workers)
   #:use-module (guix store)
+  #:autoload (guix ca records)
+             (build-graph-records build-records->expression) ;goonix: record transport
   #:use-module ((guix serialization) #:select (write-file))
   #:use-module (zlib)
   #:autoload   (lzlib) (call-with-lzip-output-port
@@ -774,6 +776,20 @@ has the given HASH of type ALGO."
             (not-found request)))
       (not-found request)))
 
+(define (render-goonix-records store request name) ;goonix: signed graph renderer
+  "Render the signed build-record graph for the derivation named NAME."
+  (let ((derivation (string-append (%store-prefix) "/" name)))
+    (if (and (string-suffix? ".drv" name)
+             (valid-path? store derivation))
+        (values '((content-type . (text/plain (charset . "UTF-8"))))
+                (call-with-output-string
+                  (lambda (port)
+                    (write (build-records->expression
+                            (build-graph-records store derivation))
+                           port)
+                    (newline port))))
+        (not-found request))))
+
 (define (render-log-file store request name)
   "Render the log file for NAME, the base name of a store item.  Don't attempt
 to compress or decompress the log file; just return it as-is."
@@ -1131,6 +1147,10 @@ headers."
              (let ((hash (nix-base32-string->bytevector hash)))
                (render-content-addressed-file store request
                                               name 'sha256 hash))))
+
+          ;; /goonix/records/DERIVATION
+          (("goonix" "records" name)
+           (render-goonix-records store request name)) ;goonix: signed graph facts
 
           ;; /log/OUTPUT
           (("log" name)

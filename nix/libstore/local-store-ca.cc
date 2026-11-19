@@ -75,6 +75,34 @@ std::vector<BuildRecord> LocalStore::queryGoonixBuildRecords(
     return goonixRecords->query(hash, output);
 }
 
+std::vector<BuildRecord> LocalStore::queryGoonixBuildGraph(const Path & unresolved)
+{
+    /* A query is read-only.  Resolve against choices already made, walk the
+       resolved build graph bottom-up, and return permanent signed facts. */
+    std::vector<BuildRecord> result;
+    PathSet visited;
+    std::function<void(const Path &, const Derivation &)> visit =
+        [&](const Path & originalPath, const Derivation & original) {
+            if (!visited.insert(originalPath).second) return;
+            for (auto & input : original.inputDrvs)
+                visit(input.first, readDerivation(input.first));
+            if (!goonixAddressed(original)) return;
+            /* Content/resolved outputs have choices rather than final names in
+               the original derivation.  Follow the resolved derivation edge. */
+            for (auto & output : original.outputs) {
+                Path chosen = chosenOutput(originalPath, output.first);
+                if (chosen.empty()) continue;
+                auto info = queryPathInfo(chosen);
+                if (isValidPath(info.deriver)) {
+                    auto records = queryGoonixRecordsByResolved(info.deriver);
+                    result.insert(result.end(), records.begin(), records.end());
+                }
+            }
+        };
+    visit(unresolved, readDerivation(unresolved));
+    return result;
+}
+
 std::vector<BuildRecord> LocalStore::queryGoonixRecordsByPath(const Path & path)
 {
     return goonixRecords->queryByPath(path);

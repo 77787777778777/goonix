@@ -315,6 +315,13 @@ Return #t on success."
     "Return the signed records of a resolved derivation output as one list
 of strings, six per record; see 'build-records' in (guix ca)."
     id: 83
+    returns: string-list)
+
+  (define (query-build-graph (store-path derivation))
+    "Return the signed records of DERIVATION's whole build graph, seven
+strings per record: resolved hash, resolved derivation, output, path, origin,
+relocation flag and signature.  That is seven fields."
+    id: 84
     returns: string-list))
 
 (define-syntax remote-procedure-id
