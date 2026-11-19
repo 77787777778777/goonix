@@ -110,12 +110,16 @@
     (for-each
      (lambda (packages)
        (let ((connection (open-connection-for-tests)))
-         (parameterize ((%package-addressing-policy 'mixed)
-                        (%upstream-package? marked?))
-           (for-each (lambda (package) (package-derivation connection package))
-                     packages))
-         (close-connection connection))
-       (test-assert "mixed shared-origin lowering completes in either order" #t))
+         (let ((derivations
+                (parameterize ((%package-addressing-policy 'mixed)
+                               (%upstream-package? marked?))
+                  (map (lambda (package) (package-derivation connection package))
+                       packages))))
+           (close-connection connection)
+           (test-equal "shared-origin upstream derivation is byte-identical in either order"
+             (bytes (package-derivation store snippet))
+             (bytes (if (eq? snippet (car packages))
+                        (car derivations) (cadr derivations)))))))
      (list (list snippet inherited) (list inherited snippet)))
     (let* ((upstream-reference (derivation-closure (package-derivation store snippet)))
            (upstream-mixed
@@ -134,18 +138,18 @@
         (closure-alist (dependency-closure (package-derivation store inherited)))
         (closure-alist (dependency-closure local-drv))))))
 
-(test-group "the addressing cache includes the current mode on every call"
-  (let ((input (parameterize ((%package-addressing-policy 'input)
-                              (%upstream-package? (upstream-package-set (set))))
-                 (package-derivation store inherited-hello)))
-        (content (parameterize ((%package-addressing-policy 'content)
-                                (%upstream-package? (upstream-package-set (set))))
-                   (package-derivation store inherited-hello))))
-    (test-assert "the same package lowered under input then content differs"
-      (and (not (addressing input))
-           (string=? "content" (addressing content))
-           (not (string=? (derivation-file-name input)
-                          (derivation-file-name content)))))))
+(define* (lower-gexp store name exp #:rest options)
+  (parameterize ((%package-addressing-policy 'mixed))
+    (let ((guile (package-derivation store %bootstrap-guile)))
+      (run-with-store store
+        (apply gexp->derivation name exp #:guile-for-build guile options)))))
+
+(define (fresh-lower . options)
+  (let ((connection (open-connection-for-tests)))
+    (let ((result (apply lower-gexp connection "ca-policy-graph"
+                         #~(mkdir #$output) options)))
+      (close-connection connection)
+      result)))
 
 (define* (trivial name builder #:optional (inputs '()) (properties '()))
   (package
@@ -198,6 +202,44 @@
            #~(call-with-output-file #$output
                (lambda (port) (display #$a port)))
            `(("a" ,a))))
+
+(test-group "reference graphs are classified from their actual values"
+  (test-assert "an upstream package graph stays input-addressed"
+    (not (addressing (fresh-lower #:references-graphs
+                                  `(("graph" ,%bootstrap-guile))))))
+  (let ((connection (open-connection-for-tests)))
+    (let ((item (add-text-to-store connection "ca-policy-store-item" "x")))
+      (test-assert "a store-item graph stays input-addressed"
+        (not (addressing (fresh-lower #:references-graphs
+                                      `(("graph" ,item))))))
+      (close-connection connection)))
+  (test-equal "a content-addressed package graph promotes its derivation"
+    "content" (addressing (fresh-lower #:references-graphs `(("graph" ,a))))))
+
+(test-group "reference lists and explicit requests are promoted by content inputs"
+  (test-equal "disallowed content-addressed reference promotes"
+    "content" (addressing (fresh-lower #:disallowed-references (list a))))
+  (test-equal "allowed content-addressed reference promotes"
+    "content" (addressing (fresh-lower #:allowed-references (list a))))
+  (let ((connection (open-connection-for-tests)))
+    (let ((actual (lower-gexp connection "ca-policy-explicit"
+                              #~(symlink #$a #$output) #:addressing 'input)))
+      (close-connection connection)
+      (test-equal "an explicit input request cannot hide a content input"
+        "content" (addressing actual)))))
+
+(test-group "the addressing cache includes the current mode on every call"
+  (let ((input (parameterize ((%package-addressing-policy 'input)
+                              (%upstream-package? (upstream-package-set (set))))
+                 (package-derivation store inherited-hello)))
+        (content (parameterize ((%package-addressing-policy 'content)
+                                (%upstream-package? (upstream-package-set (set))))
+                   (package-derivation store inherited-hello))))
+    (test-assert "the same package lowered under input then content differs"
+      (and (not (addressing input))
+           (string=? "content" (addressing content))
+           (not (string=? (derivation-file-name input)
+                          (derivation-file-name content)))))))
 
 (define opaque-a
   (trivial "ca-policy-opaque-a"

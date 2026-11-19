@@ -49,17 +49,21 @@
 (define %upstream-source-file?
   (let ((cache (make-hash-table)))
     (lambda (file)
-      (or (hash-ref cache file)
-          (let* ((absolute (if (absolute-file-name? file)
-                               file
-                               (string-append %guix-source-tree "/" file)))
-                 (gnu (string-append %guix-source-tree "/gnu/"))
-                 (guix (string-append %guix-source-tree "/guix/"))
-                 (result (and (or (string-prefix? gnu absolute)
-                                  (string-prefix? guix absolute))
-                              (file-exists? absolute))))
-            (hash-set! cache file result)
-            result)))))
+      (let ((handle (hash-get-handle cache file)))
+        (if handle
+            (cdr handle)
+            (let* ((absolute
+                    (if (absolute-file-name? file)
+                        file
+                        (string-append %guix-source-tree "/" file)))
+                   (gnu (string-append %guix-source-tree "/gnu/"))
+                   (guix (string-append %guix-source-tree "/guix/"))
+                   (result
+                    (and (or (string-prefix? gnu absolute)
+                             (string-prefix? guix absolute))
+                         (file-exists? absolute))))
+              (hash-set! cache file result)
+              result))))))
 
 (define (upstream-package? package)
   "Whether PACKAGE was defined in the running Guix's guix/ or gnu/ tree."
@@ -137,7 +141,11 @@
            (every (match-lambda
                     ((_ . inputs)
                      (every input-addressed-derivation?
-                            (filter derivation-input? inputs))))
+                            (filter derivation-input?
+                                    (if (or (derivation-input? inputs)
+                                            (string? inputs))
+                                        (list inputs)
+                                        inputs)))))
                   graphs))))
 
 (define (references-input-addressed? references)
