@@ -71,7 +71,7 @@ url {
   (mkdtemp! "/tmp/opam-repo.XXXXXX"))
 
 (test-begin "opam")
-;; Remove the temporary repository when the group ends, on failure as well.
+;; goonix: remove the temporary repository when the group ends, on failure as well.
 (test-runner-on-group-end!
  (test-runner-current)
  (lambda (runner) (delete-file-recursively test-repo)))

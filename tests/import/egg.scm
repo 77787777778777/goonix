@@ -56,7 +56,7 @@
 (define test-egg-2-file "/tmp/guix-egg-2")
 
 (test-begin "egg")
-;; Remove the temporary egg files when the group ends, on failure as well.
+;; goonix: remove the temporary egg files when the group ends, on failure as well.
 (test-runner-on-group-end!
  (test-runner-current)
  (lambda (runner)
