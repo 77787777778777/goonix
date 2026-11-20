@@ -13,6 +13,9 @@
              (srfi srfi-64))
 
 (define root (mkdtemp! "/tmp/goonix-vault-unit.XXXXXX"))
+;; Remove the temporary directory when the test process exits, including when
+;; a test raises rather than reaching the end of the file.
+(add-hook! exit-hook (lambda _ (delete-file-recursively root)))
 (define vault-path (string-append root "/vault"))
 (define (read-text file) (call-with-input-file file get-string-all))
 (define id (generate-x25519-identity))
@@ -145,4 +148,3 @@
     (and (not (false-if-exception (show-secret vault-path new-vault 'value id)))
          (equal? "edited" (utf8->string (show-secret vault-path new-vault 'value new-id))))))
 (test-end)
-(delete-file-recursively root)

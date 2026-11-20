@@ -69,6 +69,8 @@ url {
 
 (define test-repo
   (mkdtemp! "/tmp/opam-repo.XXXXXX"))
+;; Remove the repository when the test process exits, on failure as well.
+(add-hook! exit-hook (lambda _ (delete-file-recursively test-repo)))
 
 (test-begin "opam")
 

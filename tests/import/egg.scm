@@ -54,6 +54,11 @@
 
 (define test-egg-1-file "/tmp/guix-egg-1")
 (define test-egg-2-file "/tmp/guix-egg-2")
+;; Remove the temporary egg files when the test process exits, on failure too.
+(add-hook! exit-hook
+           (lambda _
+             (for-each (lambda (file) (false-if-exception (delete-file file)))
+                       (list test-egg-1-file test-egg-2-file))))
 
 (test-begin "egg")
 

@@ -32,7 +32,7 @@
                           formatted-message?
                           formatted-message-string
                           formatted-message-arguments))
-  #:use-module ((guix build utils) #:select (which))
+  #:use-module ((guix build utils) #:select (which delete-file-recursively))
   #:use-module (git)
   #:use-module (guix git)
   #:use-module (guix git-authenticate)
@@ -59,11 +59,19 @@
 
 (test-begin "channels")
 
+;; Every checkout 'make-instance' creates is removed when the test process
+;; exits, including when a test raises rather than reaching the end.
+(define %instance-directories '())
+(add-hook! exit-hook
+           (lambda _
+             (for-each delete-file-recursively %instance-directories)))
+
 (define* (make-instance #:key
                         (name 'fake)
                         (commit "cafebabe")
                         (spec #f))
   (define instance-dir (mkdtemp! "/tmp/checkout.XXXXXX"))
+  (set! %instance-directories (cons instance-dir %instance-directories))
   (when spec
     (call-with-output-file (string-append instance-dir "/.guix-channel")
       (lambda (port) (write spec port))))
