@@ -33,7 +33,7 @@ import Goonix.Store.Settings
 import Goonix.Store.Socket
 import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitutePath)
 import Goonix.Store.Archive (exportPath, importPathsFrom)
-import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, ensureStorePath)
+import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
 import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
 import Goonix.Store.Base32 (decodeBase32)
 import Goonix.Store.Wire
@@ -132,6 +132,9 @@ handleClient config counter client = do
   where
     report exception = hPutStrLn stderr ("guix-daemon: " ++ show (exception :: SomeException))
 
+reportOperation :: String -> SomeException -> IO ()
+reportOperation where' exception = hPutStrLn stderr ("guix-daemon operation " ++ where' ++ ": " ++ show exception)
+
 temporaryRootsPath :: ServerConfig -> ByteString
 temporaryRootsPath config = case configStateDirectory config of
   Just state -> state <> "/temproots"
@@ -166,6 +169,7 @@ handleConnection config store client settingsRef rootFd rootPath = do
           result <- try (dispatch config store client settingsRef rootFd rootPath clientVersion operation)
           case result of
             Left exception -> do
+              reportOperation (show operation) exception
               case fromException exception of
                 Just Collector.GCLimitReached -> throwIO exception
                 Nothing -> pure ()
@@ -202,7 +206,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     mode <- if clientVersion .&. 0xff >= 15 then readIntSocket client else pure 0
     settings <- readIORef settingsRef
     when (mode == 1 && not (trusted settings)) (throwIO (storeError "repairing is a privileged operation"))
-    buildThingsWithConfig config rootFd store settings (buildTrace settings client) things (if mode == 1 then Repair else if mode == 2 then Check else Normal)
+    buildThingsWithCancel config rootFd store settings (buildTrace settings client) things (if mode == 1 then Repair else if mode == 2 then Check else Normal) (waitForDisconnect client)
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   10 -> do

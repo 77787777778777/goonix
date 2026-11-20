@@ -11,9 +11,9 @@ assert :: String -> Bool -> IO ()
 assert name condition = unless condition (error ("scheduler property failed: " ++ name))
 
 chain :: Int -> Bool -> State
-chain slots keepGoing = foldl add (initialState slots keepGoing) [1 .. 5 :: Int]
+chain slots keepGoing = foldl add (initialState slots Nothing keepGoing) [1 .. 5 :: Int]
   where
-    add state n = either error id (addJob (label n) (if n == 1 then [] else [label (n - 1)]) state)
+    add state n = either error id (addJob (label n) BuildJob (if n == 1 then [] else [label (n - 1)]) state)
     label n = fromIntegral n `seq` (if n == 1 then "one" else if n == 2 then "two" else if n == 3 then "three" else if n == 4 then "four" else "five")
 
 running :: State -> Int
@@ -31,13 +31,42 @@ main = do
       blocked = failed
   assert "failure blocks dependent" (status (jobs blocked Map.! "three") == Blocked)
   assert "failure is reported" (Fail "three" `elem` actions3)
-  let independent = either error id (addJob "independent" [] (initialState 1 True))
+  let independent = either error id (addJob "independent" BuildJob [] (initialState 1 Nothing True))
       (withoutSlots, noStart) = step Tick independent
   assert "job runs" (noStart == [Start "independent"])
   let (failedIndependent, _) = step (FailedEvent "independent") withoutSlots
       (stopped, _) = step Tick (failedIndependent { keepGoing = False })
   assert "failure reaches terminal state" (status (jobs stopped Map.! "independent") == Failed)
   forM_ [0 .. 3] $ \limit -> do
-    let state = initialState limit True
+    let state = initialState limit Nothing True
     assert "nonnegative slots" (running state <= limit)
+  let lazy = either error id (addJob "top" BuildJob [] (initialState 1 Nothing True))
+      (started, starts) = step Tick lazy
+      (waiting, waitActions) = step (NeedsDependencies "top" ["input"]) started
+  assert "lazy job starts" (starts == [Start "top"])
+  assert "waiting releases slot" (running waiting == 0 && null waitActions)
+  assert "dependency blocks continuation" (null (snd (step Tick waiting)))
+  withDependencies <- either (error . ("add lazy dependency: " ++)) pure
+    (addDependencyJobs ["input"] waiting)
+  let (inputRunning, inputStarts) = step Tick withDependencies
+  assert "new dependency starts" (inputStarts == [Start "input"])
+  let (topWaiting, topStarts) = step (Completed "input") inputRunning
+  assert "continuation starts only after dependency" (topStarts == [Start "top"])
+  let downloads = either error id $ do
+        withBuild <- addJob "build" BuildJob [] (initialState 1 Nothing True)
+        addJob "download" DownloadJob [] withBuild
+      (_, defaultStarts) = step Tick downloads
+  assert "default download shares build slot" (length defaultStarts == 1)
+  separate <- either (error . ("add separate jobs: " ++)) pure $ do
+    withBuild <- addJob "build" BuildJob [] (initialState 1 (Just 1) True)
+    addJob "download" DownloadJob [] withBuild
+  let (_, separateStarts) = step Tick separate
+  assert "separate download slot overlaps build" (separateStarts == [Start "build", Start "download"])
+  merged <- either (error . ("merge shared job: " ++)) pure $
+    addJob "build" BuildJob [] (initialState 1 (Just 1) True)
+  let (mergedRunning, _) = step Tick merged
+  mergedAgain <- either (error . ("merge running shared job: " ++)) pure $
+    addJob "build" BuildJob [] mergedRunning
+  let (_, mergedStarts) = step Tick mergedAgain
+  assert "shared job does not start twice" (null mergedStarts)
   putStrLn "scheduler properties: PASS"

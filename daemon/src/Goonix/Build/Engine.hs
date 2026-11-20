@@ -2,22 +2,25 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StrictData #-}
 
--- The unsandboxed build interpreter.  Its process execution is deliberately
--- kept separate from the pure scheduling model in Goonix.Build.Scheduler.
+-- The engine interprets Goonix.Build.Scheduler.  Pure step calls choose all
+-- starts and failures; IO threads only execute jobs and report their events.
 module Goonix.Build.Engine
   ( BuildMode (..)
   , buildThings
   , buildThingsWithTrace
   , buildThingsWithConfig
+  , buildThingsWithCancel
   , ensureStorePath
   , BuildTrace (..)
   ) where
 
 import Control.Concurrent (forkIO, threadDelay, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef)
+import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, orElse, putTMVar, readTMVar, registerDelay, takeTMVar)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (POSIXTime)
-import Control.Exception (SomeException, bracket, bracketOnError, catch, finally, fromException, throwIO, try)
+import Control.Exception (SomeException, bracket, bracketOnError, catch, finally, fromException, mask, onException, throwIO, try)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
 import Control.Monad ((>=>), foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -44,6 +47,7 @@ import qualified System.Posix.Files.ByteString as Files
 import System.Exit (ExitCode (ExitSuccess, ExitFailure))
 import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
@@ -58,6 +62,8 @@ import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
+import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runScheduledWithCancel)
+import Goonix.Build.Scheduler (JobKind (..))
 import Goonix.Build.Offload
 import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
@@ -73,44 +79,69 @@ data BuildTrace = BuildTrace
 
 buildThingsWithTrace :: Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
 buildThingsWithTrace rootFd store settings trace things mode =
-  buildThingsInternal Nothing rootFd store settings trace Nothing things mode
+  buildThingsInternal Nothing rootFd store settings trace Nothing things mode (pure ())
 
 buildThingsWithConfig :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
-buildThingsWithConfig config rootFd store settings trace things mode = do
+buildThingsWithConfig config rootFd store settings trace things mode =
+  buildThingsWithCancel config rootFd store settings trace things mode (pure ())
+
+buildThingsWithCancel :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO () -> IO ()
+buildThingsWithCancel config rootFd store settings trace things mode cancel = do
   program <- if settingBool "build-use-build-hook" True settings then offloadProgram config else pure Nothing
   pool <- forM program $ \path -> do
     hook <- newIORef Nothing
     pure (hook, path)
   bracket (pure pool) (mapM_ (readIORef . fst >=> mapM_ stopHook)) $ \hooks ->
-    buildThingsInternal (Just config) rootFd store settings trace hooks things mode
+    buildThingsInternal (Just config) rootFd store settings trace hooks things mode cancel
+
+downloadJobId :: ByteString -> ByteString
+downloadJobId path = path <> "\0download"
+
+type Dependency = (ByteString, Set.Set ByteString, JobKind)
 
 type HookPool = (IORef (Maybe Hook), ByteString)
 
-buildThingsInternal :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> [ByteString] -> BuildMode -> IO ()
-buildThingsInternal config rootFd store settings trace hook things mode = do
-  failure <- newIORef Nothing
-  forM_ things $ \thing ->
-    catch (buildOne thing) $ \(exception :: SomeException) ->
-      if keepGoing settings
-        then do
-          previous <- readIORef failure
-          when (previous == Nothing) $ writeIORef failure . Just =<< case fromException exception of
-            Just (StoreError message _) -> pure (StoreError message 100)
-            Nothing -> pure (StoreError (C.pack (show exception)) 100)
-        else throwIO exception
-  readIORef failure >>= mapM_ throwIO
-  where
-    buildOne thing
-      | B.isSuffixOf ".drv" thing = buildDerivation config rootFd store settings trace hook mode Set.empty thing
-      | B.isInfixOf "!" thing = do
-          let (drv, selected) = B.break (== 33) thing
-              wanted = case C.split ',' (B.drop 1 selected) of
-                [""] -> Set.empty
-                names -> Set.fromList names
-          buildDerivation config rootFd store settings trace hook mode wanted drv
-      | otherwise = case config of
-          Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace thing)
-          Nothing -> pure ()
+buildThingsInternal config rootFd store settings trace hook things mode cancel = do
+  attemptedDownloads <- newIORef Set.empty
+  let discover path wanted role = case role of
+        DownloadJob -> pure JobSpec
+          { jobId = path, jobWanted = wanted, jobKind = DownloadJob
+          , jobRun = \_ -> do
+              let actualPath = B.take (B.length path - B.length "\0download") path
+              case config of
+                Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace actualPath)
+                Nothing -> pure ()
+              atomicModifyIORef' attemptedDownloads (\seen -> (Set.insert actualPath seen, ()))
+              pure Done }
+        BuildJob -> do
+          phase <- newIORef False
+          pure JobSpec
+            { jobId = path, jobWanted = wanted, jobKind = BuildJob
+            , jobRun = \requested -> do
+                discovered <- readIORef phase
+                if discovered
+                  then do
+                    buildDerivationNow config rootFd store settings trace hook mode requested path
+                    pure Done
+                  else do
+                    writeIORef phase True
+                    buildDerivation attemptedDownloads discover config rootFd store settings trace hook mode requested path }
+  specs <- forM things $ \thing -> do
+    let (path, wanted) = case B.break (== 33) thing of
+          (drv, selected) | not (B.null selected) ->
+            (drv, Set.fromList (filter (not . B.null) (C.split ',' (B.drop 1 selected))))
+          _ -> (thing, Set.empty)
+    if ".drv" `B.isSuffixOf` path
+      then discover path wanted BuildJob
+      else discover (downloadJobId thing) Set.empty DownloadJob
+  let maxJobs = settingInt "build-max-jobs" 1 settings
+      separateDownloads = if settingBool "build-separate-download-slots" False settings
+        then Just (settingInt "build-max-download-jobs" 1 settings)
+        else Nothing
+  when (maxJobs == 0 && separateDownloads == Nothing &&
+      not (settingBool "build-use-build-hook" True settings) && not (null things)) $
+    throwIO (storeError "unable to start any build; either increase `--max-jobs' or enable distributed builds")
+  runScheduledWithCancel maxJobs separateDownloads (keepGoing settings) discover specs cancel
 
 ensureStorePath :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO ()
 ensureStorePath config rootFd store settings trace path = do
@@ -121,8 +152,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
-buildDerivation config rootFd store settings trace hook mode wanted drvPath = do
+buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
+buildDerivation attemptedDownloads discover config rootFd store settings trace hook mode wanted drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -137,28 +168,49 @@ buildDerivation config rootFd store settings trace hook mode wanted drvPath = do
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
   mapM_ (appendTempRoot rootFd . outputPath) (Map.elems (outputs drv))
-  forM_ (Map.toList (inputDrvs drv)) $ \(input, selected) -> buildDerivation config rootFd store settings trace hook Normal selected input
-  forM_ (Set.toList (inputSrcs drv)) $ \input -> do
-    present <- isValidPath store input
-    unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
   let unknown = Set.difference wanted (Map.keysSet (outputs drv))
   unless (Set.null unknown) $
     throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' does not have requested output `" ++ C.unpack (Set.findMin unknown) ++ "'"))
-  let requestedOutputs = if Set.null wanted then outputs drv else Map.restrictKeys (outputs drv) wanted
-      requestedPaths = map outputPath (Map.elems requestedOutputs)
-  ready <- and <$> mapM (isValidPath store) requestedPaths
-  failed <- if mode == Normal && not ready && settingBool "build-cache-failures" False settings
-    then or <$> mapM (hasPathFailed store . outputPath) (Map.elems (outputs drv))
-    else pure False
-  when failed $ do
-    traceFailed trace drvPath "cached"
-    throwIO (storeError ("build of `" ++ C.unpack drvPath ++ "' failed previously (cached)"))
-  substituted <- case config of
-    Just serverConfig | mode /= Check && not ready && settingBool "build-use-substitutes" False settings ->
-      and <$> mapM (trySubstitute serverConfig rootFd store settings trace) requestedPaths
-    _ -> pure False
-  when (mode == Repair || mode == Check || not (ready || substituted)) $
-    buildWithHook rootFd store settings trace hook mode drvPath drv
+  let selectedOutputs = if Set.null wanted then outputs drv else Map.restrictKeys (outputs drv) wanted
+      requestedPaths = map outputPath (Map.elems selectedOutputs)
+  ready <- and <$> mapM (isValidPath store . outputPath) (Map.elems selectedOutputs)
+  -- C++ haveDerivation(): AlreadyValid is terminal in normal mode. Requested
+  -- input outputs can be valid even when another output of that drv is absent.
+  if ready && mode == Normal
+    then pure Done
+    else buildDerivationMissing requestedPaths drvPath drv
+  where
+    buildDerivationMissing requestedPaths drvPath drv = do
+      failed <- if mode == Normal && settingBool "build-cache-failures" False settings
+        then or <$> mapM (hasPathFailed store . outputPath) (Map.elems (outputs drv))
+        else pure False
+      when failed $ do
+        traceFailed trace drvPath "cached"
+        throwIO (storeError ("build of `" ++ C.unpack drvPath ++ "' failed previously (cached)"))
+      deferred <- if settingBool "build-separate-download-slots" False settings && hook == Nothing && mode /= Check
+        then do
+          attempted <- readIORef attemptedDownloads
+          pure [path | path <- requestedPaths, Set.notMember path attempted]
+        else pure []
+      case (deferred, config) of
+        (_:_, Just _) -> pure (Need [(downloadJobId path, Set.empty, DownloadJob) | path <- deferred])
+        _ -> do
+          substituted <- case config of
+            Just serverConfig | mode /= Check && settingBool "build-use-substitutes" False settings ->
+              and <$> mapM (trySubstitute serverConfig rootFd store settings trace) requestedPaths
+            _ -> pure False
+          if mode /= Repair && mode /= Check && substituted
+            then pure Done
+            else pure (Need [(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)])
+
+buildDerivationNow :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
+buildDerivationNow config rootFd store settings trace hook mode wanted drvPath = do
+  bytes <- B.readFile (C.unpack drvPath)
+  drv <- either (throwIO . storeError) pure (parseDerivation bytes)
+  forM_ (Set.toList (inputSrcs drv)) $ \input -> do
+    present <- isValidPath store input
+    unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
+  buildWithHook rootFd store settings trace hook mode drvPath drv
 
 buildWithHook :: Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> Derivation -> IO ()
 buildWithHook rootFd store settings trace pool mode drvPath drv = do
@@ -168,9 +220,13 @@ buildWithHook rootFd store settings trace pool mode drvPath drv = do
           runBuilder rootFd store settings trace Check drvPath drv
       withOutputLocks action =
         foldr (\path inner -> withPathLock path inner) action (map outputPath (Map.elems (outputs drv)))
-      tryBuild Nothing = runBuilder rootFd store settings trace mode drvPath drv
+      tryBuild Nothing = withOutputLocks $ do
+        ready <- allOutputsValid store drv
+        if ready && mode == Normal then pure () else localBuild
       tryBuild (Just currentPool)
-        | mode /= Normal || willBuildLocally settings drv = localBuild
+        | mode /= Normal || willBuildLocally settings drv = withOutputLocks $ do
+            ready <- allOutputsValid store drv
+            if ready && mode == Normal then pure () else localBuild
         | otherwise = withOutputLocks $ do
             outcome <- bracketOnError (acquireHook settings currentPool)
               (\hook -> writeIORef (fst currentPool) Nothing >> stopHook hook) $ \hook ->
@@ -343,7 +399,7 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   mapM_ (appendTempRoot rootFd) outPaths
   inputRoots <- derivationInputs store Set.empty drv
   mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
-  mapM_ deleteTree redirected
+  withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
   work <- makeBuildDirectory store
   prepareReferenceGraphs store work drv
   env <- builderEnvironment store settings work actualDrv
@@ -357,24 +413,29 @@ runBuilder rootFd store settings trace mode drvPath drv = do
   let command = if "builtin:" `B.isPrefixOf` builder drv
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (childPid, wait, sandboxRoot, sandboxOutputs) <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
-    then spawnSandboxedBuilder settings store work drvPath actualDrv command env writeFd
-    else do
-      -- As in builtins.cc, the downloader inherits the daemon's environment.
-      inherited <- if isBuiltin then getEnvironment else pure []
-      let childEnvironment = if isBuiltin then inherited else env
-      (_, _, _, process) <- createProcess command
-        { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
-      pid <- maybe 0 fromIntegral <$> getPid process
-      pure (pid, waitForProcess process, Nothing, [])
+  (childPid, wait, sandboxRoot, sandboxOutputs) <- mask $ \restore -> do
+    spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
+      then spawnSandboxedBuilder settings store work drvPath actualDrv command env writeFd
+      else do
+        -- As in builtins.cc, the downloader inherits the daemon's environment.
+        inherited <- if isBuiltin then getEnvironment else pure []
+        let childEnvironment = if isBuiltin then inherited else env
+        (_, _, _, process) <- createProcess command
+          { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
+        pid <- maybe 0 fromIntegral <$> getPid process
+        pure (pid, waitForProcess process, Nothing, [])
+    let (pid, _, _, _) = spawned
+    -- The child exists before this handler is installed only while masked.
+    -- Cancellation after this point cannot orphan it in the fork/wait gap.
+    restore (pure spawned) `onException` killBuilder pid
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
   lastOutput <- getPOSIXTime >>= newIORef
   drained <- newEmptyMVar
   _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace lastOutput `finally` putMVar drained ()
-  (status, timeoutReason) <- withWritableStore (storeDirectory store) $
-    waitForBuilder settings childPid wait lastOutput
-  takeMVar drained
+  (status, timeoutReason) <- waitForBuilder settings childPid wait lastOutput
+    `onException` killBuilder childPid
+  takeMVar drained `onException` hClose readHandle
   hClose readHandle
   closeLog logHandle
   case status of
@@ -570,6 +631,10 @@ fixedOutputNetwork settings drv
       pure (any (\line -> case C.words line of
         (_:_:_:scope:_) -> scope == "00" || scope == "40"
         _ -> False) (C.lines contents))
+
+killBuilder :: Int -> IO ()
+killBuilder pid = signalProcessGroup sigKILL (fromIntegral pid) `catch` \exception ->
+  if isDoesNotExistError exception then pure () else throwIO exception
 
 waitForBuilder :: Settings -> Int -> IO ExitCode -> IORef POSIXTime -> IO (ExitCode, Maybe String)
 waitForBuilder settings pid wait lastOutput = do
@@ -771,15 +836,6 @@ verifyFixedOutput output path = do
       | character >= 'a' && character <= 'z' = toEnum (fromEnum character - 32)
       | otherwise = character
 
-withWritableStore :: RawFilePath -> IO a -> IO a
-withWritableStore store = bracket prepare restore . const
-  where
-    prepare = do
-      status <- Files.getSymbolicLinkStatus store
-      Files.setFileMode store (Files.fileMode status .|. 0o700)
-      pure (Files.fileMode status)
-    restore = Files.setFileMode store
-
 prepareReferenceGraphs :: Store -> RawFilePath -> Derivation -> IO ()
 prepareReferenceGraphs store work drv =
   case Map.lookup "exportReferencesGraph" (environment drv) of
@@ -845,10 +901,15 @@ makeBuildDirectory store = do
   mkdirParents parent
   pid <- getProcessID
   stamp <- getPOSIXTime
-  let path = parent <> "/goonix-build-" <> C.pack (show pid) <> "-" <> C.pack (show (floor stamp :: Integer))
+  serial <- atomicModifyIORef' buildDirectoryCounter (\n -> (n + 1, n))
+  let path = parent <> "/goonix-build-" <> C.pack (show pid) <> "-" <> C.pack (show (floor stamp :: Integer)) <> "-" <> C.pack (show serial)
   deleteTree path
   Dir.createDirectory path 0o700
   pure path
+
+{-# NOINLINE buildDirectoryCounter #-}
+buildDirectoryCounter :: IORef Word
+buildDirectoryCounter = unsafePerformIO (newIORef 0)
 
 removeBuildDirectory :: RawFilePath -> IO ()
 removeBuildDirectory path = deleteTree path
