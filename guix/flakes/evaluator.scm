@@ -24,7 +24,8 @@
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (run-flake-evaluator
-            command-object))
+            command-object
+            record-object?))
 
 ;;; Commentary:
 ;;;
@@ -88,15 +89,17 @@ Record predicates are macros: evaluate their name in the defining module."
                (eval variable (resolve-module module))
                value)))))
 
+(define (record-object? object module predicate)
+  "Whether OBJECT satisfies PREDICATE, a record predicate exported by MODULE.
+Resolve the predicate in its own module, where its macro expands to a procedure."
+  (and (resolve-module module #f #:ensure #f)
+       (and=> (optional-binding module predicate)
+              (lambda (procedure) (procedure object)))))
+
 (define (lower store object name system target)
   "Return the derivation of OBJECT, the output NAME of a flake."
-  (define (optional module variable)
-    (optional-binding module variable))
-
   (define (is? module predicate)
-    (and (resolve-module module #f #:ensure #f)
-         (and=> (optional module predicate)
-                (lambda (predicate) (predicate object)))))
+    (record-object? object module predicate))
 
   (run-with-store store
     (cond ((derivation? object)

@@ -840,24 +840,26 @@ to be built, while a stand-in takes the place of each."
             ;; By default the input follows the flake's Guix.
             (equal? (list new new) (commits (root "shared")))))))
 
-(define (record-predicate-works? module constructor predicate)
-  ;; The record predicates are macros in Guile. The evaluator must evaluate
-  ;; their names in their modules, not depend on SRFI-9's generated names.
-  (let ((object (if (eq? constructor 'hurd64-barebones-os)
-                    (module-ref (resolve-module '(gnu system images hurd))
-                                constructor)
-                    (eval (list constructor) (resolve-module module)))))
-        (procedure (@@ (guix flakes evaluator) optional-binding)
-                    module predicate)))
-    (and (procedure? procedure) (procedure object))))
+(define (record-predicate-works? object module predicate)
+  ;; Exercise the public dispatch predicate, through the compiled evaluator.
+  ;; These are record lookups, not lowering tests: no image is built.
+  ((@ (guix flakes evaluator) record-object?) object module predicate))
 
 (test-assert "the operating-system predicate is resolved from its module"
-  (record-predicate-works? '(gnu system) 'hurd64-barebones-os 'operating-system?))
+  (record-predicate-works?
+   (module-ref (resolve-module '(gnu system images hurd))
+               'hurd64-barebones-os)
+   '(gnu system) 'operating-system?))
 
 (test-assert "the image predicate is resolved from its module"
-  (record-predicate-works? '(gnu image) 'image 'image?))
+  (record-predicate-works?
+   (module-ref (resolve-module '(gnu system images hurd))
+               'hurd64-barebones-qcow2-image)
+   '(gnu image) 'image?))
 
 (test-assert "the home-environment predicate is resolved from its module"
-  (record-predicate-works? '(gnu home) 'home-environment 'home-environment?))
+  (record-predicate-works?
+   (eval '(home-environment) (resolve-module '(gnu home)))
+   '(gnu home) 'home-environment?))
 
 (test-end "flake-eval")
