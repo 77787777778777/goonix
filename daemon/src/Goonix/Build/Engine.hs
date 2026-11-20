@@ -19,7 +19,7 @@ import Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, withMV
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, orElse, putTMVar, readTMVar, registerDelay, takeTMVar)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (POSIXTime)
-import Control.Exception (SomeException, bracket, bracketOnError, catch, finally, fromException, mask, onException, throwIO, try)
+import Control.Exception (IOException, SomeException, bracket, bracketOnError, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
 import Control.Monad ((>=>), foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
@@ -49,13 +49,14 @@ import System.Exit (ExitCode (ExitSuccess, ExitFailure))
 import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Posix.Files (fileOwner, fileGroup)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle)
-import System.Posix.User (getRealGroupID, getRealUserID)
+import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
 import System.FilePath (takeDirectory)
 import System.Directory (findExecutable)
-import System.IO.Error (isDoesNotExistError)
+import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
 import System.Posix.Types (Fd (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
@@ -242,7 +243,7 @@ buildWithHook userPool rootFd store settings trace pool mode drvPath drv = do
                 writeIORef (fst currentPool) Nothing
                 finally
                   (do
-                    inputRoots <- Set.toList <$> foldM (derivationInputs store) Set.empty [drv]
+                    inputRoots <- Set.toList <$> derivationInputs store drvPath Set.empty drv
                     inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
                     let outputPaths = map outputPath (Map.elems (outputs drv))
                     logPath <- buildLogPath settings store drvPath
@@ -327,20 +328,20 @@ offloadFailed settings store trace drvPath drv status = do
     mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
   throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " failed: " ++ failure)) statusCode)
 
-derivationInputs :: Store -> Set.Set ByteString -> Derivation -> IO (Set.Set ByteString)
-derivationInputs store seen current = do
+derivationInputs :: Store -> ByteString -> Set.Set ByteString -> Derivation -> IO (Set.Set ByteString)
+derivationInputs store drvPath seen current = do
   let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
         (if "builtin:" `B.isPrefixOf` builder current
           then inputSrcs current
           else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
-  dependencies <- mapM (\(path, selected) -> (,) selected <$> readStoreDerivation path)
+  dependencies <- mapM (\(path, selected) -> (\drv -> (path, selected, drv)) <$> readStoreDerivation path)
     (filter (\(path, _) -> Set.notMember path seen) (Map.toList (inputDrvs current)))
   let dependencyOutputs = Set.fromList
         [ outputPath output
-        | (selected, dependency) <- dependencies
+        | (path, selected, dependency) <- dependencies
         , output <- Map.elems (if Set.null selected then outputs dependency else Map.restrictKeys (outputs dependency) selected)
         ]
-  foldM (derivationInputs store) (Set.union seen (Set.union direct dependencyOutputs)) (map snd dependencies)
+  foldM (\seen' (path, _selected, drv) -> derivationInputs store path seen' drv) (Set.insert drvPath (Set.union seen (Set.union direct dependencyOutputs))) dependencies
   where
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
@@ -407,7 +408,7 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
       replacements = zip outPaths redirected
       actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
   mapM_ (appendTempRoot rootFd) outPaths
-  inputRoots <- derivationInputs store Set.empty drv
+  inputRoots <- derivationInputs store drvPath Set.empty drv
   mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
   withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
   work <- makeBuildDirectory store
@@ -425,7 +426,8 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
   let command = if "builtin:" `B.isPrefixOf` builder drv
         then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (childPid, wait, sandboxRoot, sandboxOutputs) <- mask $ \restore -> do
+  (childPid, wait, sandboxRoot, sandboxOutputs) <-
+    try (mask $ \restore -> do
     spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
       then spawnSandboxedBuilder buildUser settings store work drvPath actualDrv command env writeFd
       else do
@@ -439,7 +441,24 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
     let (pid, _, _, _) = spawned
     -- The child exists before this handler is installed only while masked.
     -- Cancellation after this point cannot orphan it in the fork/wait gap.
-    restore (pure spawned) `onException` killBuilder pid
+    restore (pure spawned) `onException` killBuilder pid)
+    >>= \case
+      Left (exception :: IOException) -> do
+        hClose writeHandle
+        hClose readHandle
+        let errorText = if isDoesNotExistError exception then "No such file or directory"
+              else ioeGetErrorString exception
+            message = "while setting up the child process: in phase exec: getting status of `"
+              ++ C.unpack (builder drv) ++ "': " ++ errorText ++ "\n"
+            failure = "build of `" ++ C.unpack drvPath ++ "' failed"
+        writeLog logHandle (C.pack message)
+        closeLog logHandle
+        traceFailed trace drvPath "builder failed"
+        when (mode == Normal && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
+          mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
+        if keepFailed settings then pure () else removeBuildDirectory work
+        throwIO (StoreError (C.pack failure) 100)
+      Right spawned -> pure spawned
   traceStarted trace drvPath (platform drv) logPath childPid
   hClose writeHandle
   lastOutput <- getPOSIXTime >>= newIORef
@@ -529,10 +548,12 @@ copyTree source destination = do
         Dir.createDirectory destination 0o755
         entries <- directoryEntries source
         forM_ entries $ \entry -> copyTree (source <> "/" <> entry) (destination <> "/" <> entry)
+        Files.setOwnerAndGroup destination (fileOwner status) (fileGroup status)
         Files.setFileMode destination (Files.fileMode status)
       else do
         bytes <- B.readFile (C.unpack source)
         B.writeFile (C.unpack destination) bytes
+        Files.setOwnerAndGroup destination (fileOwner status) (fileGroup status)
         Files.setFileMode destination (Files.fileMode status)
 
 spawnSandboxedBuilder :: Maybe BuildUser -> Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
@@ -547,11 +568,14 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
   root <- makeSandboxRoot store
   mkdirParents (root <> "/tmp")
   Files.setFileMode (root <> "/tmp") 0o1777
-  hostUid <- fromIntegral <$> getRealUserID
-  hostGid <- fromIntegral <$> getRealGroupID
+  hostUid <- fromIntegral <$> getEffectiveUserID
+  hostGid <- fromIntegral <$> getEffectiveGroupID
   let (uid, gid) = maybe (hostUid, hostGid) (\user -> (buildUserUid user, buildUserGid user)) buildUser
       (insideUid, insideGid) = maybe (30001, 30000) (\user -> (buildUserUid user, buildUserGid user)) buildUser
-      userNamespaceFlag = maybe sandboxFlagUserNamespace (const 0) buildUser
+      hostIdentities = hostUid == 0 && maybe False (const True) buildUser
+      identityFlag = if hostIdentities then sandboxFlagHostIdentities else 0
+      userNamespaceFlag = if hostIdentities then 0 else sandboxFlagUserNamespace
+      lockMountsFlag = if hostIdentities then 0 else sandboxFlagLockMounts
   network <- fixedOutputNetwork settings drv
   let (networkFlags, slirpProgram, slirpFilter) = case network of
         Nothing -> (0, "", [])
@@ -559,7 +583,7 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
           (sandboxFlagSlirpNetwork .|. (if ipv6 then sandboxFlagIpv6Network else 0) .|.
             (if isolate then sandboxFlagIsolateHostLoopback else 0),
             C.pack program, slirpSeccompFilter nativeArchitecture)
-  inputs <- derivationInputs store Set.empty drv
+  inputs <- derivationInputs store drvPath Set.empty drv
   let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
   let sandboxWork = "/tmp/guix-build-" <> storePathToName (storeDirectory store) drvPath <> "-0"
@@ -575,12 +599,15 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
       mountInputs = [BindMount path path (not (Set.member path writableInputs)) | path <- Set.toList closure]
       mountOutputs = []
       mountWork = [BindMount work sandboxWork False]
+      configured = filter (not . B.null) (C.words (setting "build-chroot-dirs" "" settings <> " " <> setting "build-extra-chroot-dirs" "" settings))
+      extraMounts = map (\path -> let (source, target) = B.break (== 61) path
+                                   in BindMount source (if B.null target then source else B.drop 1 target) False) configured
       devices = [BindMount path path False | path <- ["/dev/null", "/dev/full", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"]]
       plan = SandboxPlan
-        { planFlags = userNamespaceFlag .|. sandboxFlagMountNamespace .|.
+        { planFlags = identityFlag .|. userNamespaceFlag .|. sandboxFlagMountNamespace .|.
           sandboxFlagNetworkNamespace .|. sandboxFlagPidNamespace .|. sandboxFlagIpcNamespace .|.
           sandboxFlagUtsNamespace .|. sandboxFlagChroot .|. sandboxFlagProc .|. sandboxFlagDevpts .|.
-          sandboxFlagLockMounts .|. sandboxFlagSetSid .|. sandboxFlagCloseFds .|.
+          lockMountsFlag .|. sandboxFlagSetSid .|. sandboxFlagCloseFds .|.
           sandboxFlagChdir .|. sandboxFlagStdinFile .|. sandboxFlagClearGroups .|.
           sandboxFlagNoNewPrivs .|. maybe 0 (const sandboxFlagSetIds) buildUser .|. networkFlags
         , planProgram = program, planArguments = arguments, planEnvironment = environment'
@@ -590,7 +617,7 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
         , planUidMapInside = insideUid, planUidMapOutside = uid
         , planGidMapInside = insideGid, planGidMapOutside = gid
         , planRoot = root, planStoreDirectory = storeDirectory store, planHostname = "localhost", planDomainname = "(none)"
-        , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ devices
+        , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ extraMounts ++ devices
         , planSeccomp = []
         , planSlirpProgram = slirpProgram, planSlirpSeccomp = slirpFilter
         }
@@ -695,8 +722,10 @@ makeSandboxRoot store = do
   mkdirParents parent
   pid <- getProcessID
   stamp <- getPOSIXTime
-  let path = parent <> "/goonix-sandbox-" <> C.pack (show pid) <> "-" <> C.pack (show (floor stamp :: Integer))
-  deleteTree path
+  serial <- atomicModifyIORef' buildDirectoryCounter (\n -> (n + 1, n))
+  let path = parent <> "/goonix-sandbox-" <> C.pack (show pid) <> "-" <> C.pack (show (floor stamp :: Integer)) <> "-" <> C.pack (show serial)
+  -- This unique name has never belonged to another builder.  Do not delete a
+  -- directory before recreating it: another thread must never lose its root.
   Dir.createDirectory path 0o755
   pure path
 
