@@ -45,3 +45,6 @@ run_one() {
 mkdir -p "$out"
 run_one cxx-hs-cxx "$cxx" "$hs"
 run_one hs-cxx-hs "$hs" "$cxx"
+# Failed runs retain their stores; successful runs retain only the step logs.
+chmod -R u+rwX "$out/cxx-hs-cxx" "$out/hs-cxx-hs" 2>/dev/null || true
+rm -rf "$out/cxx-hs-cxx" "$out/hs-cxx-hs"

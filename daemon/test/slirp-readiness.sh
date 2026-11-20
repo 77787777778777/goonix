@@ -21,7 +21,17 @@ export GUIX_SANDBOX="$GOONIX_SANDBOX_HELPER"
 export GUIX_SLIRP4NETNS="$root/daemon/test/fail-slirp.sh"
 goonix_start_capped "$root/pre-inst-env" "${GOONIX_HS_DAEMON:-$root/guix-daemon}" --no-substitutes --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
 pid=$GOONIX_TEST_PID scope=$GOONIX_TEST_SCOPE
-trap 'goonix_stop_capped "$pid" "$scope"' EXIT
+cleanup() {
+  status=$?
+  trap - EXIT
+  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope" || status=$?; fi
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$fixture" "$live" 2>/dev/null || true
+    rm -rf "$fixture" "$live"
+  fi
+  return "$status"
+}
+trap cleanup EXIT
 for i in $(seq 1 300); do test -S "$GUIX_DAEMON_SOCKET" && break; kill -0 "$pid"; sleep .01; done
 test -S "$GUIX_DAEMON_SOCKET"
 goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile "$root/daemon/test/seed-restore.scm" >"$fixture/seed.log" 2>&1

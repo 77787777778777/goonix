@@ -20,8 +20,15 @@ export GUIX_SANDBOX=${GOONIX_SANDBOX_HELPER:-$root/guix-sandbox}
 daemon=${GOONIX_HS_DAEMON:-$root/guix-daemon}
 pid= scope= client=
 cleanup() {
+  status=$?
+  trap - EXIT
   if test -n "$client"; then kill "$client" 2>/dev/null || true; wait "$client" 2>/dev/null || true; fi
-  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope"; fi
+  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope" || status=$?; fi
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$fixture" 2>/dev/null || true
+    rm -rf "$fixture"
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 # Only start this probe's synthetic fixed-output build, never a package set.

@@ -6,7 +6,17 @@ out=${1:-$root/.scratch/hs7-temporary-roots}
 cxx=${GOONIX_CXX_DAEMON:-$root/.scratch/hs0-cxx-daemon}
 hs=${GOONIX_HS_DAEMON:-$root/guix-daemon}
 sockets=$(mktemp -d /tmp/goonix-roots-XXXXXX)
-trap 'rm -rf "$sockets"' EXIT
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf "$sockets"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$out" 2>/dev/null || true
+    rm -rf "$out"
+  fi
+  return "$status"
+}
+trap cleanup EXIT
 for daemon in "$cxx" "$hs"; do test -x "$daemon"; done
 
 run_one() {
@@ -20,15 +30,17 @@ run_one() {
   export HS7_COLLECTOR_SOCKET="$sockets/$name-collector"
   local holder_pid collector_pid holder_client holder_scope collector_scope holder_daemon_scope
   holder_pid= collector_pid= holder_client= holder_daemon_scope= collector_scope= holder_scope=
-  local cleanup=run_one_cleanup
   run_one_cleanup() {
+  status=$?
   trap - EXIT
-  if test -n "${holder_client:-}"; then goonix_stop_capped "$holder_client" "${holder_scope:-}"; fi
-  if test -n "${collector_pid:-}"; then goonix_stop_capped "$collector_pid" "${collector_scope:-}"; fi
-  if test -n "${holder_pid:-}"; then goonix_stop_capped "$holder_pid" "${holder_daemon_scope:-}"; fi
+  if test -n "${holder_client:-}"; then goonix_stop_capped "$holder_client" "${holder_scope:-}" || status=$?; fi
+  if test -n "${collector_pid:-}"; then goonix_stop_capped "$collector_pid" "${collector_scope:-}" || status=$?; fi
+  if test -n "${holder_pid:-}"; then goonix_stop_capped "$holder_pid" "${holder_daemon_scope:-}" || status=$?; fi
   holder_client= collector_pid= holder_pid= holder_scope= collector_scope= holder_daemon_scope=
+  trap cleanup EXIT
+  return "$status"
 }
-  trap "$cleanup" EXIT
+  trap run_one_cleanup EXIT
   rm -f "$HS7_HOLDER_SOCKET" "$HS7_COLLECTOR_SOCKET"
   goonix_start_capped "$root/pre-inst-env" "$holder_daemon" --disable-chroot --listen="$HS7_HOLDER_SOCKET" >"$fixture/holder-daemon.log" 2>&1
   holder_pid=$GOONIX_TEST_PID holder_daemon_scope=$GOONIX_TEST_SCOPE
@@ -51,7 +63,7 @@ run_one() {
   kill -0 "$holder_pid" "$holder_client" "$collector_pid"
   test -e "$fixture/root-before"
   cmp "$fixture/root-before" "$fixture/var/temproots"/*
-  "$cleanup"
+  run_one_cleanup
   printf 'HS-7 concurrent temporary roots %s: PASS\n' "$name"
 }
 

@@ -11,9 +11,16 @@ fixture=$(mktemp -d /tmp/goonix-same-roots-XXXXXX)
 socket=$fixture/s
 daemon_pid= daemon_scope= holder_pid= holder_scope=
 cleanup() {
-  if test -n "$holder_pid"; then goonix_stop_capped "$holder_pid" "$holder_scope"; fi
-  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope"; fi
+  status=$?
+  trap - EXIT
+  if test -n "$holder_pid"; then goonix_stop_capped "$holder_pid" "$holder_scope" || status=$?; fi
+  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope" || status=$?; fi
   rm -rf "$fixture"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$out" 2>/dev/null || true
+    rm -rf "$out"
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"

@@ -59,3 +59,6 @@ for suffix in out db files; do
   diff -u "$out/cxx.$suffix.norm" "$out/hs.$suffix.norm"
 done
 printf 'HS-7 collector differential: PASS\n'
+# Successful comparisons keep their normalized logs, not the copied stores.
+chmod -R u+rwX "$out/cxx" "$out/hs" 2>/dev/null || true
+rm -rf "$out/cxx" "$out/hs" "$out/gc-lock-holder"

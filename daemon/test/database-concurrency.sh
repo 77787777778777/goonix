@@ -13,7 +13,17 @@ export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$socket_dir/s"
 export GUIX_LOG_DIRECTORY="$fixture/var/log/guix" GUIX_CONFIGURATION_DIRECTORY="$fixture/etc"
 export GUILE_AUTO_COMPILE=0 GOONIX_TEST_TIMEOUT=${GOONIX_TEST_TIMEOUT:-180}
 pid= scope=
-cleanup() { if test -n "$pid"; then goonix_stop_capped "$pid" "$scope"; fi; rm -rf "$socket_dir"; }
+cleanup() {
+  status=$?
+  trap - EXIT
+  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope" || status=$?; fi
+  rm -rf "$socket_dir"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$fixture" 2>/dev/null || true
+    rm -rf "$fixture"
+  fi
+  return "$status"
+}
 trap cleanup EXIT
 goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --no-substitutes --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
 pid=$GOONIX_TEST_PID scope=$GOONIX_TEST_SCOPE

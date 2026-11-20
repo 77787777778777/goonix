@@ -12,9 +12,13 @@ cleanup() {
   status=$?
   trap - EXIT
   exec 9>&- 2>/dev/null || true
-  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope"; fi
+  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope" || status=$?; fi
   if test "$status" -ne 0; then cp -a "$fixture" "$out/fixture"; fi
   rm -rf "$fixture"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$out" 2>/dev/null || true
+    rm -rf "$out"
+  fi
   return "$status"
 }
 trap cleanup EXIT

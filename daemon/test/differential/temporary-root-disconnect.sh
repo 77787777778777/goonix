@@ -14,10 +14,14 @@ daemon_pid= daemon_scope= keeper_pid= keeper_scope=
 cleanup() {
   status=$?
   trap - EXIT
-  if test -n "$keeper_pid"; then goonix_stop_capped "$keeper_pid" "$keeper_scope"; fi
-  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope"; fi
+  if test -n "$keeper_pid"; then goonix_stop_capped "$keeper_pid" "$keeper_scope" || status=$?; fi
+  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope" || status=$?; fi
   if test "$status" -ne 0; then cp -a "$fixture" "$out/fixture"; fi
   rm -rf "$fixture"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$out" 2>/dev/null || true
+    rm -rf "$out"
+  fi
   return "$status"
 }
 trap cleanup EXIT

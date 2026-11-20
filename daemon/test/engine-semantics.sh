@@ -15,8 +15,15 @@ export GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes
 export XDG_CACHE_HOME="$fixture/cache"
 pid= scope=
 cleanup() {
+  status=$?
+  trap - EXIT
   exec 9>&- 2>/dev/null || true
-  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope"; fi
+  if test -n "$pid"; then goonix_stop_capped "$pid" "$scope" || status=$?; fi
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$fixture" 2>/dev/null || true
+    rm -rf "$fixture"
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 if test -e "$fixture"; then chmod -R u+rwX "$fixture" 2>/dev/null || true; rm -rf "$fixture"; fi

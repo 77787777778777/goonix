@@ -16,14 +16,18 @@ cleanup() {
   status=$?
   trap - EXIT
   test -e "$fixture/release-builder" && : || touch "$fixture/release-builder"
-  if test -n "$collector_pid"; then goonix_stop_capped "$collector_pid" "$collector_scope"; fi
-  if test -n "$builder_pid"; then goonix_stop_capped "$builder_pid" "$builder_scope"; fi
-  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope"; fi
-  exec 9>&-
+  if test -n "$collector_pid"; then goonix_stop_capped "$collector_pid" "$collector_scope" || status=$?; fi
+  if test -n "$builder_pid"; then goonix_stop_capped "$builder_pid" "$builder_scope" || status=$?; fi
+  if test -n "$daemon_pid"; then goonix_stop_capped "$daemon_pid" "$daemon_scope" || status=$?; fi
+  exec 9>&- || status=$?
   if test "$status" -ne 0; then
     cp -a "$fixture" "$out/fixture"
   fi
   rm -rf "$fixture"
+  if test "$status" -eq 0; then
+    chmod -R u+rwX "$out" 2>/dev/null || true
+    rm -rf "$out"
+  fi
   return "$status"
 }
 trap cleanup EXIT
