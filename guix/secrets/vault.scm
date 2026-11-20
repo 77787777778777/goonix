@@ -7,7 +7,7 @@
   #:use-module ((guix flakes syntax) #:select (read-data-port))
   #:use-module ((guix build syscalls)
                 #:select (mkdtemp! tcgetattr tcsetattr tcsetattr-action
-                          termios termios-input-flags termios-output-flags
+                          termios-input-flags termios-output-flags
                           termios-control-flags termios-local-flags
                           termios-line-discipline termios-control-chars
                           termios-input-speed termios-output-speed
@@ -15,6 +15,7 @@
   #:use-module (gcrypt random)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 match)
+  #:use-module (ice-9 format)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 binary-ports)
   #:use-module (ice-9 rdelim)
@@ -182,8 +183,9 @@
            (read-ssh-identity-text text))
       (error "decrypted identity has no supported key")))
 (define (termios-without-echo attributes)
-  "Return ATTRIBUTES with terminal echo disabled."
-  (termios (termios-input-flags attributes)
+  "Return ATTRIBUTES with terminal echo disabled.  Use the private constructor
+rather than changing the syscall module shared with upstream package builds."
+  ((@@ (guix build syscalls) termios) (termios-input-flags attributes)
            (termios-output-flags attributes)
            (termios-control-flags attributes)
            (logand (termios-local-flags attributes)

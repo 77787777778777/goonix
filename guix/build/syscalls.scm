@@ -209,7 +209,6 @@
             termios-output-flags
             termios-control-flags
             termios-local-flags
-            termios ; goonix: construct terminal attributes without echo in the vault.
             termios-line-discipline
             termios-control-chars
             termios-input-speed
