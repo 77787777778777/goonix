@@ -30,7 +30,9 @@
   "Read the secret names and kinds from a data-only vault form."
   (let ((form (read-data-port port "vault.scm")))
     (match form
-      (('vault ('format 1) members ...)
+      (('vault members ...)
+       (unless (equal? '(format 1) (assq 'format members))
+         (error "expected a format 1 vault"))
        (match (assq 'secrets members)
          ((_ . declarations)
           (for-each (lambda (declaration)

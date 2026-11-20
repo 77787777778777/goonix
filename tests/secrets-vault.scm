@@ -1,6 +1,7 @@
 ;;; goonix: vault data and private operations, independent of the CLI.
 (use-modules (guix secrets age)
              (guix secrets vault)
+             ((guix secrets declaration) #:select (read-secret-declarations))
              (guix build syscalls)
              ((guix build utils) #:select (delete-file-recursively))
              (rnrs bytevectors)
@@ -44,6 +45,11 @@
 (setenv "GUIX_SECRETS_TEST_TMPDIR" #f)
 (test-equal "vault reads its declared secret" "unit canary"
   (utf8->string (show-secret vault-path parsed 'value id)))
+(test-equal "declaration reader accepts vault members in any order"
+  '((value . file))
+  (call-with-input-string
+      "(vault (secrets (value (for owner))) (recipients (owner \"age1unused\")) (format 1))"
+    read-secret-declarations))
 (test-error "duplicate vault member is refused" #t
   (call-with-input-string "(vault (format 1) (format 1) (recipients) (secrets))" read-vault))
 (test-error "trailing vault form is refused" #t
