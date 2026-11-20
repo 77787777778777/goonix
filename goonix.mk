@@ -28,7 +28,10 @@ MODULES +=					\
   guix/secrets/age.scm				\
   guix/secrets/declaration.scm			\
   guix/secrets/vault.scm			\
-  guix/scripts/secrets.scm
+  guix/secrets/materialise.scm			\
+  guix/scripts/secrets.scm			\
+  gnu/services/goonix-secrets.scm		\
+  gnu/home/services/goonix-secrets.scm
 
 SCM_TESTS +=					\
   tests/ca.scm					\
@@ -49,7 +52,8 @@ SCM_TESTS +=					\
   tests/store-path-check.scm			\
   tests/secrets-age.scm				\
   tests/secrets-age-vectors.scm			\
-  tests/secrets-vault.scm
+  tests/secrets-vault.scm			\
+  tests/secrets-materialise.scm
 
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\

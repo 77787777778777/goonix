@@ -12,6 +12,7 @@
 (define-module (guix flakes syntax)
   #:use-module (guix diagnostics)
   #:use-module (guix records)
+  #:autoload (guix gexp) (gexp)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-26)
