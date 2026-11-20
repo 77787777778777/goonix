@@ -26,6 +26,7 @@ MODULES +=					\
   guix/scripts/run.scm				\
   guix/secrets/gcrypt.scm			\
   guix/secrets/age.scm				\
+  guix/secrets/declaration.scm			\
   guix/secrets/vault.scm			\
   guix/scripts/secrets.scm
 

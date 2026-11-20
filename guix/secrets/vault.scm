@@ -1,6 +1,7 @@
 ;;; goonix: data-only vault declarations and private local-vault operations.
 (define-module (guix secrets vault)
   #:use-module (guix secrets age)
+  #:use-module ((guix secrets declaration) #:select (valid-secret-name?))
   #:use-module ((guix build utils) #:select (mkdir-p delete-file-recursively find-files))
   #:use-module ((ice-9 popen) #:select (open-pipe* close-pipe))
   #:use-module ((guix utils) #:select (config-directory with-atomic-file-output))
@@ -28,6 +29,7 @@
             vault-recipients
             vault-secrets
             secret-name
+            valid-secret-name?
             secret-kind
             secret-recipients
             secret-owner
@@ -70,12 +72,7 @@
   (recipients vault-recipients)
   (secrets vault-secrets))
 
-(define (valid-name? name)
-  (and (symbol? name)
-       (let ((s (symbol->string name)))
-         (and (string-match "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$" s)
-              (not (string-contains s ".."))
-              (not (string-suffix? "." s))))))
+(define valid-name? (@ (guix secrets declaration) valid-secret-name?))
 (define (property properties name default)
   (match (assq name properties) ((_ value) value) (#f default)
          (_ (error "duplicate vault property" name))))

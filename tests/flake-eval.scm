@@ -14,11 +14,17 @@
   #:use-module (guix flakes resolve)
   #:use-module (guix flakes syntax)
   #:use-module (guix flakes evaluate)
-  #:use-module ((guix pure-eval) #:select (pure-eval-supported?))
+  #:use-module ((guix pure-eval) #:select (pure-eval-supported? call-with-evaluator))
   #:use-module ((guix git) #:select (%repository-cache-directory))
   #:use-module (guix store)
+  #:use-module ((guix config) #:select (%guile))
   #:use-module (guix derivations)
   #:use-module (guix packages)
+  #:use-module ((guix secrets age) #:select (generate-x25519-identity
+                                             x25519-identity-public
+                                             encrypt-age
+                                             decrypt-age-file))
+  #:use-module (rnrs bytevectors)
   #:use-module (guix tests)
   #:use-module (guix tests git)
   #:use-module ((guix channels)
@@ -135,6 +141,17 @@ body, after the definitions the tests share."
   (commit! directory `("flake.scm" . ,(apply flake-text fields body)))
   directory)
 
+(define (write-vault-declaration directory declarations)
+  "Write DECLARATIONS as data-only vault metadata for evaluation tests."
+  (write-file (string-append directory "/secrets/vault.scm")
+              (format #f "(vault (format 1) (recipients (owner \"~a\")) (secrets ~a))"
+                      (x25519-identity-public (generate-x25519-identity))
+                      (string-join declarations " "))))
+
+(define (secret-vault! directory . declarations)
+  (write-vault-declaration directory declarations)
+  (git directory "add" "secrets/vault.scm"))
+
 (define (output-name derivation)
   (derivation->output-path derivation))
 
@@ -144,27 +161,37 @@ body, after the definitions the tests share."
   (contents (output-name derivation)))
 
 
-(test-assert "secret references do not depend on identities"
-  (let ((directory #f))
-    (with-workspace root
-      (set! directory root)
-      (flake! root '()
-              "`((packages (sample . ,(tool \"sample\" (secret in 'token)))))")
-      (let ((first (evaluate-flake %store root 'packages 'sample)))
-        (setenv "GUIX_SECRETS_IDENTITY" "/tmp/other-identity")
-        (let ((second (evaluate-flake %store root 'packages 'sample)))
-          (unsetenv "GUIX_SECRETS_IDENTITY")
-          (and (string=? (derivation-file-name first)
-                         (derivation-file-name second))
-               (begin
-                 (build-derivations %store (list first))
-                 (string-contains (contents (derivation->output-path first))
-                                  "/run/secrets/token"))))))))
+(test-assert "secret references give the same derivation with any identity"
+  (with-workspace directory
+    (let* ((recipient (generate-x25519-identity))
+           (other (generate-x25519-identity))
+           (recipient-file (string-append directory "/recipient"))
+           (other-file (string-append directory "/other")))
+      (write-file recipient-file (string-append recipient "\n"))
+      (write-file other-file (string-append other "\n"))
+      (commit! directory
+               `("flake.scm" . ,(flake-text '()
+                   "`((packages (sample . ,(tool \"sample\" (secret in 'token)))))"))
+               `("secrets/vault.scm" . ,(format #f
+                   "(vault (format 1) (recipients (owner \"~a\")) (secrets (token (kind password) (for owner))))"
+                   (x25519-identity-public recipient)))
+               `("secrets/token.age" . ,(encrypt-age (string->utf8 "not used by evaluation")
+                                                     (list (x25519-identity-public recipient)))))
+      (let ((evaluate (lambda (identity)
+                        (setenv "GUIX_SECRETS_IDENTITY" identity)
+                        (derivation-file-name
+                         (evaluate-flake %store directory 'packages 'sample)))))
+        (let ((first (evaluate recipient-file))
+              (second (evaluate other-file))
+              (third (begin (unsetenv "GUIX_SECRETS_IDENTITY")
+                            (evaluate #f))))
+          (and (string=? first second) (string=? first third)))))))
 
 (test-assert "a public half is available as a tracked file"
   (with-workspace directory
     (flake! directory '()
             "`((packages (sample . ,(tool \"sample\" (secret-public in 'guest)))))")
+    (secret-vault! directory "(guest (kind ssh-key) (for owner))")
     (write-file (string-append directory "/secrets/guest.pub")
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpublic\n")
     (git directory "add" "secrets/guest.pub")
@@ -204,13 +231,51 @@ body, after the definitions the tests share."
 (test-assert "secret names cannot escape their runtime directory"
   (with-workspace directory
     (flake! directory '()
-            "`((packages (sample . ,(tool \"sample\" (secret in '../etc/passwd')))))")
+            "`((packages (sample . ,(tool \"sample\" (secret in '..)))))")
+    (secret-vault! directory "(token (kind file) (for owner))")
+    (write-file (string-append directory "/fixture-name") "dotdot")
+    (git directory "add" "fixture-name")
+    (raises? (evaluate-flake %store directory 'packages 'sample #:cache? #f))))
+
+(test-assert "secret names cannot contain a slash"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret in 'a/b)))))")
+    (secret-vault! directory "(token (kind file) (for owner))")
+    (write-file (string-append directory "/fixture-name") "slash")
+    (git directory "add" "fixture-name")
+    (raises? (evaluate-flake %store directory 'packages 'sample #:cache? #f))))
+
+(test-assert "secret names cannot end in a dot"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret in 'token.)))))")
+    (secret-vault! directory "(token (kind file) (for owner))")
+    (write-file (string-append directory "/fixture-name") "trailing-dot")
+    (git directory "add" "fixture-name")
+    (raises? (evaluate-flake %store directory 'packages 'sample #:cache? #f))))
+
+(test-assert "secret references require a declaration"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret in 'missing)))))")
+    (write-file (string-append directory "/fixture-name") "missing-declaration")
+    (git directory "add" "fixture-name")
+    (raises? (evaluate-flake %store directory 'packages 'sample #:cache? #f))))
+
+(test-assert "secret-public requires an ssh-key declaration"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret-public in 'guest)))))")
+    (secret-vault! directory "(guest (kind file) (for owner))")
+    (write-file (string-append directory "/secrets/guest.pub") "ssh-ed25519 public\n")
     (raises? (evaluate-flake %store directory 'packages 'sample))))
 
 (test-assert "secret-public refuses a private identity in the public path"
   (with-workspace directory
     (flake! directory '()
             "`((packages (sample . ,(tool \"sample\" (secret-public in 'guest)))))")
+    (secret-vault! directory "(guest (kind ssh-key) (for owner))")
     (write-file (string-append directory "/secrets/guest.pub")
                 "AGE-SECRET-KEY-1not-a-real-key\n")
     (git directory "add" "secrets/guest.pub")
@@ -218,18 +283,48 @@ body, after the definitions the tests share."
          "commit" "-m" "private half in public path")
     (raises? (evaluate-flake %store directory 'packages 'sample))))
 
-(test-assert "secret contents cannot be opened during evaluation"
+(test-assert "the evaluator cannot read identities, decrypt, or read outside files"
   (with-workspace directory
-    (flake! directory '()
-            "`((packages (sample . ,(tool \"sample\"
-  (call-with-input-file (secret in 'token) get-string-all)))))")
-    (raises? (evaluate-flake %store directory 'packages 'sample))))
-
-
-;;;
-;;; One flake.
-;;;
-
+    (let* ((identity (generate-x25519-identity))
+           (identity-file (string-append directory "/identity"))
+           (vault (string-append directory "/vault"))
+           (outside (string-append directory "/outside"))
+           (script (string-append directory "/probe.scm"))
+           (cipher (encrypt-age (string->utf8 "outside secret") (list (x25519-identity-public identity)))))
+      (write-file identity-file (string-append identity "\n"))
+      (write-file (string-append vault "/vault.scm")
+                  (format #f "(vault (format 1) (recipients (owner \"~a\")) (secrets (token (kind password) (for owner))))"
+                          (x25519-identity-public identity)))
+      (write-file (string-append vault "/token.age") cipher)
+      (write-file outside "outside secret")
+      (write-file script
+                  (format #f "(use-modules (guix secrets vault) (guix secrets age) (ice-9 rdelim) (ice-9 textual-ports))
+(define (try name thunk)
+  (catch #t
+    (lambda () (thunk) (error \"access was allowed\" name))
+    (lambda args
+      (unless (or (and (eq? 'system-error (car args))
+                       (= (car (list-ref args 4)) 2))
+                  (and (equal? \"read-identity\" name)
+                       (eq? 'misc-error (car args))))
+        (error \"unexpected evaluator error\" name args)))))
+(try \"identity\" (lambda () (call-with-input-file ~s get-line)))
+(try \"read-identity\" (lambda () (read-identity ~s)))
+(try \"decrypt\" (lambda ()
+  (let ((v (call-with-input-file ~s read-vault)))
+    (show-secret ~s v 'token (read-identity ~s)))))
+(try \"outside\" (lambda () (call-with-input-file ~s get-line)))"
+                          identity-file identity-file
+                          (string-append vault "/vault.scm") vault identity-file outside))
+      (and (file-exists? identity-file)
+           (file-exists? (string-append vault "/token.age"))
+           (file-exists? outside)
+           (string=? "outside secret"
+                     (utf8->string (decrypt-age-file cipher (list identity))))
+           (call-with-evaluator
+            (list %guile "--no-auto-compile" "-c" (contents script))
+            (lambda (in out) (close-port in) (close-port out) #t)
+            #:load-path (list (evaluator-sources %store)))))))
 (test-equal "an output is the derivation of the same package outside a flake"
   (derivation-file-name
    (package-derivation

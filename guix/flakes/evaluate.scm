@@ -40,6 +40,7 @@
             evaluate-flake-command
 
             %locked-guix-directory
+            evaluator-sources
             evaluator-starts
             %evaluations))
 
@@ -166,7 +167,7 @@ that FLAKE does not declare is an error."
 ;;;
 
 (define (evaluator-sources store)
-  "Return a store directory that holds the source of the two modules the
+  "Return a store directory that holds the source of the modules the
 evaluator runs, to be put first on its load path: the Guix that evaluates a
 flake need not have them."
   (define (source module)
@@ -181,7 +182,12 @@ flake need not have them."
        ("evaluator.scm" regular
         (file ,(source "guix/flakes/evaluator.scm")))
        ("support.scm" regular
-        (file ,(source "guix/flakes/support.scm"))))))))
+        (file ,(source "guix/flakes/support.scm")))
+       ("syntax.scm" regular
+        (file ,(source "guix/flakes/syntax.scm"))))
+     ("secrets" directory
+      ("declaration.scm" regular
+       (file ,(source "guix/secrets/declaration.scm"))))))))
 
 (define %locked-guix-directory
   ;; A procedure that takes a store connection and a list of channels and
@@ -555,14 +561,14 @@ lock'")
 
 (define* (evaluate-flake store directory kind name
                          #:key (options '()) (system (%current-system))
-                         target (overrides '()))
+                         target (overrides '()) (cache? #t))
   "Return the derivation of the output NAME of kind KIND of the flake in
 DIRECTORY, for SYSTEM and TARGET.  OPTIONS is an alist of names of options of
 the flake and their values, which may be text from a command line.
 OVERRIDES redirects inputs for this run (see 'effective-flake-lock')."
   (match (flake-answers store directory `(output ,kind ,name)
                         #:options options #:system system #:target target
-                        #:overrides overrides)
+                        #:overrides overrides #:cache? cache?)
     ((('output _ _ derivation metadata))
      (read-derivation-from-file derivation))))
 

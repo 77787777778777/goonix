@@ -11,6 +11,8 @@
 
 (define-module (guix flakes support)
   #:use-module (guix packages)
+  #:use-module ((guix secrets declaration)
+                #:select (valid-secret-name? read-secret-declarations))
   #:use-module (guix records)
   #:use-module (guix profiles)
   #:use-module (guix derivations)
@@ -82,23 +84,28 @@
     (#f (error "the flake declares no such option" name))))
 
 (define (secret-name-string name)
-  (unless (and (symbol? name)
-               (let ((text (symbol->string name)))
-                 (and (not (string-null? text))
-                      (string-every (lambda (char)
-                                      (or (char-alphabetic? char)
-                                          (char-numeric? char)
-                                          (memv char '(#\- #\_ #\+ #\. #\? #\!))))
-                                    text))))
+  (unless (valid-secret-name? name)
     (error "secret name must be a safe relative name" name))
   (symbol->string name))
 
+(define (secret-declaration context name)
+  (let ((file (self-file context "secrets/vault.scm")))
+    (unless (file-exists? file)
+      (error "secret reference has no vault declaration" name))
+    (or (assq name (call-with-input-file file read-secret-declarations))
+        (error "secret is not declared in the vault" name))))
+
 (define (secret context name)
   "Return the runtime path of NAME, never its contents."
+  (secret-name-string name)
+  (secret-declaration context name)
   (string-append "/run/secrets/" (secret-name-string name)))
 
 (define (secret-public context name)
   "Return the tracked public half of NAME, without opening an identity."
+  (secret-name-string name)
+  (unless (eq? 'ssh-key (cdr (secret-declaration context name)))
+    (error "secret-public is only for an ssh-key secret" name))
   (let ((file (self-file context
                          (string-append "secrets/" (secret-name-string name) ".pub"))))
     (unless (and (file-exists? file)
