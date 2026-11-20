@@ -1,0 +1,17 @@
+(use-modules (guix store) (guix tests) (guix derivations) (guix packages)
+             (ice-9 textual-ports))
+(let ((s (open-connection (getenv "GUIX_DAEMON_SOCKET"))))
+  (set-build-options s #:use-substitutes? #f)
+  (let* ((b (add-text-to-store s "build" "echo $foo > $out\n" '()))
+         (bash (add-to-store s "bash" #t "sha256"
+                (search-bootstrap-binary "bash" (%current-system))))
+         (d (derivation s "deriver-probe" bash (list "-e" b)
+              #:env-vars '(("foo" . "deriver-probe"))
+              #:inputs (list (list b) (list bash))))
+         (o (derivation->output-path d)))
+    (build-derivations s (list d))
+    (format #t "drv=~s\nout=~s\nvalid=~s\nderiver=~s\nvalid-derivers=~s\noutputs=~s\n"
+            (derivation-file-name d) o (valid-path? s o)
+            (path-info-deriver (query-path-info s o)) (valid-derivers s o)
+            (query-derivation-outputs s (derivation-file-name d)))
+    (close-connection s)))

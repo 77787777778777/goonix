@@ -4,6 +4,7 @@ version:            0.1.0.0
 synopsis:           Compatible build daemon for goonix
 license:            GPL-3.0-or-later
 build-type:         Simple
+extra-source-files: src/Goonix/*.hs make-config.scm
 
 common warnings
     default-language: GHC2024
@@ -36,6 +37,8 @@ library
         Goonix.Build.Engine
         Goonix.Build.Offload
         Goonix.Build.Seccomp
+        Goonix.Build.Runtime
+        Goonix.Build.Sandbox
         Goonix.Build.Scheduler
         Goonix.Build.Users
     c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c cbits/logs.c
@@ -48,7 +51,7 @@ library
         filepath,
         process >=1.6,
         unix >=2.8,
-        time >=1.12
+        time >=1.12,
         stm >=2.5 && <2.6
 
 test-suite build-users

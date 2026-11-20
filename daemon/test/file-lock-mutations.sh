@@ -21,7 +21,10 @@ run_fault() {
         "$tmp/daemon/src/Goonix/Store/Files.hs"
       ;;
     busy-after-kill)
-      perl -0pi -e "s/\Qatomically (modifyTVar' fileLocks (Map.delete path))\E/pure ()/" \
+      # Deleting the Busy entry during masked acquisition cannot be observed.
+      # Remove the final release deletion instead: every ordinary holder runs
+      # it, and the final table-empty assertion must reject the stale entry.
+      perl -0pi -e "s/\QcloseLock fd \`finally\` atomically (modifyTVar' fileLocks (Map.delete path))\E/closeLock fd/" \
         "$tmp/daemon/src/Goonix/Store/Files.hs"
       ;;
   esac
@@ -38,9 +41,12 @@ run_fault() {
     echo "mutation unexpectedly passed: $name" >&2
     return 1
   fi
-  grep -F "$expected" "$logs/$name.log"
+  if ! grep -F "$expected" "$logs/$name.log"; then
+    echo "mutation failed before the expected assertion: $name" >&2
+    return 1
+  fi
   echo "mutation rejected as expected: $name"
 }
 run_fault reader-closes 'lock still held after seven readers left'
-run_fault busy-after-kill 'table empty after kills during the wait'
+run_fault busy-after-kill 'table empty after single holder'
 echo 'lock-table mutations: PASS (both rejected)'

@@ -17,6 +17,7 @@ module Goonix.Build.Sandbox
   , sandboxFlagNoNewPrivs
   , sandboxFlagRedirectLog
   , sandboxFlagUserNamespace
+  , sandboxFlagHostIdentities
   , sandboxFlagMountNamespace
   , sandboxFlagNetworkNamespace
   , sandboxFlagPidNamespace
@@ -71,7 +72,7 @@ data SandboxPlan = SandboxPlan
 sandboxFlagSetIds, sandboxFlagSetSid, sandboxFlagCloseFds,
   sandboxFlagChdir, sandboxFlagStdinFile, sandboxFlagClearGroups,
   sandboxFlagNoNewPrivs, sandboxFlagRedirectLog,
-  sandboxFlagUserNamespace, sandboxFlagMountNamespace,
+  sandboxFlagUserNamespace, sandboxFlagHostIdentities, sandboxFlagMountNamespace,
   sandboxFlagNetworkNamespace, sandboxFlagPidNamespace,
   sandboxFlagIpcNamespace, sandboxFlagUtsNamespace, sandboxFlagChroot,
   sandboxFlagProc, sandboxFlagDevpts, sandboxFlagLockMounts,
@@ -98,6 +99,9 @@ sandboxFlagLockMounts = 2097152
 sandboxFlagSlirpNetwork = 4194304
 sandboxFlagIsolateHostLoopback = 8388608
 sandboxFlagIpv6Network = 16777216
+-- Root + leased user: private non-user namespaces and real setgroups/setgid/
+-- setuid.  Unprivileged builds leave this clear and retain their UID/GID map.
+sandboxFlagHostIdentities = 33554432
 
 encodeSandboxPlan :: SandboxPlan -> ByteString
 encodeSandboxPlan plan = B.concat

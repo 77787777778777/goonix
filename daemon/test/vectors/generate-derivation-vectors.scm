@@ -1,0 +1,36 @@
+;;; Generate HS-1 derivation vectors without a daemon connection.
+(use-modules (guix derivations) (guix base16) (gcrypt hash)
+             (srfi srfi-1) (ice-9 match) (ice-9 textual-ports))
+(match (command-line)
+  ((_ input output)
+   (let ((table (make-hash-table)))
+     (define (load path)
+       (or (hashq-ref table path)
+           (let ((drv (read-derivation-from-file path)))
+             (hashq-set! table path drv)
+             drv)))
+     (define (visit drv)
+       (for-each (lambda (input)
+                   (let* ((path (derivation-input-derivation input))
+                          (file (string-append input "/" (basename path))))
+                     (when (file-exists? file)
+                       (visit (load file)))))
+                 (derivation-inputs drv)))
+     (define (hash-drv path)
+       (bytevector->base16-string (derivation-hash (load path))))
+     (for-each (lambda (file)
+                 (visit (load file)))
+               (scandir input (lambda (name) (string-suffix? ".drv" name))
+                        string<?))
+     (call-with-output-file output
+       (lambda (port)
+         (hash-for-each
+          (lambda (path drv)
+            (format port "~a\t~a\t~a~%"
+                    path (hash-drv path)
+                    (bytevector->base16-string
+                     (sha256 (string->utf8
+                              (call-with-input-file (string-append input "/" (basename path))
+                                get-string-all))))))
+          table)))))
+ (_ (error "usage: generate-derivation-vectors.scm VECTOR-DERIVATIONS OUTPUT")))

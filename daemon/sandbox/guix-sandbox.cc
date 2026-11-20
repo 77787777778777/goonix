@@ -103,8 +103,9 @@ constexpr uint64_t namespaceFlags = sandboxFlag | mountNamespaceFlag |
     networkNamespaceFlag | pidNamespaceFlag | ipcNamespaceFlag | utsNamespaceFlag;
 constexpr uint64_t sandboxFlags = namespaceFlags | chrootFlag | procFlag |
     devptsFlag | lockMountsFlag;
+constexpr uint64_t hostIdentitiesFlag = 33554432;
 constexpr uint64_t knownExtendedFlags = sandboxFlags | slirpNetworkFlag |
-    isolateHostLoopbackFlag | ipv6NetworkFlag;
+    isolateHostLoopbackFlag | ipv6NetworkFlag | hostIdentitiesFlag;
 
 class Error : public std::runtime_error {
 public:
@@ -338,11 +339,17 @@ Plan parseFields(const Bytes & input)
     plan.flags = extended ? reader.u64() : reader.u32();
     if ((plan.flags & ~(extended ? uint64_t(knownFlags) | knownExtendedFlags : uint64_t(knownFlags))) != 0)
         throw Error("unknown plan flags");
-    if (plan.has(sandboxFlag) != plan.extended)
+    if (plan.extended && !plan.has(hostIdentitiesFlag) && !plan.has(sandboxFlag))
         throw Error("inconsistent sandbox plan version");
     if (plan.extended && ((plan.flags & chrootFlag) == 0 ||
-                          (plan.flags & namespaceFlags) != namespaceFlags))
-        throw Error("sandbox requires all private namespaces and chroot");
+                          (plan.flags & (namespaceFlags & ~sandboxFlag)) !=
+                          (namespaceFlags & ~sandboxFlag)))
+        throw Error("sandbox requires all private non-user namespaces and chroot");
+    if (plan.has(hostIdentitiesFlag)) {
+        if (geteuid() != 0 || !plan.has(setIdsFlag) || plan.has(newUserNsFlag) ||
+            plan.has(lockMountsFlag))
+            throw Error("host identities require root, explicit IDs, no user namespace and unlocked mounts");
+    }
     if (plan.has(stdinFileFlag) && plan.has(stdinFdFlag))
         throw Error("two stdin sources requested");
 
@@ -396,6 +403,13 @@ Plan parseFields(const Bytes & input)
     plan.uidMapOutside = uid_t(reader.u32());
     plan.gidMapInside = gid_t(reader.u32());
     plan.gidMapOutside = gid_t(reader.u32());
+    if (plan.has(hostIdentitiesFlag)) {
+        if (plan.uid == 0 || plan.gid == 0)
+            throw Error("host identities require a non-root build user");
+        if (plan.uidMapInside != plan.uidMapOutside ||
+            plan.gidMapInside != plan.gidMapOutside)
+            throw Error("host identities cannot use an identity mapping");
+    }
     if (plan.extended) {
         plan.root = reader.string();
         plan.storeDirectory = reader.string();
@@ -793,14 +807,16 @@ void mountIntoSandbox(const Plan & plan, const Bytes & source,
 void setupNamespaces(Plan & plan)
 {
     if (!plan.extended) return;
-    if (unshare(CLONE_NEWUSER) == -1) sysError("unshare(CLONE_NEWUSER)");
-    const Bytes uidMap = std::to_string(plan.uidMapInside) + " " +
-        std::to_string(plan.uidMapOutside) + " 1\n";
-    const Bytes gidMap = std::to_string(plan.gidMapInside) + " " +
-        std::to_string(plan.gidMapOutside) + " 1\n";
-    writeFile("/proc/self/uid_map", uidMap);
-    writeFile("/proc/self/setgroups", "deny");
-    writeFile("/proc/self/gid_map", gidMap);
+    if (!plan.has(hostIdentitiesFlag)) {
+        if (unshare(CLONE_NEWUSER) == -1) sysError("unshare(CLONE_NEWUSER)");
+        const Bytes uidMap = std::to_string(plan.uidMapInside) + " " +
+            std::to_string(plan.uidMapOutside) + " 1\n";
+        const Bytes gidMap = std::to_string(plan.gidMapInside) + " " +
+            std::to_string(plan.gidMapOutside) + " 1\n";
+        writeFile("/proc/self/uid_map", uidMap);
+        writeFile("/proc/self/setgroups", "deny");
+        writeFile("/proc/self/gid_map", gidMap);
+    }
     const int flags = CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID |
         CLONE_NEWIPC | CLONE_NEWUTS;
     if (unshare(flags) == -1) sysError("creating sandbox namespaces");
