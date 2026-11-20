@@ -25,6 +25,11 @@
 (add-secret vault-path parsed 'value 'file (string->utf8 "unit canary") id)
 
 (test-begin "secrets-vault")
+;; Remove the temporary directory when the group ends, whether the tests
+;; passed, failed or raised, not only when the file reaches its last line.
+(test-runner-on-group-end!
+ (test-runner-current)
+ (lambda (runner) (delete-file-recursively root)))
 (test-equal "plaintext uses the runtime directory first" root
   (begin (setenv "GUIX_SECRETS_TEST_TMPDIR" #f)
          (setenv "XDG_RUNTIME_DIR" root)
@@ -145,4 +150,3 @@
     (and (not (false-if-exception (show-secret vault-path new-vault 'value id)))
          (equal? "edited" (utf8->string (show-secret vault-path new-vault 'value new-id))))))
 (test-end)
-(delete-file-recursively root)
