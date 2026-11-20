@@ -24,6 +24,8 @@ MODULES +=					\
   guix/flakes/support.scm			\
   guix/scripts/flake.scm			\
   guix/scripts/run.scm
+  guix/secrets/gcrypt.scm
+  guix/secrets/age.scm
 
 SCM_TESTS +=					\
   tests/ca.scm					\
@@ -41,7 +43,9 @@ SCM_TESTS +=					\
   tests/flake-actions.scm			\
   tests/goonix-builders.scm			\
   tests/pure-eval.scm				\
-  tests/store-path-check.scm
+  tests/store-path-check.scm			\
+  tests/secrets-age.scm
+  tests/secrets-age-vectors.scm
 
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
@@ -51,7 +55,8 @@ SH_TESTS +=					\
   tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\
   tests/guix-flake-shell.sh			\
-  tests/guix-flake.sh
+  tests/guix-flake.sh				\
+  tests/guix-secrets-age.sh
 
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
@@ -66,7 +71,8 @@ EXTRA_DIST +=					\
   tests/fixtures/ca-self-token.xz			\
   tests/fixtures/ca-self-token.bz2			\
   tests/fixtures/ca-self-token.zip			\
-  tests/fixtures/ca-placeholder-boundary.gz
+  tests/fixtures/ca-placeholder-boundary.gz		\
+  $(wildcard $(srcdir)/tests/fixtures/age/*)
 
 if CAN_RUN_TESTS
 if BUILD_DAEMON
