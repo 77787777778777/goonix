@@ -16,6 +16,7 @@ module Goonix.Store.Files
   , withTempRootFile
   , readTemporaryRootFile
   , withTemporaryRoots
+  , withOtherTemporaryRoots
   , readLock
   , appendTempRoot
   , deduplicateTree
@@ -329,14 +330,26 @@ tempRootLock :: MVar ()
 tempRootLock = unsafePerformIO (newMVar ())
 
 withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
-withTemporaryRoots directory action = withMVar tempRootLock $ \() -> do
+withTemporaryRoots = withTemporaryRootsExcept Nothing
+
+-- C++ GC reopens its process's temporary-root file and can take its write
+-- lock.  In this threaded daemon that descriptor belongs to one connection;
+-- omit only that requester, not the other clients' live roots.
+withOtherTemporaryRoots :: RawFilePath -> Fd -> ([ByteString] -> IO a) -> IO a
+withOtherTemporaryRoots directory requester = withTemporaryRootsExcept (Just requester) directory
+
+withTemporaryRootsExcept :: Maybe Fd -> RawFilePath -> ([ByteString] -> IO a) -> IO a
+withTemporaryRootsExcept requester directory action = withMVar tempRootLock $ \() -> do
   own <- withMVar tempRoot $ pure . Map.filterWithKey (\path _ -> (directory <> "/") `B.isPrefixOf` path)
-  bracket (readRoots [] own) (mapM_ closeFd . snd) (action . fst)
+  let retained = case requester of
+        Nothing -> own
+        Just fd -> Map.filter ((/= fd) . rootDescriptor) own
+  bracket (readRoots [] own retained) (mapM_ closeFd . snd) (action . fst)
   where
-    readRoots locks own = do
+    readRoots locks own retained = do
       entries <- directoryEntries directory
       let external = [file | file <- entries, not (Map.member (directory <> "/" <> file) own)]
-      foldM readOne (concatMap rootPaths (Map.elems own), locks) external
+      foldM readOne (concatMap rootPaths (Map.elems retained), locks) external
     readOne (roots, locks) file = do
       let path = directory <> "/" <> file
       fd <- withCStringBytes path (\p -> c_lock_shared p 0)

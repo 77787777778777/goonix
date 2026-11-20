@@ -42,7 +42,7 @@ import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import System.Posix.Env.ByteString (getEnv)
-import Goonix.Store.Files (withTempRootFile, withGCLock, withTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
+import Goonix.Store.Files (withTempRootFile, withGCLock, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
 import qualified System.Posix.Files.ByteString as Files
 import System.Posix.User (getUserEntryForID, userName)
@@ -267,7 +267,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     (deleted, freed) <- withGCLock (storeGcLockPath config) $ do
       roots <- findRoots store
-      withTemporaryRoots (temporaryRootsPath config) $ \temporary -> do
+      withOtherTemporaryRoots (temporaryRootsPath config) rootFd $ \temporary -> do
         live <- Collector.livePaths (map snd roots ++ temporary) store
         if action == 3
           then Collector.deleteSpecificPaths settings live paths minFreed store
