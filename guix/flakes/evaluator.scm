@@ -78,13 +78,20 @@ input"))
                           overrides)))
        (thunk)))))
 
+(define (optional-binding module variable)
+  "Return the procedure VARIABLE of MODULE, loading MODULE if it is defined.
+Record predicates are macros: evaluate their name in the defining module."
+  (let ((interface (resolve-module module #:ensure #f)))
+    (and (module-defined? interface variable)
+         (let ((value (module-ref (resolve-module module) variable)))
+           (if (macro? value)
+               (eval variable (resolve-module module))
+               value)))))
+
 (define (lower store object name system target)
   "Return the derivation of OBJECT, the output NAME of a flake."
   (define (optional module variable)
-    ;; A predicate or a procedure of a module that is loaded only if the
-    ;; flake uses it.
-    (and (module-defined? (resolve-module module #:ensure #f) variable)
-         (module-ref (resolve-module module) variable)))
+    (optional-binding module variable))
 
   (define (is? module predicate)
     (and (resolve-module module #f #:ensure #f)
