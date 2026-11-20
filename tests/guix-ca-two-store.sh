@@ -145,18 +145,19 @@ for i in $(seq 1 100); do
   sleep .1
 done
 grep -E 'GET /goonix/records/.*-two-store-dependent.drv' "$root/publish.log"
-dependent_graph_line=$(grep -nE 'GET /goonix/records/.*-two-store-dependent.drv' "$root/publish.log" | sed -n '1s/:.*//p')
-dependent_output=$(sed -n 's/.*(dependent-output "\([^"]*\)").*/\1/p' "$root/fixture.scm")
-dependent_hash=$(basename "$dependent_output" | cut -d- -f1)
 for i in $(seq 1 600); do
   if grep -q 'two-store-dependent.drv.: answer imported' "$root/concurrent-client.log" 2>/dev/null; then break; fi
   if ! kill -0 "$concurrent_pid" 2>/dev/null; then cat "$root/concurrent-client.log"; exit 1; fi
   sleep .1
 done
 grep -F 'answer imported' "$root/concurrent-client.log"
+builder_line=$(grep -nE '@ build-started .*-two-store-input.drv' "$root/concurrent-client.log" | sed -n '1s/:.*//p')
+import_line=$(grep -nE 'two-store-dependent.drv.: answer imported' "$root/concurrent-client.log" | sed -n '1s/:.*//p')
+test -n "$builder_line" && test -n "$import_line" && test "$builder_line" -lt "$import_line"
 : > "$root/hold-released"
 wait "$concurrent_pid"
 concurrent_pid=
+grep -F 'dropping choice' "$root/concurrent-client.log" | grep -F 'two-store-dependent'
 after=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
 test $((after-before)) -ge 2
 for drv in two-store-dependent two-store-local-dependent; do
@@ -166,16 +167,24 @@ done
 # An unauthorized graph is refused by the daemon; the next cache is asked.
 retry_port=$((port + 100))
 empty_port=$((port + 101))
-empty=$root/empty-cache
-mkdir -p "$empty/db" "$empty/etc" "$empty/log"
-cp "$server/etc/signing-key.sec" "$server/etc/signing-key.pub" "$empty/etc/"
-NIX_STORE_DIR=$store GUIX_DATABASE_DIRECTORY=$empty/db \
-GUIX_CONFIGURATION_DIRECTORY=$empty/etc GUIX_STATE_DIRECTORY=$empty \
-GUIX_DAEMON_SOCKET=$server/socket \
-  ./pre-inst-env guix publish --listen=127.0.0.1 --port="$empty_port" -C0 \
-  >"$root/empty-publish.log" 2>&1 & empty_pid=$!
+: > "$root/empty-publish.log"
+perl -MIO::Socket::INET -e '
+  my $s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>'"$empty_port"',Listen=>20,ReuseAddr=>1) or die $!;
+  open my $f,">>","'$root'/empty-publish.log" or die $!;
+  select((select($f),$|=1)[0]);
+  while (my $c=$s->accept) {
+    my $pid=fork(); die "fork: $!" unless defined $pid;
+    if ($pid==0) {
+      sysread($c,my $request,4096);
+      print $f ($request =~ m{^([^ ]+ [^ ]+)}) ? "$1\n" : "request\n";
+      print $c "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      close $c; exit 0;
+    }
+    close $c;
+  }
+' >"$root/empty-server.log" 2>&1 & empty_pid=$!
 for i in $(seq 1 100); do
-  if curl -fsS "http://127.0.0.1:$empty_port/nix-cache-info" >/dev/null; then break; fi
+  if timeout 1 bash -c "</dev/tcp/127.0.0.1/$empty_port" 2>/dev/null; then break; fi
   sleep .1
 done
 bad=$root/bad-cache
@@ -233,6 +242,7 @@ export GOONIX_RETRY_URLS='$first $url'\n\\
 export _NIX_OPTIONS=build-graph-timeout=3" "$root/retry-$mode-part.sh"
   sed -i '/--substitute-urls=/s#--substitute-urls="[^"]*"#--substitute-urls="'"$first $url"'"#' "$root/retry-$mode-part.sh"
   printf 'part: retry-%s\n' "$mode"
+  publisher_before=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
   unshare --user --map-root-user --mount bash -c \
     "mount --bind '$client/retry-$mode-store' '$store' && exec unshare --user --map-user=$(id -u) --map-group=$(id -g) bash '$root/retry-$mode-part.sh'"
   if test "$mode" = silent; then
@@ -240,6 +250,9 @@ export _NIX_OPTIONS=build-graph-timeout=3" "$root/retry-$mode-part.sh"
     kill "$silent_pid"; wait "$silent_pid" 2>/dev/null || true
   elif test "$mode" = none; then
     test "$(grep -c '^GET /goonix/records/' "$root/empty-publish.log")" -eq 1
+    publisher_after=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
+    test "$publisher_after" -eq "$((publisher_before + 1))"
+    grep '^GET /nar/.*-two-store-earlier' "$root/publish.log" | tail -1
   else
     test "$(grep -c '^GET /goonix/records/' "$root/bad-publish.log")" -eq 1
   fi

@@ -1,5 +1,3 @@
-#include "build-goonix-response.hh"
-
 GoalPtr Worker::makeGoonixGraphGoal(const Path & path)
 {
     GoalPtr goal = goonixGraphGoals[path].lock();
@@ -244,6 +242,7 @@ void GoonixGraphGoal::retry(const string & reason)
         worker.childTerminated(pid);
     }
     input.clear();
+    oversized = false;
     eof = false;
     printMsg(lvlError, std::format("goonix: graph cache for `{}': {}", drvPath, reason));
     state = &GoonixGraphGoal::start;
@@ -283,9 +282,12 @@ void GoonixGraphGoal::handleChildOutput(int fd, const string & data)
     }
     if (fd != agent->builderOut.readSide) return;
     constexpr size_t maximum = 128 * 1024 * 1024;
-    input.append(data, 0, std::min(data.size(), maximum + 1 - std::min(input.size(), maximum + 1)));
-    if (input.size() > maximum) {
-        input.assign(maximum + 1, 'x');
+    if (oversized) return;
+    size_t remaining = maximum - input.size();
+    input.append(data, 0, std::min(data.size(), remaining));
+    if (data.size() > remaining) {
+        input.clear();
+        oversized = true;
         waiting = false;
         worker.wakeUp(shared_from_this());
         return;
@@ -307,6 +309,10 @@ void GoonixGraphGoal::handleEOF(int fd)
 
 void GoonixGraphGoal::finish()
 {
+    if (oversized) {
+        retry("answer exceeded its size limit");
+        return;
+    }
     Strings fields;
     unsigned int nrHints = 0;
     string error;
@@ -318,6 +324,10 @@ void GoonixGraphGoal::finish()
     }
     if (!complete) {
         waiting = true;
+        return;
+    }
+    if (fields.empty() && nrHints == 0) {
+        retry("cache has no graph");
         return;
     }
     try {

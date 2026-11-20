@@ -18,7 +18,7 @@ guix/scripts/shell.scm 21 6
 guix/scripts/substitute.scm 4 0
 guix/scripts/system.scm 13 1
 guix/store.scm 17 2
-nix/libstore/build.cc 50 6
+nix/libstore/build.cc 50 5
 nix/libstore/derivations.cc 14 3
 nix/libstore/derivations.hh 1 0
 nix/libstore/gc.cc 21 0

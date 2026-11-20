@@ -10,8 +10,7 @@
 #include "builtins.hh"
 #include "spawn.hh"
 #include "ca.hh" // goonix: resolution and content finalisation
-#include "build-ca.hh" // goonix: build-state helpers
-#include "build-goonix-response.hh" // goonix: graph response parser
+#include "build-ca.hh" // goonix: build-state and finalisation helpers
 
 #include <map>
 #include <algorithm>
@@ -801,6 +800,8 @@ private:
 
     void done(BuildResult::Status status, const string & msg = "");
 };
+
+
 #include "build-goonix.inc" // goonix: member definitions for CA-only hooks
 
 DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, Worker & worker, BuildMode buildMode)

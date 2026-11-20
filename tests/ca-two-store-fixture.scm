@@ -176,14 +176,18 @@
          (input (make-input))
          (dependent (make-dependent input))
          (local-dependent (make-local-dependent input)))
-    (set-build-options store #:verbosity 5 #:use-substitutes? #t #:max-build-jobs 2
+    (set-build-options store #:verbosity 5 #:fallback? #t
+                       #:use-substitutes? #t #:max-build-jobs 2
                        #:substitute-urls (list (getenv "GOONIX_SERVER_URL")))
     (call-with-output-file (getenv "GOONIX_BUILD_MARKER")
       (lambda (port) (display "concurrent-fallback\n" port)))
     (assert-equal "held input has the server's derivation"
                   (field data 'input) (derivation-file-name input))
     (build-derivations store (list dependent local-dependent))
-    (let ((chosen (realised input)))
+    (let ((chosen (string-trim-right (read-all (realised dependent)))))
+      (assert-equal "both dependent closures use the current input choice"
+                    chosen
+                    (string-trim-right (read-all (realised local-dependent))))
       (assert-equal "shared input is coherent"
                     (list chosen)
                     (delete-duplicates
