@@ -1,5 +1,5 @@
 #!/bin/sh
-# goonix: command-level S-2 gate.  The canary is checked after every command.
+# goonix: vault command behavior, plaintext confinement and recipient changes.
 set -eu
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -7,12 +7,12 @@ mkdir "$work/home" "$work/tmp" "$work/vault" "$work/out" "$work/store"
 export HOME=$work/home TMPDIR=$work/tmp GUIX_SECRETS_IDENTITY=$work/identity
 export GUIX_SECRETS_VAULT=$work/vault
 export GUIX_SECRETS_LOCAL_OPTIONS_DIRECTORY=$work
-canary='goonix-S2-canary-7bd90d8f0b-private'
-new_canary='goonix-S2-canary-rekeyed-private'
+export GUIX_SECRETS_TEST_TMPDIR=$work/tmp
+canary='goonix-vault-canary-7bd90d8f0b-private'
+new_canary='goonix-vault-canary-rekeyed-private'
 export GOONIX_CANARY=$canary
 
-# The gate itself owns this isolated store-like tree; no daemon or real store
-# is involved in vault commands.
+# The harness owns this isolated store-like tree; vault commands never use a daemon.
 check_canary() {
   if grep -R -F -l "$canary" "$work/vault" "$work/store" "$work/tmp" >/dev/null 2>&1; then
     echo 'plaintext canary survived in a vault, store item or temporary file' >&2
@@ -157,12 +157,30 @@ cat > "$work/vault/vault.scm" <<EOF
           (guest (kind ssh-key) (for new))))
 EOF
 run ./pre-inst-env guix secrets rekey
-if ./pre-inst-env guix secrets show value > "$work/out/old" 2>/dev/null; then
-  echo 'removed recipient still opens the rekeyed value' >&2; exit 1
-fi
+for name in value generated guest; do
+  if ./pre-inst-env guix secrets show "$name" > "$work/out/old-$name" 2>/dev/null; then
+    echo "removed recipient still opens rekeyed $name" >&2; exit 1
+  fi
+done
 check_canary
 GUIX_SECRETS_IDENTITY=$new_id run ./pre-inst-env guix secrets show value > "$work/out/new"
 test "$(cat "$work/out/new")" = "$canary"
 GUIX_SECRETS_IDENTITY=$new_id run ./pre-inst-env guix secrets check
 
-printf 'guix secrets S-2 command gate: PASS\n'
+# Both the explicitly selected local vault and its default location collide
+# with a shared declaration of the same name.
+mkdir "$work/local-explicit" "$work/state"
+cp "$work/vault/vault.scm" "$work/local-explicit/vault.scm"
+if GUIX_SECRETS_LOCAL_VAULT=$work/local-explicit ./pre-inst-env guix secrets list >"$work/out/collision" 2>&1; then
+  echo 'explicit local/shared name collision was accepted' >&2; exit 1
+fi
+grep -F 'both shared and local vaults' "$work/out/collision"
+mkdir -p "$work/state/guix/secrets-local"
+cp "$work/vault/vault.scm" "$work/state/guix/secrets-local/vault.scm"
+if XDG_STATE_HOME=$work/state ./pre-inst-env guix secrets list >"$work/out/default-collision" 2>&1; then
+  echo 'default local/shared name collision was accepted' >&2; exit 1
+fi
+grep -F 'both shared and local vaults' "$work/out/default-collision"
+check_canary
+
+printf 'guix secrets vault behavior: PASS\n'

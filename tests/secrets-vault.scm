@@ -5,7 +5,10 @@
              ((guix build utils) #:select (delete-file-recursively))
              (rnrs bytevectors)
              (ice-9 textual-ports)
+             (ice-9 binary-ports)
+             (ice-9 rdelim)
              (srfi srfi-1)
+             (srfi srfi-11)
              (srfi srfi-64))
 
 (define root (mkdtemp! "/tmp/goonix-vault-unit.XXXXXX"))
@@ -21,6 +24,24 @@
 (add-secret vault-path parsed 'value 'file (string->utf8 "unit canary") id)
 
 (test-begin "secrets-vault")
+(test-equal "plaintext uses the runtime directory first" root
+  (begin (setenv "GUIX_SECRETS_TEST_TMPDIR" #f)
+         (setenv "XDG_RUNTIME_DIR" root)
+         (plaintext-parent-directory)))
+(test-equal "plaintext falls back with a warning when tmpfs is unavailable"
+  (if (file-is-directory? "/dev/shm") "/dev/shm" (or (getenv "TMPDIR") "/tmp"))
+  (if (file-is-directory? "/dev/shm")
+      (begin (setenv "XDG_RUNTIME_DIR" #f) (plaintext-parent-directory))
+      (let ((error (open-output-string)))
+        (parameterize ((current-error-port error))
+          (setenv "XDG_RUNTIME_DIR" #f)
+          (let ((directory (plaintext-parent-directory)))
+            (unless (string-contains (get-output-string error) "plaintext") (error "missing warning"))
+            directory)))))
+(test-equal "test plaintext override selects the scanned directory" root
+  (begin (setenv "GUIX_SECRETS_TEST_TMPDIR" root)
+         (plaintext-parent-directory)))
+(setenv "GUIX_SECRETS_TEST_TMPDIR" #f)
 (test-equal "vault reads its declared secret" "unit canary"
   (utf8->string (show-secret vault-path parsed 'value id)))
 (test-error "duplicate vault member is refused" #t
@@ -29,6 +50,36 @@
   (call-with-input-string "(vault (format 1) (recipients) (secrets)) (extra)" read-vault))
 (test-error "reader evaluation is refused" #t
   (call-with-input-string "#.(begin (delete-file \"/tmp/should-not-exist\") (vault))" read-vault))
+(test-assert "passphrase input disables and restores echo"
+  (let-values (((master slave) (openpty)))
+    (let* ((input (fdopen master "w+"))
+           (port (fdopen slave "r+"))
+           (fd (port->fdes port))
+           (before (tcgetattr fd)))
+      (setvbuf input 'none)
+      (display "secret-passphrase\n" input)
+      (force-output input)
+      (let* ((answer (read-passphrase-from-port port "fixture"))
+             (after (tcgetattr fd)))
+        (false-if-exception (close-port input))
+        (false-if-exception (close-port port))
+        (and (string=? answer "secret-passphrase")
+             (= (termios-local-flags before)
+                (termios-local-flags after)))))))
+(test-assert "Git projects inspect tracked files, not ignored identities"
+  (let ((project (string-append root "/project")))
+    (mkdir project)
+    (call-with-output-file (string-append project "/tracked")
+      (lambda (p) (display "ordinary source\n" p)))
+    (call-with-output-file (string-append project "/ignored-key")
+      (lambda (p) (display id p)))
+    (and (zero? (system* "git" "init" "-q" project))
+         (zero? (system* "git" "-C" project "add" "tracked"))
+         (equal? (list (string-append project "/tracked"))
+                 (project-files-to-check project))
+         (begin
+           (generate-ssh-key vault-path parsed 'guest id)
+           (check-vault vault-path parsed id #:project-directory project)))))
 (test-assert "check refuses a tracked private key"
   (begin
     (call-with-output-file (string-append root "/leak")
@@ -51,6 +102,14 @@
     (call-with-output-file path (lambda (p) (display "ssh-ed25519 wrong\n" p)))
     (and (not (false-if-exception (check-vault vault-path parsed id)))
          (begin (generate-ssh-key vault-path parsed 'guest id) #t))))
+(test-assert "editor receives the private file as one argument"
+  (let ((editor (string-append root "/editor")))
+    (call-with-output-file editor
+      (lambda (port)
+        (display "#!/bin/sh\nprintf edited > \"$1\"\n" port)))
+    (chmod editor #o700)
+    (edit-secret vault-path parsed 'value id editor)
+    (string=? "edited" (utf8->string (show-secret vault-path parsed 'value id)))))
 (test-assert "exec exposes files and removes its directory"
   (let ((marker (string-append root "/directory")))
     (test-equal "exec command succeeds" 0
@@ -78,6 +137,6 @@
                                      (vault-secrets parsed)))))
     (rekey-vault vault-path new-vault id)
     (and (not (false-if-exception (show-secret vault-path new-vault 'value id)))
-         (equal? "unit canary" (utf8->string (show-secret vault-path new-vault 'value new-id))))))
+         (equal? "edited" (utf8->string (show-secret vault-path new-vault 'value new-id))))))
 (test-end)
 (delete-file-recursively root)

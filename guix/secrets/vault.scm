@@ -2,9 +2,16 @@
 (define-module (guix secrets vault)
   #:use-module (guix secrets age)
   #:use-module ((guix build utils) #:select (mkdir-p delete-file-recursively find-files))
+  #:use-module ((ice-9 popen) #:select (open-pipe* close-pipe))
   #:use-module ((guix utils) #:select (config-directory with-atomic-file-output))
   #:use-module ((guix flakes syntax) #:select (read-data-port))
-  #:use-module ((guix build syscalls) #:select (mkdtemp!))
+  #:use-module ((guix build syscalls)
+                #:select (mkdtemp! tcgetattr tcsetattr tcsetattr-action
+                          termios termios-input-flags termios-output-flags
+                          termios-control-flags termios-local-flags
+                          termios-line-discipline termios-control-chars
+                          termios-input-speed termios-output-speed
+                          local-flags openpty))
   #:use-module (gcrypt random)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 match)
@@ -40,6 +47,10 @@
             rekey-vault
             exec-with-secrets
             check-vault
+            private-temporary-directory
+            plaintext-parent-directory
+            project-files-to-check
+            read-passphrase-from-port
             write-local-option))
 
 (define-record-type <secret>
@@ -170,16 +181,41 @@
       (and (string-contains text "-----BEGIN OPENSSH PRIVATE KEY-----")
            (read-ssh-identity-text text))
       (error "decrypted identity has no supported key")))
+(define (termios-without-echo attributes)
+  "Return ATTRIBUTES with terminal echo disabled."
+  (termios (termios-input-flags attributes)
+           (termios-output-flags attributes)
+           (termios-control-flags attributes)
+           (logand (termios-local-flags attributes)
+                   (lognot (local-flags ECHO)))
+           (termios-line-discipline attributes)
+           (termios-control-chars attributes)
+           (termios-input-speed attributes)
+           (termios-output-speed attributes)))
+(define (read-passphrase-from-port port file)
+  (let ((fd (fileno port))
+        (attributes (tcgetattr (fileno port))))
+    (dynamic-wind
+      (lambda ()
+        (tcsetattr fd (tcsetattr-action TCSANOW)
+                   (termios-without-echo attributes)))
+      (lambda ()
+        (format port "Enter passphrase for identity file ~a: " file)
+        (force-output port)
+        (let ((passphrase (get-line port)))
+          (newline port)
+          (if (eof-object? passphrase)
+              (error "end of file while reading identity passphrase")
+              passphrase)))
+      (lambda () (tcsetattr fd (tcsetattr-action TCSANOW) attributes)))))
 (define (read-passphrase file)
-  (let ((port (and (isatty? (current-error-port))
-                   (false-if-exception (open-file "/dev/tty" "r+")))))
+  "Read a passphrase on /dev/tty with echo disabled, restoring its settings."
+  (let ((port (false-if-exception (open-file "/dev/tty" "r+"))))
     (unless port (error "encrypted identity requires a terminal for its passphrase"))
-    (format (current-error-port) "Enter passphrase for identity file ~a: " file)
-    (force-output (current-error-port))
-    (let ((passphrase (get-line port)))
-      (newline (current-error-port))
-      (close-port port)
-      passphrase)))
+    (dynamic-wind
+      (const #t)
+      (lambda () (read-passphrase-from-port port file))
+      (lambda () (close-port port)))))
 (define (write-private-file file text)
   (mkdir-p (dirname file))
   (with-atomic-file-output file
@@ -219,11 +255,28 @@
                              (map car (vault-recipients vault))))))
     (unless (pair? recipients) (error "a secret needs at least one recipient"))
     (write-secret directory name plaintext recipients)))
+(define (plaintext-parent-directory)
+  "Prefer volatile storage; GUIX_SECRETS_TEST_TMPDIR is for the test only."
+  (let ((override (getenv "GUIX_SECRETS_TEST_TMPDIR"))
+        (runtime (getenv "XDG_RUNTIME_DIR")))
+    (cond (override override)
+          ((and runtime (file-is-directory? runtime)) runtime)
+          ((file-is-directory? "/dev/shm") "/dev/shm")
+          (else
+           (let ((fallback (or (getenv "TMPDIR") "/tmp")))
+             (format (current-error-port)
+                     "guix secrets: warning: plaintext temporary files are on ~a; ~
+                      use XDG_RUNTIME_DIR or /dev/shm for tmpfs~%" fallback)
+             fallback)))))
+(define (private-temporary-directory suffix)
+  (let ((directory (mkdtemp! (string-append (plaintext-parent-directory)
+                                           "/guix-secrets" suffix ".XXXXXX"))))
+    (chmod directory #o700)
+    directory))
 (define (edit-secret directory vault name identity editor)
   "Edit plaintext only in a private directory; encrypt after EDITOR succeeds."
   (let* ((secret (find (lambda (s) (eq? name (secret-name s))) (vault-secrets vault)))
-         (tmp (mkdtemp! (string-append (or (getenv "TMPDIR") "/tmp")
-                                       "/guix-secrets-edit.XXXXXX"))))
+         (tmp (private-temporary-directory "-edit")))
     (unless secret (delete-file-recursively tmp)
             (error "declare the secret in vault.scm first" name))
     (chmod tmp #o700)
@@ -236,7 +289,9 @@
               (lambda (port)
                 (chmod file #o600)
                 (put-bytevector port (secret-key secret directory identity)))))
-          (let ((status (system (string-append editor " " (object->string file)))))
+          (let ((status (system* "sh" "-c"
+                                 (string-append editor " \"$1\"")
+                                 "guix-secrets-editor" file)))
             (unless (zero? status) (error "secret editor failed" status)))
           (add-secret directory vault name (secret-kind secret)
                       (call-with-input-file file get-bytevector-all) identity)))
@@ -257,8 +312,7 @@
                                      (secret-recipients s))))) plain)))
 (define (exec-with-secrets directory vault identity command)
   "Run COMMAND with plaintext only in a private directory, removed on exit."
-  (let ((tmp (mkdtemp! (string-append (or (getenv "TMPDIR") "/tmp")
-                                      "/guix-secrets.XXXXXX"))))
+  (let ((tmp (private-temporary-directory "")))
     (chmod tmp #o700)
     (define old-signals '())
     (define child-pid #f)
@@ -310,12 +364,26 @@
   (and (not (string-suffix? ".go" file))
        (not (string-suffix? ".age" file))
        (not (string-suffix? ".pub" file))
+       (eq? 'regular (stat:type (stat file #f)))
        (false-if-exception
-        (let ((text (string-trim (call-with-input-file file get-string-all))))
-          (or (and (not (string-contains text "\n"))
-                   (string-prefix? "AGE-SECRET-KEY-1" text)
-                   (valid-x25519-identity? text))
-              (string-prefix? "-----BEGIN OPENSSH PRIVATE KEY-----" text))))))
+        (let ((port (open-input-file file)))
+          (let ((text (get-bytevector-n port 4096)))
+            (close-port port)
+            (let ((text (bytevector->string text "ISO-8859-1")))
+              (or (parse-x25519-identity text)
+                  (string-prefix? "-----BEGIN OPENSSH PRIVATE KEY-----" text))))))))
+(define (project-files-to-check directory)
+  (if (file-exists? (string-append directory "/.git"))
+      (let* ((port (open-pipe* OPEN_READ "git" "-C" directory
+                               "ls-files" "-z" "--" "."))
+             (names (remove string-null?
+                            (string-split (get-string-all port) #\nul)))
+             (status (close-pipe port)))
+        (unless (zero? status)
+          (error "cannot enumerate tracked project tree" directory))
+        (map (lambda (name) (string-append directory "/" name)) names))
+      (find-files directory
+                  (lambda (file stat) (eq? 'regular (stat:type stat))))))
 (define* (check-vault directory vault identity #:key (project-directory #f))
   (for-each (lambda (s)
               (let* ((ciphertext (read-secret-file directory (secret-name s)))
@@ -343,13 +411,7 @@
      (lambda (file)
        (when (private-key-file? file)
          (error "tracked file contains a private key" file)))
-     (find-files project-directory
-                 (lambda (file stat)
-                   (and (eq? 'regular (stat:type stat))
-                        (not (string-contains file "/.git/"))
-                        (not (string-suffix? ".go" file))
-                        (not (string-suffix? ".age" file))
-                        (not (string-suffix? ".pub" file)))))))
+     (project-files-to-check project-directory)))
   #t)
 (define (write-local-option directory name value)
   "Set one public option, preserving data-only local input overrides."
