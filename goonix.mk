@@ -56,7 +56,8 @@ SH_TESTS +=					\
   tests/guix-goonix-defaults.sh			\
   tests/guix-flake-shell.sh			\
   tests/guix-flake.sh				\
-  tests/guix-secrets-age.sh
+  tests/guix-secrets-age.sh			\
+  tests/guix-secrets-ssh-age.sh
 
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\

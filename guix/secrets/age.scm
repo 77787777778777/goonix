@@ -9,6 +9,7 @@
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
+  #:use-module (srfi srfi-14)
   #:use-module (ice-9 match)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 binary-ports)
@@ -18,6 +19,9 @@
             x25519-identity-public
             parse-x25519-identity
             parse-age-recipient
+            encrypt-age
+            read-ssh-identity
+            unwrap-ssh-stanza
             encrypt-x25519
             decrypt-x25519
             decrypt-scrypt
@@ -68,8 +72,7 @@
        (zero? (fold (lambda (x y acc) (logior acc (logxor x y))) 0
                     (bytevector->u8-list a) (bytevector->u8-list b)))))
 (define (hkdf salt secret info)
-  (let* ((salt (if (= (bytevector-length salt) 0) (zero 32) salt))
-         (prk (hmac salt secret)))
+  (let* ((prk (hmac salt secret)))
     (bytevector-slice (hmac prk (bv-append info (make-bytevector 1 1))) 0 32)))
 
 ;; age keys use the original Bech32 checksum, not Bech32m.
@@ -150,6 +153,109 @@
                     (utf8 "age-encryption.org/v1/X25519"))))
     (stanza "X25519" (list (raw64 ephemeral))
             (chacha20-poly1305-seal key (zero 12) file-key))))
+
+;; SSH wire fields are big-endian uint32 length followed by their bytes.
+(define (ssh-u32 n)
+  (let ((out (make-bytevector 4)))
+    (bytevector-u32-set! out 0 n (endianness big)) out))
+(define (ssh-string bv) (bv-append (ssh-u32 (bytevector-length bv)) bv))
+(define (read-u32 bv offset)
+  (unless (<= offset (- (bytevector-length bv) 4))
+    (error "truncated SSH uint32"))
+  (bytevector-u32-ref bv offset (endianness big)))
+(define (read-ssh-field bv offset)
+  (let* ((length (read-u32 bv offset)) (start (+ offset 4)) (end (+ start length)))
+    (when (> end (bytevector-length bv)) (error "truncated SSH string"))
+    (values (bytevector-slice bv start end) end)))
+(define (ssh-key-blob public)
+  (bv-append (ssh-string (utf8 "ssh-ed25519")) (ssh-string public)))
+(define (parse-ssh-public text)
+  (let ((words (filter (negate string-null?)
+                       (string-split text char-set:whitespace))))
+    (unless (and (>= (length words) 2) (string=? (car words) "ssh-ed25519"))
+      (error "only ssh-ed25519 public keys are supported"))
+    (let* ((blob (base64-decode (cadr words) base64-alphabet)))
+      (let-values (((type offset) (read-ssh-field blob 0)))
+        (let-values (((public end) (read-ssh-field blob offset)))
+          (unless (and (= end (bytevector-length blob))
+                       (equal? type (utf8 "ssh-ed25519"))
+                       (= 32 (bytevector-length public)))
+            (error "invalid ssh-ed25519 public key"))
+          (cons blob public))))))
+
+;; All stanza details below follow age v1.3.2 agessh/agessh.go:
+;; sshFingerprint and Ed25519Recipient.Wrap (lines 35-38 and 205-250).
+;; The tag is raw base64 of SHA-256(SSH blob)[:4]; the tweak is HKDF with
+;; empty salt, SSH blob as IKM and the SSH label as info.  Go's hkdf.New
+;; takes IKM before salt, hence hkdf(blob, empty, label) below.  The wrapping
+;; key instead uses ephemeral || converted recipient as salt.
+(define ssh-label (utf8 "age-encryption.org/v1/ssh-ed25519"))
+(define (ssh-fingerprint blob)
+  (raw64 (bytevector-slice (bytevector-hash blob (hash-algorithm sha256)) 0 4)))
+(define (wrap-ssh file-key blob converted-public)
+  (let* ((secret (gen-random-bv 32))
+         (ephemeral (x25519-public-key secret))
+         (tweak (hkdf blob (zero 0) ssh-label))
+         (shared (x25519 tweak (x25519 secret converted-public)))
+         (key (hkdf (bv-append ephemeral converted-public) shared ssh-label)))
+    (stanza "ssh-ed25519" (list (ssh-fingerprint blob) (raw64 ephemeral))
+            (chacha20-poly1305-seal key (zero 12) file-key))))
+
+;; Unencrypted OpenSSH private-key framing follows OpenSSH V_10_5_P1's
+;; PROTOCOL.key.  The inner Ed25519 fields are string type, string public
+;; key, and string seed || public key, followed by the comment and padding.
+;; Passphrase-protected identities ("ciphername" != "none") are refused.
+(define (read-pem-base64 text marker)
+  (let* ((begin (string-append "-----BEGIN " marker "-----"))
+         (end (string-append "-----END " marker "-----"))
+         (lines (map strip-armor-cr (string-split text #\newline)))
+         (start (list-index (lambda (line) (string=? begin line)) lines))
+         (stop (and start (list-index (lambda (line) (string=? end line)) (cdr lines)))))
+    (unless (and start stop) (error "missing OpenSSH private key markers"))
+    (for-each (lambda (line) (unless (string-null? line)
+                               (error "unexpected text in SSH identity")))
+              (append (take lines start)
+                      (drop lines (+ start stop 2))))
+    (base64-decode (string-concatenate
+                    (take (drop lines (+ start 1)) stop)) base64-alphabet)))
+(define (read-ssh-identity file)
+  (let ((bytes (read-pem-base64 (call-with-input-file file get-string-all)
+                                "OPENSSH PRIVATE KEY")))
+    (let-values (((cipher offset) (read-ssh-field bytes 15)))
+      (let-values (((kdf offset) (read-ssh-field bytes offset)))
+        (let-values (((options offset) (read-ssh-field bytes offset)))
+          (unless (and (equal? (bytevector-slice bytes 0 15)
+                               (utf8 "openssh-key-v1\0"))
+                       (equal? cipher (utf8 "none"))
+                       (equal? kdf (utf8 "none"))
+                       (= 0 (bytevector-length options))
+                       (= 1 (read-u32 bytes offset)))
+            (error "only one unencrypted OpenSSH Ed25519 identity is supported"))
+          (let-values (((public-blob offset) (read-ssh-field bytes (+ offset 4))))
+            (let-values (((private offset) (read-ssh-field bytes offset)))
+              (unless (= offset (bytevector-length bytes))
+                (error "trailing OpenSSH private-key data"))
+              (let ((check1 (read-u32 private 0)) (check2 (read-u32 private 4)))
+                (unless (= check1 check2) (error "OpenSSH checkints differ"))
+                (let-values (((type offset) (read-ssh-field private 8)))
+                  (let-values (((public offset) (read-ssh-field private offset)))
+                    (let-values (((key-pair offset) (read-ssh-field private offset)))
+                      (let-values (((comment offset) (read-ssh-field private offset)))
+                        (unless (and (equal? type (utf8 "ssh-ed25519"))
+                                     (= 32 (bytevector-length public))
+                                     (= 64 (bytevector-length key-pair))
+                                     (equal? public (bytevector-slice key-pair 32 64))
+                                     (equal? public-blob (ssh-key-blob public)))
+                          (error "invalid or mismatched OpenSSH Ed25519 key"))
+                        (let loop ((i offset))
+                          (when (< i (bytevector-length private))
+                            (unless (= (bytevector-u8-ref private i)
+                                       (+ 1 (modulo (- i offset) 255)))
+                              (error "invalid OpenSSH private-key padding"))
+                            (loop (+ i 1))))
+                        (list 'ssh public-blob public
+                              (ed25519-seed->x25519
+                               (bytevector-slice key-pair 0 32)))))))))))))))
 (define (wrap-lines body)
   (let ((s (armor64 body)))
     (let loop ((s s))
@@ -188,10 +294,17 @@
                                                 (bytevector-slice plaintext offset (+ offset (* 64 1024))))
                          (loop (+ offset (* 64 1024)) (+ counter 1))))))))
 
-(define* (encrypt-x25519 plaintext recipients #:key (armor? #t))
-  "Return an age v1 ciphertext for a list of native age public key strings."
+(define* (encrypt-age plaintext recipients #:key (armor? #t))
+  "Encrypt to native age and ssh-ed25519 recipient strings."
   (let* ((file-key (gen-random-bv 16))
-         (stanzas (map (lambda (r) (wrap-x25519 file-key (parse-age-recipient r))) recipients))
+         (stanzas
+          (map (lambda (recipient)
+                 (if (string-prefix? "ssh-ed25519 " recipient)
+                     (let ((parsed (parse-ssh-public recipient)))
+                       (wrap-ssh file-key (car parsed)
+                                 (ed25519-public->x25519 (cdr parsed))))
+                     (wrap-x25519 file-key (parse-age-recipient recipient))))
+               recipients))
          (prefix (header-prefix stanzas))
          (header (string-append prefix " " (header-mac file-key prefix) "\n"))
          (nonce (gen-random-bv 16))
@@ -202,6 +315,13 @@
                        (wrap-lines (bv-append (utf8 header) payload))
                        "-----END AGE ENCRYPTED FILE-----\n")
         (bv-append (utf8 header) payload))))
+(define* (encrypt-x25519 plaintext recipients #:key (armor? #t))
+  "Return an age v1 ciphertext for a list of native age public key strings."
+  (for-each (lambda (r)
+              (when (string-prefix? "ssh-ed25519 " r)
+                (error "encrypt-x25519 accepts only native age recipients")))
+            recipients)
+  (encrypt-age plaintext recipients #:armor? armor?))
 
 (define (strip-armor-cr line)
   (let ((n (string-length line)))
@@ -323,6 +443,23 @@
        (and (= (bytevector-length body) 32)
             (false-if-exception (chacha20-poly1305-open key (zero 12) body)))))
     (_ #f)))
+;; The inverse follows Ed25519Identity.unwrap in age v1.3.2, lines 310-357.
+(define (unwrap-ssh-stanza identity stanza)
+  (match (cons identity stanza)
+    ((('ssh blob public secret) "ssh-ed25519" (fingerprint ephemeral-text) body)
+     (and (string=? fingerprint (ssh-fingerprint blob))
+          (= 32 (bytevector-length body))
+          (let* ((ephemeral (pad64 ephemeral-text))
+                 (tweak (hkdf blob (zero 0) ssh-label))
+                 (shared (x25519 tweak (x25519 secret ephemeral)))
+                 (key (hkdf (bv-append ephemeral
+                                       (x25519-public-key secret))
+                            shared ssh-label)))
+            (and (= 32 (bytevector-length ephemeral))
+                 (false-if-exception
+                  (chacha20-poly1305-open key (zero 12) body))))))
+    (_ #f)))
+
 (define (decrypt-stream key data offset)
   (let ((length (- (bytevector-length data) offset)))
     (when (< length 16) (error "truncated age payload"))
@@ -338,10 +475,16 @@
           (if last?
               (apply bv-append (reverse (cons plain pieces)))
               (loop (+ offset n) (+ counter 1) (cons plain pieces))))))))
+(define (unwrap-identity identity stanza)
+  (cond ((string? identity) (unwrap-stanza identity stanza))
+        ((pair? identity) (unwrap-ssh-stanza identity stanza))
+        (else (error "invalid age identity"))))
 (define (decrypt-x25519 text identities)
   "Decrypt TEXT with age identity strings. Never return unauthenticated data."
   (let-values (((stanzas mac prefix payload) (header-boundary text)))
-    (let* ((file-key (any (lambda (identity) (any (lambda (s) (unwrap-stanza identity s)) stanzas)) identities)))
+    (let* ((file-key (any (lambda (identity)
+                            (any (lambda (stanza) (unwrap-identity identity stanza))
+                                 stanzas)) identities)))
       (unless file-key (error "no age identity matches the recipient stanzas"))
       (unless (constant= (pad64 mac) (pad64 (header-mac file-key prefix)))
         (error "age header authentication failed"))

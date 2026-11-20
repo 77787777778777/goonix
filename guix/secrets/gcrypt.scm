@@ -4,12 +4,15 @@
   #:use-module (gcrypt internal)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
+  #:use-module (gcrypt hash)
   #:use-module (srfi srfi-1)
   #:export (x25519
             x25519-public-key
             chacha20-poly1305-seal
             chacha20-poly1305-open
-            scrypt-key))
+            scrypt-key
+            ed25519-public->x25519
+            ed25519-seed->x25519))
 
 (define (foreign-procedure return name parameters)
   (libgcrypt->procedure return name parameters))
@@ -107,6 +110,33 @@
            (kdf-derive (bv-pointer passphrase) (bytevector-length passphrase)
                        48 (ash 1 log-work-factor) (bv-pointer salt) (bytevector-length salt)
                        1 32 (bytevector->pointer out)))
+    out))
+
+;;; ssh-ed25519 recipients use the birational map from RFC 7748, section 4.1.
+;;; The private conversion is RFC 8032, section 5.1.5.  Exact Scheme integers
+;;; avoid another foreign interface: only X25519 and AEAD call libgcrypt.
+(define ed25519-field-prime (- (expt 2 255) 19))
+(define (ed25519-public->x25519 public)
+  "Return the Curve25519 u-coordinate of a 32-byte Ed25519 public key."
+  (unless (= 32 (bytevector-length public))
+    (error "Ed25519 public key must be 32 bytes"))
+  (let* ((y (logand (bytevector-uint-ref public 0 (endianness little) 32)
+                    (- (expt 2 255) 1)))
+         (u (modulo (* (+ 1 y)
+                       (modulo-expt (modulo (- 1 y) ed25519-field-prime)
+                                    (- ed25519-field-prime 2)
+                                    ed25519-field-prime))
+                    ed25519-field-prime))
+         (out (make-bytevector 32)))
+    (bytevector-uint-set! out 0 u (endianness little) 32)
+    out))
+(define (ed25519-seed->x25519 seed)
+  "Return the X25519 secret derived from an Ed25519 seed."
+  (unless (= 32 (bytevector-length seed))
+    (error "Ed25519 seed must be 32 bytes"))
+  (let ((digest (bytevector-hash seed (hash-algorithm sha512)))
+        (out (make-bytevector 32)))
+    (bytevector-copy! digest 0 out 0 32)
     out))
 
 (define ecc-mul-point

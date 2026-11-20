@@ -29,6 +29,22 @@
   (x25519 alice-secret (make-bytevector 32 0)))
 (test-end)
 
+;; RFC 8032 section 7.1, tests 1 to 3.  The two conversions must agree:
+;; mapping the public point equals X25519's public key of the hashed seed.
+(test-begin "ssh-ed25519-to-x25519")
+(for-each
+ (lambda (seed public)
+   (test-equal "RFC 8032 key pair has matching converted public key"
+     (x25519-public-key (ed25519-seed->x25519 (hex seed)))
+     (ed25519-public->x25519 (hex public))))
+ '("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+   "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+   "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7")
+ '("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+   "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+   "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"))
+(test-end)
+
 (define aead-key
   (hex "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"))
 (define aead-nonce
