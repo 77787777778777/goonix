@@ -39,6 +39,13 @@ int goonix_canonicalize(const char *path) {
     mode_t mode = 0444 | ((st.st_mode & S_IXUSR) ? 0111 : 0);
     if (chmod(path, mode) < 0) return -1;
   }
+  /* Match canonicalisePathMetaData_ in nix/libstore/local-store.cc: take
+     ownership of the output for the daemon (root).  A build user's output
+     arrives owned by that user; the store item must be root-owned.  lchown
+     leaves symlinks' targets alone, as in the C++ daemon. */
+  if (st.st_uid != geteuid()) {
+    if (lchown(path, geteuid(), getegid()) < 0) return -1;
+  }
   struct timeval times[2];
   times[0].tv_sec = st.st_atime;
   times[0].tv_usec = 0;

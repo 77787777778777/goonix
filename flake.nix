@@ -54,9 +54,25 @@
               # These suites need the external store vectors and proxy path.
               # They are run explicitly, not by the package's generic checkPhase.
               check = false;
+              drvAttrs = {
+                nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.guile nixpkgs.legacyPackages.${system}.gcc ];
+                postInstall = ''
+                  g++ -O2 -std=c++17 ${./daemon/sandbox/guix-sandbox.cc} -o $out/bin/guix-sandbox
+                '';
+                preConfigure = ''
+                  mkdir -p src/Goonix
+                  guile --no-auto-compile make-config.scm \
+                    src/Goonix/Config.hs /gnu/store /var/guix /var/log/guix \
+                    /etc/guix /bin /share/locale x86_64-linux \
+                    'https://bordeaux.guix.gnu.org https://ci.guix.gnu.org' \
+                    ${./guix/store/schema.sql}
+                '';
+              };
               librarySystemDepends = [
                 nixpkgs.legacyPackages.${system}.libgcrypt
                 nixpkgs.legacyPackages.${system}.sqlite
+                nixpkgs.legacyPackages.${system}.zlib
+                nixpkgs.legacyPackages.${system}.bzip2
               ];
             };
             autoWire = [ ];
@@ -93,6 +109,28 @@
         });
       });
       overlays.default = final: prev: { goonix = mkGoonix prev; };
+      checks = forAllSystems (pkgs:
+        let
+          # The VM test script lives in daemon/test, a tracked file of self.
+          # mkGoonix uses src = self, so every test edit would otherwise change
+          # the client's source hash and recompile all 1146 Guile modules.  The
+          # client build reads nothing under daemon/test (those files are only
+          # EXTRA_DIST), so drop that directory from the check's client source.
+          # Filter self (the flake's already-cleaned source), not ./.: the raw
+          # worktree holds untracked sockets/FIFOs that Nix cannot copy.
+          clientSource = lib.cleanSourceWith {
+            src = self;
+            filter = path: _type:
+              let rel = lib.removePrefix (toString self + "/") (toString path);
+              in rel != "daemon/test" && !lib.hasPrefix "daemon/test/" rel;
+          };
+        in {
+        hs6-build-users-vm = import ./daemon/test/build-users-vm.nix {
+          inherit pkgs;
+          goonixDaemon = composed.packages.${pkgs.stdenv.system}.guix-daemon-hs;
+          guixClient = (mkGoonix pkgs).overrideAttrs (old: { src = clientSource; });
+        };
+      });
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell { inputsFrom = [ (mkGoonix pkgs) ]; };
       });

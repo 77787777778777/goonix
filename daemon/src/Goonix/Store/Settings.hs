@@ -172,6 +172,7 @@ parseDaemonOptions = go defaultDaemonOptions
       | arg == "--no-gc-warning" = go options rest
       | arg == "--system" = withValue arg rest $ \value more -> go (put "system" value options) more
       | arg == "--chroot-directory" = withValue arg rest $ \value more -> go (put "build-chroot-dirs" value options) more
+      | Just value <- stripPrefix "--chroot-directory=" arg = go (put "build-chroot-dirs" value options) rest
       | arg == "--discover" = optionalBool "build-discover" options rest
       | arg == "--no-discover" = go (put "build-discover" "false" options) rest
       | otherwise = Left ("unrecognized daemon option: " ++ C.unpack arg)

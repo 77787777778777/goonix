@@ -74,6 +74,16 @@ notYet name entered = do
   inside <- isEmptyMVar entered
   check name inside
 
+waitForBusyLock :: IO ()
+waitForBusyLock = do
+  installed <- timeout 1000000 (waitForEntry 0)
+  check "waiter installs its lock table entry" (case installed of Just () -> True; Nothing -> False)
+  where
+    waitForEntry 0 = pure ()
+    waitForEntry _ = do
+      n <- lockTableSize
+      if n == 0 then threadDelay 1000 >> waitForEntry 0 else pure ()
+
 descriptorsOn :: FilePath -> IO Int
 descriptorsOn path = do
   fds <- listDirectory "/proc/self/fd"
@@ -94,6 +104,9 @@ main = do
 
   -- 1. Exclusive excludes exclusive, between threads.
   do
+    let released = directory ++ "/released.lock"
+    withGCLock (BC.pack released) (pure ())
+    lockTableSize >>= check "table empty after single holder" . (== 0)
     entered1 <- newEmptyMVar; leave1 <- newEmptyMVar; entered2 <- newEmptyMVar
     (_, done1) <- spawn $ withGCLock (BC.pack gc) (putMVar entered1 () >> takeMVar leave1)
     within "first writer enters" (readMVar entered1)
@@ -163,6 +176,7 @@ main = do
     stop <- externalHolder gc False
     firstIn <- newEmptyMVar; secondIn <- newEmptyMVar
     (first, firstDone) <- spawn $ withGCLock (BC.pack gc) (putMVar firstIn ())
+    waitForBusyLock
     (second, secondDone) <- spawn $ withGCReadLock (BC.pack gc) (putMVar secondIn ())
     notYet "thread waits for the other process" firstIn
     notYet "second thread waits too" secondIn

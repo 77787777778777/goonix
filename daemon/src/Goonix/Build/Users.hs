@@ -13,12 +13,13 @@ module Goonix.Build.Users
   , acquireUser
   , releaseLease
   , withBuildUser
+  , withBuildUserUsing
   , loadUserPool
   , userLease
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, writeTVar)
-import Control.Exception (SomeException, bracket, finally, mask, onException, throwIO, try)
+import Control.Exception (SomeException, bracket, finally, mask, onException, throwIO, try, uninterruptibleMask_)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import qualified Data.Map.Strict as Map
@@ -164,12 +165,17 @@ killUser user = do
     else throwIO (storeError ("cannot clean up processes for build user " <> C.unpack (buildUserName user)))
 
 withBuildUser :: forall a. UserPool -> (BuildUser -> IO a) -> IO a
-withBuildUser pool action = bracket (acquireUser pool) (releaseLease pool) $ \lease ->
+withBuildUser = withBuildUserUsing killUser
+
+-- Injectable only for the bounded unit tests of the exception boundary. The
+-- daemon uses the real UID sweep above; the root VM checks its OS effects.
+withBuildUserUsing :: forall a. (BuildUser -> IO ()) -> UserPool -> (BuildUser -> IO a) -> IO a
+withBuildUserUsing sweep pool action = bracket (acquireUser pool) (releaseLease pool) $ \lease ->
   mask $ \restore -> do
     let user = userLease lease
-    killUser user
+    sweep user
     result <- try (restore (action user)) :: IO (Either SomeException a)
-    cleanup <- try (restore (killUser user)) :: IO (Either SomeException ())
+    cleanup <- try (uninterruptibleMask_ (sweep user)) :: IO (Either SomeException ())
     case (result, cleanup) of
       (Left exception, _) -> throwIO exception
       (Right _, Left exception) -> throwIO exception
