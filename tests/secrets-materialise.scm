@@ -175,4 +175,20 @@
         (volatile-generation-directory? shm)
         #t)))
 
+;; ensure-volatile-directory mounts the tmpfs itself.  As an unprivileged user
+;; the mount is refused, so it raises and writes nothing into the directory:
+;; it must never leave a non-volatile directory that a later step would
+;; materialise plaintext into.  (The test runs unprivileged; the mount needs
+;; root, so this exercises the refusal path, not a successful mount.)
+(test-equal "ensure-volatile-directory raises unprivileged and writes nothing" #t
+  (let ((plain (string-append root "/run/ensure-plain")))
+    (mkdir-p plain)
+    (and (catch #t
+           (lambda () (ensure-volatile-directory plain) #f)
+           (lambda (key . args) #t))
+         ;; Nothing was materialised into it: it stays an empty plain dir.
+         (null? (scandir plain (lambda (f)
+                                 (not (member f '("." ".."))))))
+         (not (volatile-generation-directory? plain)))))
+
 (test-end)

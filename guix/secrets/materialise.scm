@@ -14,17 +14,21 @@
   #:use-module (guix secrets age)
   #:use-module (guix secrets vault)
   #:use-module ((guix build utils) #:select (mkdir-p delete-file-recursively))
+  #:use-module ((guix build syscalls)
+                #:select (mount setxattr MS_NODEV MS_NOSUID MS_NOEXEC))
   #:use-module (ice-9 match)
   #:use-module (ice-9 ftw)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 binary-ports)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-13)
   #:export (materialise-secrets
             materialise-secret
             next-generation
             publish-generation
             volatile-generation-directory?
+            ensure-volatile-directory
             machine-identity-file
             ensure-machine-identity
             identity-public-text))
@@ -166,3 +170,38 @@ runs after the mount; on reconfigure the tmpfs is already mounted, so this is
          (let ((parent (stat (dirname directory) #f)))
            (and parent
                 (not (= (stat:dev st) (stat:dev parent))))))))
+
+(define (ensure-volatile-directory directory)
+  "Make DIRECTORY the volatile file system the secrets are materialised into,
+mounting it if it is not already.  The platform is decided here, at run time,
+not at evaluation time: a service's extensions never see the operating system,
+and the Hurd's file-system-service-type would turn a tmpfs entry into a
+mount(2) call with no Hurd path, stopping the boot.  So the service mounts its
+own volatile directory and the guest decides how.
+
+If DIRECTORY is already a mount point (volatile-generation-directory?), return.
+Otherwise create it mode 751 and mount a tmpfs on it: on the Hurd
+(utsname:sysname is \"GNU\") set a tmpfs translator on the node, the way
+(gnu build hurd-boot) set-translator does — setxattr \"gnu.translator\" with the
+command joined by NUL characters, as /dev/shm is set; on Linux, mount(2) a
+tmpfs with nodev/nosuid/noexec.  Then check again: if DIRECTORY is still not a
+mount point, raise.  Never materialise into a directory that is not volatile.
+Only the shepherd one-shot 'secrets' calls this, after file-systems; activation
+keeps its rule of materialising only when the directory is already volatile."
+  (unless (volatile-generation-directory? directory)
+    (mkdir-p directory)
+    (chmod directory #o751)
+    (if (string=? (utsname:sysname (uname)) "GNU")
+        ;; GNU/Hurd: a tmpfs translator on the node, as /dev/shm is set in
+        ;; (gnu build hurd-boot).  The translator record is an attribute of the
+        ;; directory and holds no plaintext; /run is recreated each boot, so it
+        ;; is set again each boot.
+        (setxattr directory "gnu.translator"
+                  (string-join '("/hurd/tmpfs" "--mode=751" "1M")
+                               "\0" 'suffix))
+        ;; Linux: mount a tmpfs.
+        (mount "none" directory "tmpfs"
+               (logior MS_NODEV MS_NOSUID MS_NOEXEC) "mode=751"))
+    (unless (volatile-generation-directory? directory)
+      (error "could not mount a volatile file system for the secrets"
+             directory))))

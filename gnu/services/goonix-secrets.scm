@@ -19,7 +19,6 @@
   #:use-module (gnu services base)
   #:use-module (gnu services configuration)
   #:use-module (gnu services shepherd)
-  #:use-module (gnu system file-systems)
   #:use-module (guix gexp)
   #:use-module (guix modules)
   #:use-module (guix self)
@@ -88,30 +87,17 @@ requires 'secrets' sees the files."
   (directory
    (string %secrets-directory)
    "The public path of the materialised secrets, a symlink to the current
-generation in the volatile directory (see secrets-file-system)."
+generation in the volatile directory (the public path with '.d' appended)."
    empty-serializer))
 
 (define (secrets-generation-directory config)
   "The volatile directory that holds the generations, the public path with
-'.d' appended (/run/secrets.d for the default /run/secrets)."
+'.d' appended (/run/secrets.d for the default /run/secrets).  The shepherd
+one-shot 'secrets' mounts it as a tmpfs at run time (ensure-volatile-directory),
+deciding the platform then: a tmpfs translator on the Hurd, mount(2) on Linux.
+It is not a file-system-service-type entry, which on the Hurd would become a
+mount(2) call with no Hurd path and stop the boot."
   (string-append (secrets-configuration-directory config) ".d"))
-
-(define (secrets-file-system config)
-  "The tmpfs that holds the secret generations, mounted at a separate
-directory (/run/secrets.d), not at the public path.  Each activation decrypts
-into a new generation inside it and the public path is a symlink swapped in
-one step, so no mount point is ever renamed and nothing is staged outside the
-tmpfs (agenix and sops-nix do the same, D9).  Mode 751: others may traverse to
-a secret declared for them but not list the generations; each file's own owner
-and mode protect it.  Nothing persists across a reboot in clear."
-  (list (file-system
-          (device "none")
-          (mount-point (secrets-generation-directory config))
-          (type "tmpfs")
-          (check? #f)
-          (flags '(no-suid no-dev no-exec))
-          (options "mode=0751")
-          (create-mount-point? #t))))
 
 (define (secrets-activation config)
   "Return the activation gexp that materialises the declared secrets."
@@ -212,6 +198,12 @@ waits for the identity to arrive."
                   (let* ((identity-file #$(secrets-configuration-identity config))
                          (directory #$(secrets-configuration-directory config))
                          (generations #$(secrets-generation-directory config)))
+                    ;; Mount the volatile directory now, after file-systems,
+                    ;; deciding the platform at run time (tmpfs translator on
+                    ;; the Hurd, mount(2) on Linux).  This raises if it cannot
+                    ;; be made volatile; never materialise into a non-volatile
+                    ;; directory.
+                    (ensure-volatile-directory generations)
                     (if (file-exists? identity-file)
                         (let* ((identity (read-identity identity-file))
                                (vault (call-with-input-file
@@ -240,8 +232,6 @@ waits for the identity to arrive."
    (extensions
     (list (service-extension activation-service-type
                              secrets-activation)
-          (service-extension file-system-service-type
-                             secrets-file-system)
           (service-extension shepherd-root-service-type
                              secrets-shepherd-service)))
    (default-value (secrets-configuration))
