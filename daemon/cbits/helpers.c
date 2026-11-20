@@ -8,7 +8,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern char **environ;
+#include <sys/types.h>
+
+/* Equivalent to the C++ daemon's killUser: the short-lived child changes to
+   the leased uid so kill(-1, SIGKILL) affects only that uid, including itself. */
+int goonix_kill_user(uid_t uid)
+{
+  if (uid == 0) { errno = EPERM; return -1; }
+  pid_t child = fork();
+  if (child < 0) return -1;
+  if (child == 0) {
+    if (setuid(uid) < 0) _exit(127);
+    while (kill(-1, SIGKILL) < 0) {
+      if (errno == ESRCH) _exit(0);
+      if (errno != EINTR) _exit(126);
+    }
+    _exit(0);
+  }
+  int status;
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) return -1;
+  }
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+  errno = EIO;
+  return -1;
+}
 
 int goonix_spawn_sandbox(const char *program, const char *plan,
                         int log_fd, int *pid_out)

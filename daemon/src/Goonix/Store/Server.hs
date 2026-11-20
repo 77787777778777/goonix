@@ -34,6 +34,7 @@ import Goonix.Store.Socket
 import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitutePath)
 import Goonix.Store.Archive (exportPath, importPathsFrom)
 import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
+import Goonix.Build.Users (loadUserPool)
 import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
 import Goonix.Store.Base32 (decodeBase32)
 import Goonix.Store.Wire
@@ -64,10 +65,12 @@ serveSocket config path = do
 serveListener :: ServerConfig -> Socket -> IO ()
 serveListener config listener = do
   initialiseState config
+  users <- loadUserPool (maybe "/var/guix" id (configStateDirectory config)) (setting "build-users-group" "" (configDefaultSettings config))
+  let sharedConfig = config { configBuildUsers = users }
   counter <- newMVar (0 :: Integer)
   forever $ do
     client <- acceptSocket listener
-    _ <- forkFinally (handleClient config counter client) (const (closeSocket client))
+    _ <- forkFinally (handleClient sharedConfig counter client) (const (closeSocket client))
     pure ()
 
 initialiseState :: ServerConfig -> IO ()

@@ -10,6 +10,7 @@ module Goonix.Store.Files
   , withGCLock
   , withGCReadLock
   , withFileLock
+  , tryFileLock
   , LockMode (..)
   , lockTableSize
   , withTempRootFile
@@ -188,6 +189,38 @@ lockTableSize = Map.size <$> readTVarIO fileLocks
 withFileLock :: RawFilePath -> LockMode -> Bool -> IO a -> IO a
 withFileLock path mode deleteOnRelease =
   bracket_ (acquireFileLock path mode) (releaseFileLock path deleteOnRelease)
+
+-- Nonblocking acquisition for identities and other resources for which a
+-- caller must try the next candidate instead of waiting.  The returned
+-- release action keeps the table entry and descriptor until called.
+tryFileLock :: RawFilePath -> IO (Maybe (IO ()))
+tryFileLock path = mask $ \_restore -> do
+  available <- atomically $ do
+    table <- readTVar fileLocks
+    case Map.lookup path table of
+      Nothing -> writeTVar fileLocks (Map.insert path LockBusy table) >> pure True
+      _ -> pure False
+  if not available then pure Nothing else do
+    acquired <- (do
+      fd <- withCStringBytes path (\p -> c_open_lock p 1) `onException`
+        atomically (modifyTVar' fileLocks (Map.delete path))
+      when (fd < 0) (errnoIO "cannot open file lock")
+      result <- c_lock_nonblocking fd 1
+      if result == 0 then pure (Just fd) else do
+        errno <- getErrno
+        closeFd (Fd fd)
+        if errno == eAGAIN || errno == eACCES then pure Nothing
+          else errnoIO "cannot acquire file lock") `onException`
+        atomically (modifyTVar' fileLocks (Map.delete path))
+    case acquired of
+      Nothing -> do
+        atomically $ modifyTVar' fileLocks (Map.delete path)
+        pure Nothing
+      Just fd -> do
+        self <- myThreadId
+        atomically $ modifyTVar' fileLocks (Map.insert path (LockHeld fd Exclusive 1 (Just self)))
+        pure (Just (releaseFileLock path False))
+
 
 acquireFileLock :: RawFilePath -> LockMode -> IO ()
 acquireFileLock path mode = mask $ \restore -> do

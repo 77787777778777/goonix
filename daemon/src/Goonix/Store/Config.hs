@@ -7,6 +7,7 @@ module Goonix.Store.Config
   ) where
 import Data.ByteString (ByteString)
 import Goonix.Store.Settings (Settings, defaultSettings)
+import Goonix.Build.Users (UserPool, loadUserPool)
 
 data ServerConfig = ServerConfig
   { configStore :: !ByteString
@@ -16,8 +17,9 @@ data ServerConfig = ServerConfig
   , configReadOnly :: !Bool
   , configStateDirectory :: !(Maybe ByteString)
   , configGuixProgram :: !ByteString
+  , configBuildUsers :: !(Maybe UserPool)
   }
 
 defaultConfig :: ServerConfig
 defaultConfig = ServerConfig "/gnu/store" "/var/guix/db/db.sqlite"
-  (defaultSettings True False) False True Nothing "guix"
+  (defaultSettings True False) False True Nothing "guix" Nothing
