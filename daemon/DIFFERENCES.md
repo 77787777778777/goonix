@@ -12,6 +12,12 @@ Haskell thread rather than by the `SIGPOLL` flag (inventory 1.3).
 Recursive NAR uploads and hash rewriting are streamed instead of retaining a
 whole store item in memory (inventory 9.20).
 
+The optional `build-separate-download-slots` setting gives download jobs their
+own `build-max-download-jobs` limit (inventory 5.2). It is off by default:
+substitutions and builders share `build-max-jobs`, as in the C++ daemon. The
+setting is not enabled in parity comparisons and must not be enabled before
+those comparisons pass and the user asks for it.
+
 The build-user pool reads `/etc/passwd` and `/etc/group` directly rather than
 calling `getgrnam`, `getpwnam`, and `getgrouplist` (inventory 4.1). This keeps
 identity parsing independent of NSS modules in the static/test daemon; the
