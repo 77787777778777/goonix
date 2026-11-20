@@ -37,6 +37,7 @@ library
         Goonix.Build.Offload
         Goonix.Build.Seccomp
         Goonix.Build.Scheduler
+        Goonix.Build.Users
     c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c cbits/logs.c
     extra-libraries: gcrypt sqlite3 z bz2
     build-depends:
@@ -48,6 +49,18 @@ library
         process >=1.6,
         unix >=2.8,
         time >=1.12
+        stm >=2.5 && <2.6
+
+test-suite build-users
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test
+    main-is: build-users.hs
+    build-depends:
+        base,
+        bytestring,
+        containers,
+        guix-daemon-hs
 
 executable guix-daemon
     import: warnings

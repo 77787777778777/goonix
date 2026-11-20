@@ -65,6 +65,7 @@ import Goonix.Build.Sandbox
 import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runScheduledWithCancel)
 import Goonix.Build.Scheduler (JobKind (..))
 import Goonix.Build.Offload
+import Goonix.Build.Users (BuildUser (..), UserPool, loadUserPool, withBuildUser)
 import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
 import System.Posix.Env.ByteString (getEnv)
@@ -102,6 +103,7 @@ type Dependency = (ByteString, Set.Set ByteString, JobKind)
 type HookPool = (IORef (Maybe Hook), ByteString)
 
 buildThingsInternal config rootFd store settings trace hook things mode cancel = do
+  userPool <- loadUserPool (setting "build-users-group" "" settings)
   attemptedDownloads <- newIORef Set.empty
   let discover path wanted role = case role of
         DownloadJob -> pure JobSpec
@@ -121,7 +123,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                 discovered <- readIORef phase
                 if discovered
                   then do
-                    buildDerivationNow config rootFd store settings trace hook mode requested path
+                    buildDerivationNow userPool config rootFd store settings trace hook mode requested path
                     pure Done
                   else do
                     writeIORef phase True
@@ -203,21 +205,21 @@ buildDerivation attemptedDownloads discover config rootFd store settings trace h
             then pure Done
             else pure (Need [(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)])
 
-buildDerivationNow :: Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
-buildDerivationNow config rootFd store settings trace hook mode wanted drvPath = do
+buildDerivationNow :: Maybe UserPool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
+buildDerivationNow userPool config rootFd store settings trace hook mode wanted drvPath = do
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
   forM_ (Set.toList (inputSrcs drv)) $ \input -> do
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
-  buildWithHook rootFd store settings trace hook mode drvPath drv
+  buildWithHook userPool rootFd store settings trace hook mode drvPath drv
 
-buildWithHook :: Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> Derivation -> IO ()
-buildWithHook rootFd store settings trace pool mode drvPath drv = do
+buildWithHook :: Maybe UserPool -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> Derivation -> IO ()
+buildWithHook userPool rootFd store settings trace pool mode drvPath drv = do
   let localBuild = do
-        runBuilder rootFd store settings trace mode drvPath drv
+        runBuilder userPool rootFd store settings trace mode drvPath drv
         when (mode == Normal) $ replicateM_ (max 0 (settingInt "build-repeat" 0 settings)) $
-          runBuilder rootFd store settings trace Check drvPath drv
+          runBuilder userPool rootFd store settings trace Check drvPath drv
       withOutputLocks action =
         foldr (\path inner -> withPathLock path inner) action (map outputPath (Map.elems (outputs drv)))
       tryBuild Nothing = withOutputLocks $ do
@@ -389,83 +391,90 @@ trySubstitute config rootFd store settings trace path = do
 allOutputsValid :: Store -> Derivation -> IO Bool
 allOutputsValid store drv = and <$> mapM (isValidPath store . outputPath) (Map.elems (outputs drv))
 
-runBuilder :: Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> Derivation -> IO ()
-runBuilder rootFd store settings trace mode drvPath drv = do
-  let isBuiltin = "builtin:" `B.isPrefixOf` builder drv
-      outPaths = map outputPath (Map.elems (outputs drv))
-      redirected = if mode == Check then map (redirectOutput store drvPath) outPaths else outPaths
-      replacements = zip outPaths redirected
-      actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
-  mapM_ (appendTempRoot rootFd) outPaths
-  inputRoots <- derivationInputs store Set.empty drv
-  mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
-  withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
-  work <- makeBuildDirectory store
-  prepareReferenceGraphs store work drv
-  env <- builderEnvironment store settings work actualDrv
-  logPath <- buildLogPath settings store drvPath
-  mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
-  logHandle <- openLog settings logPath
-  (readFd, writeFd) <- createPipe
-  writeHandle <- fdToHandle writeFd
-  readHandle <- fdToHandle readFd
-  guixProgram <- maybe "guix" C.unpack <$> getEnv "GUIX"
-  let command = if "builtin:" `B.isPrefixOf` builder drv
-        then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
-        else proc (C.unpack (builder drv)) (map C.unpack (args drv))
-  (childPid, wait, sandboxRoot, sandboxOutputs) <- mask $ \restore -> do
-    spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
-      then spawnSandboxedBuilder settings store work drvPath actualDrv command env writeFd
-      else do
-        -- As in builtins.cc, the downloader inherits the daemon's environment.
-        inherited <- if isBuiltin then getEnvironment else pure []
-        let childEnvironment = if isBuiltin then inherited else env
-        (_, _, _, process) <- createProcess command
-          { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
-        pid <- maybe 0 fromIntegral <$> getPid process
-        pure (pid, waitForProcess process, Nothing, [])
-    let (pid, _, _, _) = spawned
-    -- The child exists before this handler is installed only while masked.
-    -- Cancellation after this point cannot orphan it in the fork/wait gap.
-    restore (pure spawned) `onException` killBuilder pid
-  traceStarted trace drvPath (platform drv) logPath childPid
-  hClose writeHandle
-  lastOutput <- getPOSIXTime >>= newIORef
-  drained <- newEmptyMVar
-  _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace lastOutput `finally` putMVar drained ()
-  (status, timeoutReason) <- waitForBuilder settings childPid wait lastOutput
-    `onException` killBuilder childPid
-  takeMVar drained `onException` hClose readHandle
-  hClose readHandle
-  closeLog logHandle
-  case status of
-    ExitSuccess -> do
-      forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
-        let produced = root <> path
-        exists <- Files.fileExist produced
-        unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
-        deleteTree path
-        makeParentsWritable root path
-        copyTree produced path
-      forM_ sandboxRoot $ \root -> do
-        Files.setFileMode root 0o755
-        deleteTree root
-      registration <- try $ if mode == Check
-        then checkBuiltOutputs store drvPath replacements (keepFailed settings)
-        else registerBuiltOutputs store drvPath drv
-      case registration of
-        Left (exception :: SomeException) -> do
-          forM_ redirected $ \path -> deleteTree path
-          let (message, status) = registrationFailure exception
-          buildFailed work (Just (message, status))
-        Right () -> pure ()
-      removeBuildDirectory work
-      traceSucceeded trace drvPath
-    _ -> do
-      forM_ sandboxRoot $ \root -> do
-        Files.setFileMode root 0o755
-        deleteTree root
-      buildFailed work ((, 101) <$> timeoutReason)
+runBuilder :: Maybe UserPool -> Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> Derivation -> IO ()
+runBuilder userPool rootFd store settings trace mode drvPath drv =
+  case userPool of
+    Nothing -> runBuilderWithUser Nothing rootFd store settings trace mode drvPath drv
+    Just pool -> withBuildUser pool $ \user ->
+      runBuilderWithUser (Just user) rootFd store settings trace mode drvPath drv
+
+runBuilderWithUser :: Maybe BuildUser -> Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> Derivation -> IO ()
+runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
+      let isBuiltin = "builtin:" `B.isPrefixOf` builder drv
+          outPaths = map outputPath (Map.elems (outputs drv))
+          redirected = if mode == Check then map (redirectOutput store drvPath) outPaths else outPaths
+          replacements = zip outPaths redirected
+          actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
+      mapM_ (appendTempRoot rootFd) outPaths
+      inputRoots <- derivationInputs store Set.empty drv
+      mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
+      withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
+      work <- makeBuildDirectory store
+      prepareReferenceGraphs store work drv
+      env <- builderEnvironment store settings work actualDrv
+      logPath <- buildLogPath settings store drvPath
+      mkdirParents (C.pack (takeDirectory (C.unpack logPath)))
+      logHandle <- openLog settings logPath
+      (readFd, writeFd) <- createPipe
+      writeHandle <- fdToHandle writeFd
+      readHandle <- fdToHandle readFd
+      guixProgram <- maybe "guix" C.unpack <$> getEnv "GUIX"
+      let command = if "builtin:" `B.isPrefixOf` builder drv
+            then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
+            else proc (C.unpack (builder drv)) (map C.unpack (args drv))
+      (childPid, wait, sandboxRoot, sandboxOutputs) <- mask $ \restore -> do
+        spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
+          then spawnSandboxedBuilder buildUser settings store work drvPath actualDrv command env writeFd
+          else do
+            -- As in builtins.cc, the downloader inherits the daemon's environment.
+            inherited <- if isBuiltin then getEnvironment else pure []
+            let childEnvironment = if isBuiltin then inherited else env
+            (_, _, _, process) <- createProcess command
+              { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
+            pid <- maybe 0 fromIntegral <$> getPid process
+            pure (pid, waitForProcess process, Nothing, [])
+        let (pid, _, _, _) = spawned
+        -- The child exists before this handler is installed only while masked.
+        -- Cancellation after this point cannot orphan it in the fork/wait gap.
+        restore (pure spawned) `onException` killBuilder pid
+      traceStarted trace drvPath (platform drv) logPath childPid
+      hClose writeHandle
+      lastOutput <- getPOSIXTime >>= newIORef
+      drained <- newEmptyMVar
+      _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace lastOutput `finally` putMVar drained ()
+      (status, timeoutReason) <- waitForBuilder settings childPid wait lastOutput
+        `onException` killBuilder childPid
+      takeMVar drained `onException` hClose readHandle
+      hClose readHandle
+      closeLog logHandle
+      case status of
+        ExitSuccess -> do
+          forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
+            let produced = root <> path
+            exists <- Files.fileExist produced
+            unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
+            deleteTree path
+            makeParentsWritable root path
+            copyTree produced path
+          forM_ sandboxRoot $ \root -> do
+            Files.setFileMode root 0o755
+            deleteTree root
+          registration <- try $ if mode == Check
+            then checkBuiltOutputs store drvPath replacements (keepFailed settings)
+            else registerBuiltOutputs store drvPath drv
+          case registration of
+            Left (exception :: SomeException) -> do
+              forM_ redirected $ \path -> deleteTree path
+              let (message, status) = registrationFailure exception
+              buildFailed work (Just (message, status))
+            Right () -> pure ()
+          removeBuildDirectory work
+          traceSucceeded trace drvPath
+        _ -> do
+          forM_ sandboxRoot $ \root -> do
+            Files.setFileMode root 0o755
+            deleteTree root
+          buildFailed work ((, 101) <$> timeoutReason)
   where
     -- Output registration can fail after a successful builder.  It is not a
     -- timeout, and its StoreError status must survive rather than becoming
@@ -523,8 +532,8 @@ copyTree source destination = do
         B.writeFile (C.unpack destination) bytes
         Files.setFileMode destination (Files.fileMode status)
 
-spawnSandboxedBuilder :: Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
-spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = do
+spawnSandboxedBuilder :: Maybe BuildUser -> Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
+spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd logFd) = do
   helper <- do
     explicit <- getEnv "GUIX_SANDBOX"
     case explicit of
@@ -535,8 +544,12 @@ spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = d
   root <- makeSandboxRoot store
   mkdirParents (root <> "/tmp")
   Files.setFileMode (root <> "/tmp") 0o1777
-  uid <- fromIntegral <$> getRealUserID
-  gid <- fromIntegral <$> getRealGroupID
+  hostUid <- fromIntegral <$> getRealUserID
+  hostGid <- fromIntegral <$> getRealGroupID
+  let selectedUid = maybe 30001 buildUserUid buildUser
+      selectedGid = maybe 30000 buildUserGid buildUser
+      (uid, gid) = maybe (hostUid, hostGid) (\user -> (buildUserUid user, buildUserGid user)) buildUser
+      (insideUid, insideGid) = if buildUser == Nothing then (30001, 30000) else (uid, gid)
   network <- fixedOutputNetwork settings drv
   let (networkFlags, slirpProgram, slirpFilter) = case network of
         Nothing -> (0, "", [])
@@ -570,10 +583,10 @@ spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = d
           sandboxFlagNoNewPrivs .|. networkFlags
         , planProgram = program, planArguments = arguments, planEnvironment = environment'
         , planWorkingDirectory = sandboxWork, planStdinFile = "/dev/null"
-        , planUid = 30001, planGid = 30000, planStdinFd = maxBound, planLogFd = maxBound
+        , planUid = insideUid, planGid = insideGid, planStdinFd = maxBound, planLogFd = maxBound
         , planGroups = [], planCloseFds = []
-        , planUidMapInside = 30001, planUidMapOutside = uid
-        , planGidMapInside = 30000, planGidMapOutside = gid
+        , planUidMapInside = insideUid, planUidMapOutside = uid
+        , planGidMapInside = insideGid, planGidMapOutside = gid
         , planRoot = root, planStoreDirectory = storeDirectory store, planHostname = "localhost", planDomainname = "(none)"
         , planMounts = mountInputs ++ mountOutputs ++ mountWork ++ devices
         , planSeccomp = []
@@ -582,8 +595,9 @@ spawnSandboxedBuilder settings store work drvPath drv command env (Fd logFd) = d
       planPath = root <> ".plan"
   mkdirParents (root <> "/etc")
   B.writeFile (C.unpack (root <> "/etc/passwd"))
-    "nixbld:x:30001:30000:Nix build user:/:/noshell\nnobody:x:65534:65534:Nobody:/:/noshell\n"
-  B.writeFile (C.unpack (root <> "/etc/group")) "nixbld:!:30000:\n"
+    (C.pack (C.unpack (maybe "nixbld" buildUserName buildUser) ++ ":x:" ++ show insideUid ++ ":" ++ show insideGid ++ ":Nix build user:/:/noshell\n") <> "nobody:x:65534:65534:Nobody:/:/noshell\n")
+  B.writeFile (C.unpack (root <> "/etc/group"))
+    (C.pack (C.unpack (maybe "nixbld" buildUserName buildUser) ++ ":!:" ++ show insideGid ++ ":\n"))
   B.writeFile (C.unpack (root <> "/etc/hosts")) "127.0.0.1 localhost\n::1 localhost\n"
   when (isFixedOutput drv) $ do
     forM_ ["/etc/services", "/etc/nsswitch.conf"] (copyEtcFile root)
