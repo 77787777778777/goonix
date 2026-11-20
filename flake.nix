@@ -62,6 +62,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ (mkGoonix pkgs) ];
+          packages = [ pkgs.age pkgs.openssh ];
 
           # The bootstrap Guile 2.0 scripts in tests/gexp.scm must not load
           # Guile 3.0's own ice-9/boot-9.go.  Keep the Guile libraries'

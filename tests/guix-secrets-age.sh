@@ -1,8 +1,10 @@
 #!/bin/sh
 # goonix: stock age interoperability and authenticated-failure gates.
 set -eu
-command -v age >/dev/null
-command -v age-keygen >/dev/null
+if ! command -v age >/dev/null 2>&1 || ! command -v age-keygen >/dev/null 2>&1; then
+    echo 'stock age tools are missing; install the flake development shell with age' >&2
+    exit 77
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 export GOONIX_AGE_WORK="$work"

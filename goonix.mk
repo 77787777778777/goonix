@@ -23,8 +23,8 @@ MODULES +=					\
   guix/flakes/evaluator.scm			\
   guix/flakes/support.scm			\
   guix/scripts/flake.scm			\
-  guix/scripts/run.scm
-  guix/secrets/gcrypt.scm
+  guix/scripts/run.scm				\
+  guix/secrets/gcrypt.scm			\
   guix/secrets/age.scm
 
 SCM_TESTS +=					\
@@ -44,7 +44,7 @@ SCM_TESTS +=					\
   tests/goonix-builders.scm			\
   tests/pure-eval.scm				\
   tests/store-path-check.scm			\
-  tests/secrets-age.scm
+  tests/secrets-age.scm				\
   tests/secrets-age-vectors.scm
 
 SH_TESTS +=					\

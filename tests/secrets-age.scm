@@ -1,4 +1,4 @@
-;;; goonix: S-1 age and libgcrypt primitive gates.
+;;; goonix: libgcrypt primitive tests against RFC 7748 and RFC 8439.
 (use-modules (guix secrets gcrypt)
              (gcrypt base16)
              (rnrs bytevectors) (srfi srfi-64))
