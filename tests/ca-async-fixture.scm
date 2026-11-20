@@ -10,9 +10,10 @@
 (define (realised d) (realised-output-path store d "out"))
 (define shell (add-to-store store "async-shell" #t "sha256"
                             (getenv "GOONIX_SHELL_SOURCE")))
-(define* (ca name script #:key (addressing 'content))
+(define* (ca name script #:key (addressing 'content) (env '()))
   (derivation store name shell `("-c" ,script)
               #:sources (list shell)
+              #:env-vars env
               #:addressing addressing))
 (define (write-data p v)
   (call-with-output-file p (lambda (o) (write v o) (newline o))))
@@ -20,7 +21,7 @@
   (let* ((root (getenv "GOONIX_ASYNC_ROOT"))
          (slow (ca "async-slow" "printf slow > \"$out\""))
          (other (ca "async-other"
-                    (format #f "printf 'builder\\n' > '~a/builder-output'; printf 'builder\\n' > \"$out\"" root)
+                    (format #f "echo builder >> '~a/events'; echo builder > $out" root)
                     #:addressing 'input)))
     (call-with-output-file (string-append root "/paths")
       (lambda (port)

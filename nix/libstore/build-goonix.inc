@@ -1,3 +1,5 @@
+#include "build-goonix-response.hh"
+
 GoalPtr Worker::makeGoonixGraphGoal(const Path & path)
 {
     GoalPtr goal = goonixGraphGoals[path].lock();
@@ -70,8 +72,8 @@ bool DerivationGoal::goonixHaveDerivation()
     nrRounds = prepared.rounds;
     if (prepared.action == GoonixGoalAction::substituteOutputs) {
         for (auto & output : originalDrv.outputs) {
-            Path chosen = worker.store.chosenGoonixOutput(originalDrvPath,
-                                                          output.first);
+            Path chosen = worker.store.chosenOutputForCurrentGraph(originalDrvPath,
+                                                                  output.first);
             if (!chosen.empty() && !worker.store.isValidPath(chosen)) {
                 addWaitee(worker.makeSubstitutionGoal(chosen));
                 goonixSubstitutionRequested = true;
@@ -171,8 +173,13 @@ bool DerivationGoal::goonixSelectedOutputsSubstituted()
     if (!goonixSubstitutionRequested || !goonixAddressed(drv) || buildMode != bmNormal)
         return false;
     for (auto & output : originalDrv.outputs) {
-        Path chosen = worker.store.chosenGoonixOutput(originalDrvPath, output.first);
-        if (chosen.empty() || !worker.store.isValidPath(chosen)) return false;
+        Path chosen = worker.store.chosenOutputForCurrentGraph(originalDrvPath, output.first);
+        if (chosen.empty() || !worker.store.isValidPath(chosen)) {
+            needRestart = true;
+            goonixGraphRequested = true;
+            goonixGraphSettled = true;
+            return false;
+        }
     }
     done(BuildResult::Substituted);
     return true;
@@ -195,6 +202,8 @@ GoonixGraphGoal::GoonixGraphGoal(const Path & path, Worker & worker)
     : Goal(worker), drvPath(path), state(&GoonixGraphGoal::start)
 {
     name = std::format("goonix graph query for `{}'", path);
+    caches = settings.get("substitute-urls", Strings());
+    next = caches.begin();
 }
 
 GoonixGraphGoal::~GoonixGraphGoal()
@@ -204,7 +213,8 @@ GoonixGraphGoal::~GoonixGraphGoal()
 
 void GoonixGraphGoal::work()
 {
-    if (!waiting) (this->*state)();
+    if (waiting) return;
+    (this->*state)();
 }
 
 void GoonixGraphGoal::finishWithoutFailure(const string & reason)
@@ -222,16 +232,37 @@ void GoonixGraphGoal::finishWithoutFailure(const string & reason)
 
 void GoonixGraphGoal::timedOut()
 {
-    finishWithoutFailure("request deadline expired; building locally if needed");
+    printMsg(lvlError, std::format("{} reached its graph cache deadline", getName()));
+    retry("cache deadline expired");
+}
+
+void GoonixGraphGoal::retry(const string & reason)
+{
+    if (agent) {
+        pid_t pid = agent->pid;
+        agent.reset();
+        worker.childTerminated(pid);
+    }
+    input.clear();
+    eof = false;
+    printMsg(lvlError, std::format("goonix: graph cache for `{}': {}", drvPath, reason));
+    state = &GoonixGraphGoal::start;
+    waiting = false;
+    worker.wakeUp(shared_from_this());
 }
 
 void GoonixGraphGoal::start()
 {
+    if (next == caches.end()) {
+        finishWithoutFailure("no usable cache answer; building locally if needed");
+        return;
+    }
+    string cache = *next++;
     try {
         const Strings args = { "substitute", "--goonix-graph" };
         const std::map<string, string> env = {{ "_NIX_OPTIONS", settings.pack() }};
         agent = std::make_shared<Agent>(settings.guixProgram, args, env);
-        writeLine(agent->toAgent.writeSide, "records " + drvPath);
+        writeLine(agent->toAgent.writeSide, "records " + drvPath + " " + cache);
         set<int> fds{agent->fromAgent.readSide, agent->builderOut.readSide};
         worker.childStarted(shared_from_this(), agent->pid, fds, false, false);
         if (settings.goonixGraphTimeout)
@@ -240,7 +271,7 @@ void GoonixGraphGoal::start()
         state = &GoonixGraphGoal::finish;
         waiting = true;
     } catch (std::exception & e) {
-        finishWithoutFailure(std::format("helper unavailable: {}", e.what()));
+        retry("helper unavailable");
     }
 }
 
@@ -251,9 +282,12 @@ void GoonixGraphGoal::handleChildOutput(int fd, const string & data)
         return;
     }
     if (fd != agent->builderOut.readSide) return;
-    input += data;
-    if (input.size() > 128 * 1024 * 1024) {
-        finishWithoutFailure("answer exceeded its size limit; ignored");
+    constexpr size_t maximum = 128 * 1024 * 1024;
+    input.append(data, 0, std::min(data.size(), maximum + 1 - std::min(input.size(), maximum + 1)));
+    if (input.size() > maximum) {
+        input.assign(maximum + 1, 'x');
+        waiting = false;
+        worker.wakeUp(shared_from_this());
         return;
     }
     if (input.find('\n') != string::npos) {
@@ -273,51 +307,24 @@ void GoonixGraphGoal::handleEOF(int fd)
 
 void GoonixGraphGoal::finish()
 {
-    if (input.empty() && eof) {
-        finishWithoutFailure("helper died without an answer; ignored");
+    Strings fields;
+    unsigned int nrHints = 0;
+    string error;
+    bool complete = parseGoonixGraphResponse(input, eof, 128 * 1024 * 1024,
+                                             fields, nrHints, error);
+    if (!error.empty()) {
+        retry(error);
         return;
     }
-    if (input.empty() && !eof) {
+    if (!complete) {
         waiting = true;
         return;
     }
     try {
-        std::vector<string> lines = tokenizeString<std::vector<string>>(input, "\n");
-        if (lines.empty() || lines.front() != "goonix-records 1")
-            throw Error("invalid graph response marker");
-        if (lines.size() < 3) {
-            waiting = true;
-            return;
-        }
-        size_t pos = 1;
-        unsigned int nrRecords;
-        if (!string2Int(lines[pos++], nrRecords) || nrRecords > 100000)
-            throw Error("invalid graph record count");
-        size_t afterRecords = pos + nrRecords * 7;
-        if (lines.size() <= afterRecords) {
-            waiting = true;
-            return;
-        }
-        unsigned int nrHints;
-        if (!string2Int(lines[afterRecords], nrHints) || nrHints > 100000)
-            throw Error("invalid graph hint count");
-        if (lines.size() < afterRecords + 1 + nrHints * 3) {
-            waiting = true;
-            return;
-        }
-        if (!eof && input.back() != '\n') {
-            waiting = true;
-            return;
-        }
-        std::vector<string> fields(lines.begin() + pos, lines.begin() + afterRecords);
-        std::vector<string> hints(lines.begin() + afterRecords + 1,
-                      lines.begin() + afterRecords + 1 + nrHints * 3);
-        fields.insert(fields.end(), hints.begin(), hints.end());
-        worker.store.goonixGraphReply(drvPath,
-            Strings(fields.begin(), fields.end()), nrHints);
+        worker.store.goonixGraphReply(drvPath, fields, nrHints);
         finishWithoutFailure("answer imported");
     } catch (std::exception & e) {
-        finishWithoutFailure(std::format("answer refused: {}", e.what()));
+        retry("answer refused: " + string(e.what()));
     }
 }
 

@@ -261,4 +261,11 @@ OutputChoices BuildRecords::choices(const Path & unresolved)
     return result;
 }
 
+void BuildRecords::drop(const Path & unresolved, const string & output)
+{
+    SQLiteStmt stmt;
+    stmt.create(db, "delete from GoonixChoices where derivation = ? and output = ?;");
+    stmt.use()(unresolved)(output).exec();
+}
+
 }

@@ -63,6 +63,7 @@ public:
         const Path & realised);
     Path choice(const Path & unresolved, const string & output);
     OutputChoices choices(const Path & unresolved);
+    void drop(const Path & unresolved, const string & output); // goonix: stale graph promise
 };
 
 }

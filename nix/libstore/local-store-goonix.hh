@@ -39,6 +39,7 @@ Path chosenGoonixOutput(const Path & unresolved, const string & output);
 void chooseOutput(const Path & unresolved, const string & output,
     const Path & realised);
 Path chosenOutput(const Path & unresolved, const string & output);
+Path chosenOutputForCurrentGraph(const Path & unresolved, const string & output);
 OutputChoices choices(const Path & unresolved);
 string signBuildRecord(const string & payload);
 void initialiseGoonixRecords();

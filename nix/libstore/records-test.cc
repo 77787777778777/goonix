@@ -1,4 +1,5 @@
 // goonix: adversarial tests of record signing, selection and import.
+#include "build-goonix-response.hh"
 #include "records.hh"
 #include "ca.hh"
 #include "local-store.hh"
@@ -11,6 +12,30 @@
 #include <sys/wait.h>
 
 using namespace nix;
+
+static int checkGraphResponses()
+{
+    Strings fields;
+    unsigned int hints = 0;
+    string error;
+    if (!parseGoonixGraphResponse("goonix-records 1\n0\n0\n", true, 1024,
+                                  fields, hints, error) || !fields.empty())
+        return 1;
+    if (parseGoonixGraphResponse("goonix-records 1\n1\n", false, 1024,
+                                 fields, hints, error) || !error.empty())
+        return 2;
+    if (parseGoonixGraphResponse("goonix-records 1\n1\n", true, 1024,
+                                 fields, hints, error) ||
+        error.find("incomplete graph response at EOF") == string::npos)
+        return 3;
+    error.clear();
+    if (parseGoonixGraphResponse(string(1025, 'x'), false, 1024,
+                                 fields, hints, error) ||
+        error.find("size limit") == string::npos)
+        return 4;
+    std::cout << "goonix graph response bounds: PASS\n";
+    return 0;
+}
 
 static void configureTestStore(const Path & root, const Path & guix)
 {
@@ -68,6 +93,8 @@ static int checkUnauthorizedImport(int argc, char ** argv)
 
 int main(int argc, char ** argv)
 {
+    if (argc == 2 && string(argv[1]) == "--check-graph-responses")
+        return checkGraphResponses();
     if (argc == 8 && string(argv[3]) == "--check-unauthorized-import")
         return checkUnauthorizedImport(argc, argv);
     if (argc != 3) {

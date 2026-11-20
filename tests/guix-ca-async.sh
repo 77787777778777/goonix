@@ -21,22 +21,22 @@ cp tests/keys/openpgp/signing-key.sec tests/keys/openpgp/signing-key.pub "$root/
 chmod 400 "$root/etc/signing-key.sec"
 cat > "$root/shell" <<'EOF'
 #!/bin/sh
-if test "$1" = -c; then shift; exec /bin/sh -c "$@"; fi
 exec /bin/sh "$@"
 EOF
 chmod 755 "$root/shell"
 export NIX_STORE_DIR=$store GUIX_DATABASE_DIRECTORY=$root/db
 export GUIX_CONFIGURATION_DIRECTORY=$root/etc GUIX_STATE_DIRECTORY=$root/state
-export GUIX_DAEMON_SOCKET=$socket NIX_LOG_DIR=$root/log
+export GUIX_DAEMON_SOCKET=$socket GUIX_LOG_DIRECTORY=$root/log
 export GOONIX_SHELL_SOURCE=$root/shell GOONIX_ASYNC_ROOT=$root
 export GOONIX_ASYNC_URL=http://127.0.0.1:$port
 export _NIX_OPTIONS=build-graph-timeout=10
 
 # Serve each connection independently.  Ordinary narinfo requests get an
 # immediate 404; the record request is deliberately left open forever.
+: > "$root/events"
 perl -MIO::Socket::INET -e '
   my $s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>'"$port"',Listen=>20,ReuseAddr=>1) or die $!;
-  open my $f,">","'$root'/events" or die $!;
+  open my $f,">>","'$root'/events" or die $!;
   select((select($f),$|=1)[0]);
   while (my $c=$s->accept) {
     my $pid=fork(); die "fork: $!" unless defined $pid;
@@ -76,13 +76,17 @@ chmod 755 "$GUIX"
   --substitute-urls="http://127.0.0.1:$port" --max-jobs=1 \
   >"$root/silent-daemon.log" 2>&1 & daemon_pid=$!
 for i in $(seq 1 100); do test -S "$socket" && break; sleep .05; done
-./pre-inst-env guile --no-auto-compile tests/ca-async-fixture.scm silent "$root/silent-fixture.scm" \
+timeout 60 ./pre-inst-env guile --no-auto-compile tests/ca-async-fixture.scm silent "$root/silent-fixture.scm" \
   >"$root/client.log" 2>&1
 # The client receives the daemon's marked build-start event in its protocol
 # stream; the graph connection remains open across that event.
 name=$(grep '^records accepted ' "$root/events" | head -1 | sed 's/^records accepted //')
 test -n "$name"
-grep -F "records closed $name" "$root/events"
+builder_line=$(grep -n '^builder$' "$root/events" | head -1 | cut -d: -f1)
+accepted_line=$(grep -n -F "records accepted $name" "$root/events" | head -1 | cut -d: -f1)
+closed_line=$(grep -n -F "records closed $name" "$root/events" | head -1 | cut -d: -f1)
+test "$accepted_line" -lt "$builder_line"
+test "$builder_line" -lt "$closed_line"
 grep -F '@ build-started ' "$root/client.log" | grep -F 'async-other.drv'
 kill "$daemon_pid"; wait "$daemon_pid" 2>/dev/null || true
 
@@ -105,16 +109,17 @@ chmod 755 "$GUIX"
   --substitute-urls="http://127.0.0.1:$port" --max-jobs=1 \
   >"$root/daemon.log" 2>&1 & daemon_pid=$!
 for i in $(seq 1 100); do test -S "$socket" && break; sleep .05; done
-./pre-inst-env guile --no-auto-compile tests/ca-async-fixture.scm silent "$root/fixture.scm"
+timeout 60 ./pre-inst-env guile --no-auto-compile tests/ca-async-fixture.scm dead "$root/fixture.scm" >"$root/dead-client.log" 2>&1
+# The helper is a separate process; the daemon itself may be a terminated
+# zombie whose PID still accepts kill(2).
 helper=$(cat "$GOONIX_ASYNC_HELPER_PID")
 if kill -0 "$helper" 2>/dev/null; then
   printf 'graph helper survived the worker deadline: %s\n' "$helper" >&2
   exit 1
 fi
-name=$(sed -n 's/.*async-slow\.drv.*/async-slow.drv/p' "$root/daemon.log" | head -1)
 # The sleeping helper never reaches the cache; its PID is the deadline proof.
 test -s "$GOONIX_ASYNC_HELPER_PID"
-grep -F 'reached its graph deadline' "$root/daemon.log" 2>/dev/null || true
+grep -F 'reached its graph cache deadline' "$root/dead-client.log"
 kill "$daemon_pid"; wait "$daemon_pid" 2>/dev/null || true
 
 completed=true

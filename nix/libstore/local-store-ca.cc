@@ -16,6 +16,42 @@ Path LocalStore::chosenOutput(const Path & unresolved, const string & output)
     return goonixRecords->choice(unresolved, output);
 }
 
+Path LocalStore::chosenOutputForCurrentGraph(const Path & unresolved,
+    const string & output)
+{
+    auto txn = goonixRecords->transaction();
+    Path current = chosenOutput(unresolved, output);
+    if (current.empty()) { txn.commit(); return current; }
+    Derivation original = readDerivation(unresolved);
+    if (!goonixAddressed(original)) { txn.commit(); return current; }
+    auto nameOf = [&](const Path & path, const Derivation & drv,
+                      const string & name) -> Path {
+        auto found = drv.outputs.find(name);
+        if (found == drv.outputs.end()) return Path();
+        if (!goonixAddressed(drv) || !found->second.hash.empty())
+            return found->second.path;
+        return chosenOutput(path, name);
+    };
+    for (auto & input : original.inputDrvs)
+        for (auto & name : input.second)
+            if (nameOf(input.first, readDerivation(input.first), name).empty()) {
+                /* A valid output is already a local fact; absent historical
+                   input choices cannot invalidate it after collection. */
+                if (isValidPath(current)) { txn.commit(); return current; }
+                goonixRecords->drop(unresolved, output);
+                txn.commit();
+                return "";
+            }
+    Derivation resolved = resolveDerivation(*this, unresolved, original, nameOf);
+    string hash = printHash(hashString(htSHA256, unparseDerivation(resolved)));
+    for (auto & record : goonixRecords->query(hash, output))
+        if (record.path == current) { txn.commit(); return current; }
+    printMsg(lvlError, std::format("goonix: dropping choice `{}' of `{}': input choices changed",
+        current, unresolved));
+    goonixRecords->drop(unresolved, output);
+    txn.commit();
+    return "";
+}
 OutputChoices LocalStore::choices(const Path & unresolved)
 {
     return goonixRecords->choices(unresolved);

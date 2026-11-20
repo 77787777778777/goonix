@@ -48,35 +48,22 @@
               cache key arguments)
       #f)))
 
-(define (process-graph-query port command caches open-connection timeout)
-  (match (string-tokenize command)
-    (("records" derivation)
-     (let loop ((caches caches))
-       (match caches
-         (()
-          (display "goonix-records 1\n0\n0\n" port)
-          (force-output port))
-         ((cache . rest)
-          (let ((expression (read-cache-graph cache derivation
-                                               open-connection timeout)))
-            (if expression
-                (write-graph-fields port
-                                    (expression->build-records expression)
-                                    (expression->graph-choices expression))
-                (loop rest)))))))
-    (_ (error "invalid goonix graph query" command))))
-
 (define (run-graph-loop port caches open-connection timeout)
   (let loop ()
     (match (read-line)
       ((? eof-object?) #t)
-      ((= string-tokenize ("records" derivation))
+      ((= string-tokenize ("records" derivation cache))
        (guard (c (#t
                   (format (current-error-port)
                           "goonix graph query failed: ~s~%" c)
                   (display "goonix-records 1\n0\n0\n" port)
                   (force-output port)))
-         (process-graph-query port (string-append "records " derivation)
-                              caches open-connection timeout))
+         (let ((expression (read-cache-graph cache derivation
+                                             open-connection timeout)))
+           (if expression
+               (write-graph-fields port (expression->build-records expression)
+                                   (expression->graph-choices expression))
+               (display "goonix-records 1\n0\n0\n" port))
+           (force-output port)))
        (loop))
       (_ (loop)))))
