@@ -6,6 +6,8 @@ root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 daemon=${1:?Haskell daemon required}
 out=${2:-$root/.scratch/hs7-temporary-roots-builder}
 mkdir -p "$out"
+find "$out" -mindepth 1 -maxdepth 1 -exec chmod -R u+rwX {} + 2>/dev/null || true
+find "$out" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 out=$(CDPATH= cd -- "$out" && pwd)
 fixture=$(mktemp -d /tmp/goonix-builder-gc-XXXXXX)
 socket=$fixture/s
@@ -50,7 +52,7 @@ for i in $(seq 1 1500); do
   fi
   sleep .01
 done
-test -s "$fixture/builder-started"
+test -s "$fixture/builder-started" || { cat "$out/builder.log"; echo 'builder never started' >&2; exit 1; }
 HS7_PHASE=seed goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile -c '(use-modules (guix store) (ice-9 rdelim)) (let* ((s (open-connection (getenv "HS7_COLLECTOR_SOCKET"))) (p (add-text-to-store s "hs7-dead-during-build" "dead")) (f (string-append (getenv "HS7_FIXTURE") "/dead-path"))) (close-connection s) (call-with-output-file f (lambda (port) (display p port) (newline port))))'
 goonix_start_capped "$root/pre-inst-env" guile --no-auto-compile "$root/daemon/test/differential/temporary-root-builder-collect.scm" >"$out/collector.log" 2>&1
 collector_pid=$GOONIX_TEST_PID collector_scope=$GOONIX_TEST_SCOPE
@@ -69,6 +71,8 @@ builder_pid= builder_scope=
 test -e "$fixture/build-client-finished"
 test -e "$fixture/builder-finished"
 test -f "$(cat "$fixture/builder-output")"
+test "$(cat "$fixture/dependent-input-copy")" = retained
+test "$(cat "$fixture/input-output-after-gc")" = retained
 test ! -e "$(cat "$fixture/dead-path")"
 printf 'HS-7 collector returns during live builder and preserves its inputs: PASS\n'
 cleanup
