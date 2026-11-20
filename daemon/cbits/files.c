@@ -70,6 +70,14 @@ int goonix_unlock_delete(int fd, const char *path) {
   return close(fd);
 }
 
+/* A deleted lock file is marked by its last holder. While we waited for its
+ * lock, another process may have opened the replacement at the same name. */
+int goonix_lock_stale(int fd) {
+  struct stat st;
+  if (fstat(fd, &st) < 0) return -1;
+  return st.st_size != 0;
+}
+
 int goonix_make_symlink(const char *target, const char *link) {
   return symlink(target, link);
 }
@@ -91,6 +99,10 @@ int goonix_mkdir_parents(const char *path, mode_t mode) {
     }
   }
   return 0;
+}
+
+int goonix_open_lock(const char *path, int create) {
+  return open(path, O_RDWR | (create ? O_CREAT : 0) | O_CLOEXEC, 0600);
 }
 
 int goonix_lock_shared(const char *path, int create) {

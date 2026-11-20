@@ -8,6 +8,10 @@ module Goonix.Store.Files
   , canonicaliseTree
   , withPathLock
   , withGCLock
+  , withGCReadLock
+  , withFileLock
+  , LockMode (..)
+  , lockTableSize
   , withTempRootFile
   , readTemporaryRootFile
   , withTemporaryRoots
@@ -19,23 +23,26 @@ module Goonix.Store.Files
   , deleteTree
   , directoryEntries
   , catchMissing
+  , withWritableStore
   , writeBytes
   ) where
 
-import Control.Exception (IOException, bracket, bracketOnError, finally, throwIO, try)
-import Control.Concurrent.MVar (MVar, newMVar, withMVar, modifyMVar, modifyMVar_)
+import Control.Exception (IOException, bracket, bracket_, bracketOnError, finally, mask, onException, throwIO, try, uninterruptibleMask_)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar_, modifyMVar, withMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import qualified Data.Map.Strict as Map
 import Control.Monad (foldM, forM_, unless, when)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.C.Error (Errno (..), eAGAIN, eNOENT, getErrno)
+import Foreign.C.Error (Errno (..), eAGAIN, eACCES, eNOENT, getErrno)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CUInt (..))
 import Data.Word (Word64)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Data.Bits ((.&.))
+import Data.Bits ((.&.), (.|.))
 import Goonix.Store.Nar (Nar (..), hashNar)
 import Goonix.Store.Base32 (encodeBase32)
 import Goonix.Store.Hash (hashDigest)
@@ -44,7 +51,7 @@ import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.IO.ByteString (closeFd, openFd, OpenMode (WriteOnly), OpenFileFlags (..), defaultFileFlags, fdWrite)
-import System.Posix.Types (Fd (..))
+import System.Posix.Types (Fd (..), FileMode)
 
 foreign import ccall unsafe "goonix_restore_node"
   c_restore_node :: CString -> CInt -> CInt -> Ptr () -> Word64 -> IO CInt
@@ -54,9 +61,11 @@ foreign import ccall unsafe "goonix_unlock_delete" c_unlock_delete :: CInt -> CS
 foreign import ccall unsafe "goonix_make_symlink" c_make_symlink :: CString -> CString -> IO CInt
 foreign import ccall unsafe "goonix_rename" c_rename :: CString -> CString -> IO CInt
 foreign import ccall unsafe "goonix_mkdir_parents" c_mkdir_parents :: CString -> CUInt -> IO CInt
+foreign import ccall unsafe "goonix_open_lock" c_open_lock :: CString -> CInt -> IO CInt
+foreign import ccall unsafe "goonix_lock_stale" c_lock_stale :: CInt -> IO CInt
 foreign import ccall safe "goonix_lock_shared" c_lock_shared :: CString -> CInt -> IO CInt
 foreign import ccall safe "goonix_lock_upgrade" c_lock_upgrade :: CInt -> CInt -> IO CInt
-foreign import ccall safe "goonix_lock_nonblocking" c_lock_nonblocking :: CInt -> CInt -> IO CInt
+foreign import ccall unsafe "goonix_lock_nonblocking" c_lock_nonblocking :: CInt -> CInt -> IO CInt
 foreign import ccall unsafe "goonix_write_at_end" c_write_at_end :: CInt -> Ptr () -> Word64 -> IO CInt
 foreign import ccall unsafe "goonix_dedup_link" c_dedup_link :: CString -> CString -> CString -> IO CInt
 
@@ -72,6 +81,56 @@ restoreNar path = restore path
     restore p (Directory entries) = do
       withCStringBytes p $ \p' -> checkIO "cannot restore directory" $ c_restore_node p' 2 0 nullPtr 0
       forM_ entries $ \(name, child) -> restore (p <> "/" <> name) child
+
+-- Store-directory mode is shared mutable state. Only the short bookkeeping
+-- sections are serialized; builders and hashers run concurrently. The final
+-- holder restores the mode observed by the first holder.
+withWritableStore :: RawFilePath -> IO a -> IO a
+withWritableStore = withWritableDirectory
+
+data DirectoryMode = DirectoryBusy | DirectoryWritable !FileMode !Int
+
+{-# NOINLINE writableDirectories #-}
+writableDirectories :: TVar (Map.Map RawFilePath DirectoryMode)
+writableDirectories = unsafePerformIO (newTVarIO Map.empty)
+
+-- A store path lock creates and removes a sibling .lock file. The daemon may
+-- own the store directory while its normal mode denies writes. Save the mode
+-- once, keep it writable through the final lock-file unlink, and restore it
+-- after the last holder; builders and hashers themselves are not serialized.
+withWritableDirectory :: RawFilePath -> IO a -> IO a
+withWritableDirectory path action = bracket_ acquire release action
+  where
+    acquire = mask $ \restore -> do
+      first <- atomically $ do
+        current <- readTVar writableDirectories
+        case Map.lookup path current of
+          Nothing -> writeTVar writableDirectories (Map.insert path DirectoryBusy current) >> pure True
+          Just (DirectoryWritable original count) -> do
+            writeTVar writableDirectories (Map.insert path (DirectoryWritable original (count + 1)) current)
+            pure False
+          Just DirectoryBusy -> retry
+      when first $ do
+        original <- (do
+          status <- Files.getSymbolicLinkStatus path
+          let original = Files.fileMode status
+          Files.setFileMode path (original .|. 0o700)
+          pure original) `onException` atomically (modifyTVar' writableDirectories (Map.delete path))
+        atomically $ modifyTVar' writableDirectories (Map.insert path (DirectoryWritable original 1))
+        restore (pure ())
+    release = uninterruptibleMask_ $ do
+      final <- atomically $ do
+        current <- readTVar writableDirectories
+        case Map.lookup path current of
+          Just (DirectoryWritable original count) | count > 1 -> do
+            writeTVar writableDirectories (Map.insert path (DirectoryWritable original (count - 1)) current)
+            pure Nothing
+          Just (DirectoryWritable original _) -> do
+            writeTVar writableDirectories (Map.insert path DirectoryBusy current)
+            pure (Just original)
+          _ -> throwSTM (userError "store directory mode released without a holder")
+      forM_ final $ \original ->
+        Files.setFileMode path original `finally` atomically (modifyTVar' writableDirectories (Map.delete path))
 
 writeBytes :: RawFilePath -> ByteString -> IO ()
 writeBytes path bytes = bracketOnError (openFd path WriteOnly defaultFileFlags { System.Posix.IO.ByteString.creat = Just 0o666 }) closeFd $ \fd -> do
@@ -92,38 +151,104 @@ canonicaliseTree path = do
     forM_ entries $ \entry -> canonicaliseTree (path <> "/" <> entry)
 
 withPathLock :: RawFilePath -> IO a -> IO a
-withPathLock path action = do
-  let directory = parent path
-  status <- Files.getSymbolicLinkStatus directory
-  let mode = Files.fileMode status
-  Files.setFileMode directory 0o755
-  bracket acquire release (const action) `finally` Files.setFileMode directory mode
-  where
-    lockPath = path <> ".lock"
-    acquire = do
-      fd <- withCStringBytes lockPath c_lock_exclusive
-      if fd < 0 then errnoIO "cannot acquire store path lock" else pure (Fd fd)
-    release (Fd fd) = do
-      result <- withCStringBytes lockPath (c_unlock_delete fd)
-      when (result < 0) (errnoIO "cannot release store path lock")
+withPathLock path action = withWritableDirectory (parent path) $
+  withFileLock (path <> ".lock") Exclusive True action
 
 withGCLock :: RawFilePath -> IO a -> IO a
-withGCLock = gcLock True
+withGCLock = gcLock Exclusive
 
 withGCReadLock :: RawFilePath -> IO a -> IO a
-withGCReadLock = gcLock False
+withGCReadLock = gcLock Shared
 
-gcLock :: Bool -> RawFilePath -> IO a -> IO a
-gcLock exclusive path action = do
+gcLock :: LockMode -> RawFilePath -> IO a -> IO a
+gcLock mode path action = do
   mkdirParents (parent path)
-  bracket acquire closeFd (const action)
+  withFileLock path mode False action
+
+-- POSIX locks belong to the process: they exclude nothing between threads,
+-- and closing any descriptor of a file drops every process lock on it. Keep
+-- one descriptor per lock path and close it only when the last holder leaves.
+--
+-- A path is absent, Busy (one thread is opening/locking or closing it), or
+-- Held. Everybody else waits on this one table. Shared and exclusive holders
+-- never coexist, so the kernel lock mode is never changed and needs no
+-- downgrade. Re-entering an exclusive lock on one thread is refused.
+data LockMode = Shared | Exclusive deriving (Eq, Show)
+data LockSlot
+  = LockBusy
+  | LockHeld !CInt !LockMode !Int !(Maybe ThreadId)
+
+{-# NOINLINE fileLocks #-}
+fileLocks :: TVar (Map.Map RawFilePath LockSlot)
+fileLocks = unsafePerformIO (newTVarIO Map.empty)
+
+lockTableSize :: IO Int
+lockTableSize = Map.size <$> readTVarIO fileLocks
+
+withFileLock :: RawFilePath -> LockMode -> Bool -> IO a -> IO a
+withFileLock path mode deleteOnRelease =
+  bracket_ (acquireFileLock path mode) (releaseFileLock path deleteOnRelease)
+
+acquireFileLock :: RawFilePath -> LockMode -> IO ()
+acquireFileLock path mode = mask $ \restore -> do
+  self <- myThreadId
+  -- A committed acquisition is followed by the cleanup handler while masked.
+  first <- atomically $ do
+    table <- readTVar fileLocks
+    case Map.lookup path table of
+      Nothing -> writeTVar fileLocks (Map.insert path LockBusy table) >> pure True
+      Just (LockHeld fd Shared holders _) | mode == Shared -> do
+        writeTVar fileLocks (Map.insert path (LockHeld fd Shared (holders + 1) Nothing) table)
+        pure False
+      Just (LockHeld _ Exclusive _ (Just owner)) | owner == self ->
+        throwSTM (userError ("deadlock: this thread already holds the lock on " ++ show path))
+      Just _ -> retry
+  when first $ do
+    fd <- acquireExternal restore path mode `onException`
+      atomically (modifyTVar' fileLocks (Map.delete path))
+    atomically $ modifyTVar' fileLocks $
+      Map.insert path (LockHeld fd mode 1 (if mode == Exclusive then Just self else Nothing))
+
+-- Only the wait for another process is interruptible. Its descriptor and the
+-- Busy slot are removed if it is cancelled.
+acquireExternal :: (IO () -> IO ()) -> RawFilePath -> LockMode -> IO CInt
+acquireExternal restore path mode = do
+  fd <- withCStringBytes path (\p -> c_open_lock p 1)
+  when (fd < 0) (errnoIO "cannot open file lock")
+  restore (waitLock fd 1000) `onException` closeFd (Fd fd)
+  stale <- c_lock_stale fd
+  case stale of
+    0 -> pure fd
+    1 -> closeFd (Fd fd) >> acquireExternal restore path mode
+    _ -> closeFd (Fd fd) >> errnoIO "cannot examine file lock"
   where
-    acquire = do
-      fd <- withCStringBytes path (\p -> c_lock_shared p 1)
-      if fd < 0 then errnoIO "cannot acquire global GC lock"
-        else do
-          when exclusive (checkIO "cannot upgrade global GC lock" (c_lock_upgrade fd 1))
-          pure (Fd fd)
+    waitLock fd delay = do
+      result <- c_lock_nonblocking fd (if mode == Exclusive then 1 else 0)
+      when (result /= 0) $ do
+        errno <- getErrno
+        if errno == eAGAIN || errno == eACCES
+          then threadDelay delay >> waitLock fd (min 50000 (delay * 2))
+          else errnoIO "cannot acquire file lock"
+
+releaseFileLock :: RawFilePath -> Bool -> IO ()
+releaseFileLock path deleteOnRelease = uninterruptibleMask_ $ do
+  final <- atomically $ do
+    table <- readTVar fileLocks
+    case Map.lookup path table of
+      Just (LockHeld fd mode holders owner)
+        | holders > 1 -> do
+            writeTVar fileLocks (Map.insert path (LockHeld fd mode (holders - 1) owner) table)
+            pure Nothing
+        | otherwise -> writeTVar fileLocks (Map.insert path LockBusy table) >> pure (Just fd)
+      _ -> throwSTM (userError ("file lock released without a holder: " ++ show path))
+  forM_ final $ \fd ->
+    closeLock fd `finally` atomically (modifyTVar' fileLocks (Map.delete path))
+  where
+    closeLock fd = do
+      result <- if deleteOnRelease
+        then withCStringBytes path (c_unlock_delete fd)
+        else closeFd (Fd fd) >> pure 0
+      when (result < 0) (errnoIO "cannot release file lock")
 
 withTempRootFile :: RawFilePath -> RawFilePath -> (Fd -> IO a) -> IO a
 withTempRootFile path gcPath action = do
@@ -146,7 +271,7 @@ withTempRootFile path gcPath action = do
         Errno errno <- getErrno
         if Errno errno == eAGAIN then Files.removeLink path `catchMissing` pure () >> openRoot
           else errnoIO "cannot acquire temporary roots lock"
-    release root = withMVar tempRootLock $ \() -> modifyMVar_ tempRoot $ \roots ->
+    release _root = withMVar tempRootLock $ \() -> modifyMVar_ tempRoot $ \roots ->
       case Map.lookup path roots of
         Nothing -> throwIO (userError "temporary root file released without an owner")
         Just current
