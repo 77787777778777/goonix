@@ -42,6 +42,7 @@ import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
 import qualified System.Posix.Files.ByteString as Files
 import Data.Word (Word32, Word64)
+import qualified Goonix.Config as Config
 import Goonix.Store.Files (mkdirParents)
 import Goonix.Store.Base32 (decodeBase16)
 import Goonix.Store.Database
@@ -85,10 +86,10 @@ assertStorePath :: Store -> ByteString -> IO ByteString
 assertStorePath store path = either (throwIO . storeError) pure (storePath store path)
 
 openStore :: ByteString -> FilePath -> IO Store
-openStore directory databasePath = do
+openStore directory databasePath = withSchemaLock $ do
   mkdirParents (C.pack (takeDirectory databasePath))
   bracketOnError (openReadWrite databasePath) closeDatabase $ \db -> do
-    initializeSchema db "guix/store/schema.sql"
+    initializeSchemaSql db (C.pack Config.schemaSql)
     let prepare' = prepare db
     Store directory databasePath Nothing db
       <$> prepare' "select id, hash, registrationTime, deriver, narSize from ValidPaths where path = ?;"

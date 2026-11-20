@@ -5,7 +5,14 @@ behaviour inventory.  Incidental differences found by differential testing
 are defects, not entries here.
 
 The process model is one threaded process rather than one process per client
-(H5; inventory 1.1).  The client PID is not written over `argv[1]`
+(H5; inventory 1.1). Each client still has its own SQLite connection. Database
+statements and transactions on one client's connection are serialized against
+that connection's concurrent engine jobs, so one client registering a path can
+make another job of the same client wait for a query. Other clients' ordinary
+queries do not take that per-connection lock. Client startup briefly shares a
+process-wide lock for SQLite WAL setup, schema creation, and statement
+preparation. The C++ daemon instead isolates each client in its own process.
+  The client PID is not written over `argv[1]`
 (inventory 1.1 and 9.25).  A vanished client is handled by cancelling its
 Haskell thread rather than by the `SIGPOLL` flag (inventory 1.3).
 

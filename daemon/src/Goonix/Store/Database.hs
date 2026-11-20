@@ -11,7 +11,10 @@ module Goonix.Store.Database
   , openReadOnly
   , openReadWrite
   , initializeSchema
+  , initializeSchemaSql
   , closeDatabase
+  , withDatabaseLock
+  , withSchemaLock
   , withReadOnly
   , withReadWrite
   , execute
@@ -28,6 +31,9 @@ module Goonix.Store.Database
   ) where
 
 import Control.Exception (Exception, bracket, bracketOnError, onException, throwIO)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -41,14 +47,28 @@ import Foreign.Marshal.Alloc (free, mallocBytes)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, castPtrToFunPtr, intPtrToPtr, nullPtr)
 import Foreign.Storable (peek)
 
-newtype Database = Database (Ptr ())
-data Statement = Statement ByteString (Ptr ())
+data Database = Database (Ptr ()) !(TVar (Maybe (ThreadId, Int)))
+data Statement = Statement ByteString (Ptr ()) (TVar (Maybe (ThreadId, Int)))
 
 data DatabaseBusy = DatabaseBusy !String deriving (Show)
 instance Exception DatabaseBusy
 
 data Value = Integer !Int64 | Bytes !ByteString | Null
   deriving (Eq, Ord, Show)
+
+-- Distinct client Store values have distinct SQLite handles.  Their one-time
+-- schema check/creation must still be atomic across those handles: another
+-- thread can prepare a statement after ValidPaths appears but before Refs or
+-- DerivationOutputs has been created.
+{-# NOINLINE schemaLock #-}
+schemaLock :: MVar ()
+schemaLock = unsafePerformIO (newMVar ())
+
+-- Cover SQLite's WAL setup as well as schema and statement creation.  Opening
+-- separate handles concurrently can otherwise return SQLITE_BUSY before the
+-- per-handle lock exists.
+withSchemaLock :: IO a -> IO a
+withSchemaLock = withMVar schemaLock . const
 
 foreign import ccall unsafe "sqlite3_open_v2"
   c_open :: CString -> Ptr (Ptr ()) -> CInt -> CString -> IO CInt
@@ -95,10 +115,12 @@ openReadOnly :: FilePath -> IO Database
 openReadOnly = openDatabase 0x1
 
 initializeSchema :: Database -> FilePath -> IO ()
-initializeSchema db schemaPath = do
+initializeSchema db schemaPath = initializeSchemaSql db =<< B.readFile schemaPath
+
+initializeSchemaSql :: Database -> ByteString -> IO ()
+initializeSchemaSql db sql = withDatabaseLock db $ do
   rows <- queryValues db "select name from sqlite_master where type='table' and name='ValidPaths';" []
   when (null rows) $ do
-    sql <- B.readFile schemaPath
     let statements = completeStatements sql
     mapM_ (\statement -> unless (B.null (B.dropWhile (<= 32) statement)) (execute db statement [])) statements
 
@@ -130,18 +152,40 @@ openDatabase flags path = do
   free database
   if result /= 0 || handle == nullPtr
     then do
-      message <- if handle == nullPtr then pure "cannot open SQLite database" else databaseError (Database handle)
+      message <- if handle == nullPtr then pure "cannot open SQLite database" else do
+        lock <- newTVarIO Nothing
+        databaseError (Database handle lock)
       _ <- if handle == nullPtr then pure 0 else c_close handle
       throwIO (userError message)
     else do
-      check (Database handle) =<< c_busy_timeout handle 60000
-      let db = Database handle
+      lock <- newTVarIO Nothing
+      let db = Database handle lock
+      check db =<< c_busy_timeout handle 60000
       execute db "pragma foreign_keys = on;" []
       execute db "pragma main.journal_mode = wal;" []
       pure db
 
+withDatabaseLock :: Database -> IO a -> IO a
+withDatabaseLock (Database _ owner) action = bracket acquire release (const action)
+  where
+    acquire = do
+      self <- myThreadId
+      atomically $ do
+        current <- readTVar owner
+        case current of
+          Nothing -> writeTVar owner (Just (self, 1))
+          Just (held, count) | held == self -> writeTVar owner (Just (self, count + 1))
+          _ -> retry
+      pure self
+    release self = atomically $ do
+      current <- readTVar owner
+      case current of
+        Just (held, count) | held == self && count > 1 -> writeTVar owner (Just (self, count - 1))
+        Just (held, 1) | held == self -> writeTVar owner Nothing
+        _ -> pure ()
+
 closeDatabase :: Database -> IO ()
-closeDatabase (Database handle) = do
+closeDatabase database@(Database handle _) = withDatabaseLock database $ do
   _ <- c_close handle
   pure ()
 
@@ -157,23 +201,23 @@ execute database sql values = withStatement database sql $ \statement -> do
   pure ()
 
 withTransaction :: Database -> IO a -> IO a
-withTransaction database action = do
+withTransaction database action = withDatabaseLock database $ do
   execute database "begin;" []
   (action >>= \result -> execute database "commit;" [] >> pure result)
     `onException` execute database "rollback;" []
 
 prepare :: Database -> ByteString -> IO Statement
-prepare database@(Database handle) sql =
+prepare database@(Database handle lock) sql = withDatabaseLock database $
   bracketOnError (mallocBytes 8) free $ \statement -> do
     result <- B.useAsCStringLen sql $ \(text, len) ->
       c_prepare handle text (fromIntegral len) statement nullPtr
     pointer <- peek statement
     if result /= 0 || pointer == nullPtr
       then databaseError database >>= \message -> throwIO (userError ("SQLite prepare `" ++ C.unpack sql ++ "': " ++ message))
-      else pure (Statement sql pointer)
+      else pure (Statement sql pointer lock)
 
 closeStatement :: Statement -> IO ()
-closeStatement (Statement _ statement) = do
+closeStatement (Statement _ statement _) = do
   _ <- c_finalize statement
   pure ()
 
@@ -193,17 +237,17 @@ bindValues database statement values = do
         check database =<< c_bind_text (statementPtr statement) index pointer (fromIntegral len) transient 1
 
 query :: Database -> Statement -> [Value] -> IO [[Value]]
-query database statement values = do
+query database statement values = withDatabaseLock database $ do
   bindValues database statement values
   rows statement []
   where
-    rows (Statement sql handle) acc = do
+    rows current@(Statement sql handle lock) acc = do
       result <- c_step handle
       case result of
         100 -> do
           count <- c_column_count handle
           row <- mapM (column handle) [0 .. count - 1]
-          rows (Statement sql handle) (row:acc)
+          rows (Statement sql handle lock) (row:acc)
         101 -> pure (reverse acc)
         _ | result == 5 || result == 6 -> throwIO (DatabaseBusy ("SQLite step `" ++ C.unpack sql ++ "': database is busy"))
           | otherwise -> databaseError database >>= \message -> throwIO (userError ("SQLite step `" ++ C.unpack sql ++ "': " ++ message))
@@ -235,7 +279,7 @@ queryRows database sql values = do
     bytes (Integer value) = error ("integer SQLite value where bytes expected: " ++ show value)
 
 statementPtr :: Statement -> Ptr ()
-statementPtr (Statement _ pointer) = pointer
+statementPtr (Statement _ pointer _) = pointer
 
 check :: Database -> CInt -> IO ()
 check database result
@@ -243,6 +287,6 @@ check database result
   | otherwise = databaseError database >>= throwIO . userError
 
 databaseError :: Database -> IO String
-databaseError (Database handle) = do
+databaseError (Database handle _) = do
   message <- c_errmsg handle
   if message == nullPtr then pure "unknown SQLite error" else peekCString message
