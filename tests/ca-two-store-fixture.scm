@@ -176,7 +176,7 @@
          (input (make-input))
          (dependent (make-dependent input))
          (local-dependent (make-local-dependent input)))
-    (set-build-options store #:verbosity 5 #:fallback? #t
+    (set-build-options store #:verbosity 5
                        #:use-substitutes? #t #:max-build-jobs 2
                        #:substitute-urls (list (getenv "GOONIX_SERVER_URL")))
     (call-with-output-file (getenv "GOONIX_BUILD_MARKER")

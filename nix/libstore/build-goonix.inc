@@ -244,7 +244,8 @@ void GoonixGraphGoal::retry(const string & reason)
     input.clear();
     oversized = false;
     eof = false;
-    printMsg(lvlError, std::format("goonix: graph cache for `{}': {}", drvPath, reason));
+    printMsg(reason == "cache has no graph" ? lvlInfo : lvlError,
+             std::format("goonix: graph cache for `{}': {}", drvPath, reason));
     state = &GoonixGraphGoal::start;
     waiting = false;
     worker.wakeUp(shared_from_this());
