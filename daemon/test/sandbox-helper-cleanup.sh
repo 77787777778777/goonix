@@ -40,7 +40,7 @@ for i in $(seq 1 600); do
   sleep .05
 done
 test -n "$helper"
-test "$(ps -p "$helper" -o comm=)" = guix-sandbox
+test "$(readlink -f "/proc/$helper/exe")" = "$(readlink -f "$GUIX_SANDBOX")"
 builder_path=$(cat "$fixture/builder-path")
 sleeper=$(sed -n "s/.*exec '\\([^']*\\)' 600.*/\\1/p" "$builder_path")
 test -n "$sleeper"
