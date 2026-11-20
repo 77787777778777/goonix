@@ -23,9 +23,9 @@ module Goonix.Store.Files
   ) where
 
 import Control.Exception (IOException, bracket, bracketOnError, finally, throwIO, try)
-import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar, modifyMVar, modifyMVar_)
+import qualified Data.Map.Strict as Map
 import Control.Monad (foldM, forM_, unless, when)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -128,59 +128,64 @@ gcLock exclusive path action = do
 withTempRootFile :: RawFilePath -> RawFilePath -> (Fd -> IO a) -> IO a
 withTempRootFile path gcPath action = do
   mkdirParents (parent path)
-  bracket (withMVar tempRootLock (const acquire)) (const release) action
+  bracket acquire release (action . rootDescriptor)
   where
-    acquire = do
-      existing <- readIORef tempRoot
-      case existing of
-        Just (fd, count) -> writeIORef tempRoot (Just (fd, count + 1)) >> pure fd
+    acquire = withMVar tempRootLock $ \() -> modifyMVar tempRoot $ \roots ->
+      case Map.lookup path roots of
+        Just root -> pure (Map.insert path root { rootUsers = rootUsers root + 1 } roots, root)
         Nothing -> withGCReadLock gcPath $ do
-          fd <- openFresh
-          modifyIORef' tempRoot (const (Just (fd, 1)))
-          pure fd
-    openFresh = do
+          root <- openRoot
+          pure (Map.insert path root roots, root)
+    openRoot = do
       fd <- withCStringBytes path c_lock_exclusive
-      if fd >= 0 then readLock (Fd fd) >> pure (Fd fd) else do
+      if fd >= 0 then do
+        let descriptor = Fd fd
+        readLock descriptor
+        pure (Root descriptor [] 1)
+      else do
         Errno errno <- getErrno
-        if Errno errno == eAGAIN then Files.removeLink path `catchMissing` pure () >> openFresh
+        if Errno errno == eAGAIN then Files.removeLink path `catchMissing` pure () >> openRoot
           else errnoIO "cannot acquire temporary roots lock"
-    release = withMVar tempRootLock $ \() -> do
-      Just (fd, count) <- readIORef tempRoot
-      if count == 1 then do
-        writeIORef tempRoot Nothing
-        closeFd fd
-        Files.removeLink path `catchMissing` pure ()
-      else writeIORef tempRoot (Just (fd, count - 1))
+    release root = withMVar tempRootLock $ \() -> modifyMVar_ tempRoot $ \roots ->
+      case Map.lookup path roots of
+        Nothing -> throwIO (userError "temporary root file released without an owner")
+        Just current
+          | rootUsers current > 1 -> pure (Map.insert path current { rootUsers = rootUsers current - 1 } roots)
+          | otherwise -> do
+              closeFd (rootDescriptor current)
+              Files.removeLink path `catchMissing` pure ()
+              pure (Map.delete path roots)
+
+data Root = Root
+  { rootDescriptor :: !Fd
+  , rootPaths :: ![ByteString]
+  , rootUsers :: !Int
+  }
 
 {-# NOINLINE tempRoot #-}
-tempRoot :: IORef (Maybe (Fd, Int))
-tempRoot = unsafePerformIO (newIORef Nothing)
+tempRoot :: MVar (Map.Map RawFilePath Root)
+tempRoot = unsafePerformIO (newMVar Map.empty)
 
 {-# NOINLINE tempRootLock #-}
 tempRootLock :: MVar ()
 tempRootLock = unsafePerformIO (newMVar ())
 
 withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
-withTemporaryRoots directory action = withMVar tempRootLock $ \() ->
-  bracket (readRoots []) (mapM_ closeFd . snd) (action . fst)
+withTemporaryRoots directory action = withMVar tempRootLock $ \() -> do
+  own <- withMVar tempRoot $ pure . Map.filterWithKey (\path _ -> (directory <> "/") `B.isPrefixOf` path)
+  bracket (readRoots [] own) (mapM_ closeFd . snd) (action . fst)
   where
-    readRoots locks = do
+    readRoots locks own = do
       entries <- directoryEntries directory
-      foldM readOne ([], locks) entries
+      let external = [file | file <- entries, not (Map.member (directory <> "/" <> file) own)]
+      foldM readOne (concatMap rootPaths (Map.elems own), locks) external
     readOne (roots, locks) file = do
-      own <- readIORef tempRoot
       let path = directory <> "/" <> file
-          sameFd fd = case own of
-            Just (owner, _) -> owner == Fd fd
-            Nothing -> False
       fd <- withCStringBytes path (\p -> c_lock_shared p 0)
       if fd < 0 then do
         Errno errno <- getErrno
         if Errno errno == eNOENT then pure (roots, locks)
           else ioError (userError "cannot open temporary roots file")
-      else if sameFd fd then do
-        ownRoots <- readTemporaryRootFile (Fd fd)
-        pure (roots ++ ownRoots, Fd fd : locks)
       else do
         result <- c_lock_nonblocking fd 1
         if result == 0 then do
@@ -210,11 +215,16 @@ appendTempRoot :: Fd -> RawFilePath -> IO ()
 readLock :: Fd -> IO ()
 readLock (Fd fd) = checkIO "cannot acquire temporary roots read lock" (c_lock_upgrade fd 0)
 
-appendTempRoot (Fd fd) path = do
-  checkIO "cannot upgrade temporary roots lock" (c_lock_upgrade fd 1)
-  result <- B.useAsCStringLen (path <> "\0") $ \(bytes, len) -> c_write_at_end fd (castPtr bytes) (fromIntegral len)
+appendTempRoot fd path = withMVar tempRootLock $ \() -> do
+  found <- modifyMVar tempRoot $ \roots ->
+    case [(name, root) | (name, root) <- Map.toList roots, rootDescriptor root == fd] of
+      [] -> pure (roots, False)
+      (name, root):_ -> pure (Map.insert name root { rootPaths = path : rootPaths root } roots, True)
+  unless found $ throwIO (userError "cannot append to an unowned temporary roots file")
+  checkIO "cannot upgrade temporary roots lock" (c_lock_upgrade (case fd of Fd raw -> raw) 1)
+  result <- B.useAsCStringLen (path <> "\0") $ \(bytes, len) -> c_write_at_end (case fd of Fd raw -> raw) (castPtr bytes) (fromIntegral len)
   when (result < 0) (errnoIO "cannot write temporary root")
-  checkIO "cannot downgrade temporary roots lock" (c_lock_upgrade fd 0)
+  checkIO "cannot downgrade temporary roots lock" (c_lock_upgrade (case fd of Fd raw -> raw) 0)
 
 foreign import ccall safe "pread"
   c_read :: CInt -> Ptr () -> Word64 -> Word64 -> IO Int

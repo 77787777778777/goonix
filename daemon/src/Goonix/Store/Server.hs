@@ -15,7 +15,7 @@ module Goonix.Store.Server
   ) where
 
 import Control.Concurrent (forkFinally)
-import Control.Concurrent.MVar (MVar, newMVar)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
 import Control.Exception (IOException, SomeException, bracket, catch, fromException, throwIO, try)
 import Control.Monad (forever, unless, when)
 import Data.Bits ((.&.))
@@ -121,7 +121,9 @@ handleClient config counter client = do
   settingsRef <- newIORef settings
   pid <- getProcessID
   credentialId <- pure (maybe 0 id credential)
-  let rootName = C.pack (show pid)
+  rootName <- modifyMVar counter $ \value -> do
+    let next = value + 1
+    pure (next, C.pack (show pid <> "-" <> show next))
   catch
     (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
       bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->

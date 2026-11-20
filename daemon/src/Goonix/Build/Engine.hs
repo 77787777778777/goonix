@@ -136,6 +136,7 @@ buildDerivation config rootFd store settings trace hook mode wanted drvPath = do
   unless stillValid $ throwIO (storeError ("cannot build missing derivation `" ++ C.unpack drvPath ++ "'"))
   bytes <- B.readFile (C.unpack drvPath)
   drv <- either (throwIO . storeError) pure (parseDerivation bytes)
+  mapM_ (appendTempRoot rootFd . outputPath) (Map.elems (outputs drv))
   forM_ (Map.toList (inputDrvs drv)) $ \(input, selected) -> buildDerivation config rootFd store settings trace hook Normal selected input
   forM_ (Set.toList (inputSrcs drv)) $ \input -> do
     present <- isValidPath store input
@@ -340,6 +341,8 @@ runBuilder rootFd store settings trace mode drvPath drv = do
       replacements = zip outPaths redirected
       actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
   mapM_ (appendTempRoot rootFd) outPaths
+  inputRoots <- derivationInputs store Set.empty drv
+  mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
   mapM_ deleteTree redirected
   work <- makeBuildDirectory store
   prepareReferenceGraphs store work drv
