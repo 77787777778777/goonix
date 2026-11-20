@@ -98,3 +98,15 @@ int goonix_is_listening(int fd) {
   if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &size) < 0) return -1;
   return value;
 }
+
+/* Inspect the next byte without consuming it or blocking. Input is not a
+   disconnect: the caller stops its runtime-managed watcher in that case. */
+int goonix_peek_socket(int fd) {
+  char byte;
+  ssize_t result;
+  do { result = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT); }
+  while (result < 0 && errno == EINTR);
+  if (result == 0) return 0;
+  if (result > 0) return 1;
+  return errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 3;
+}

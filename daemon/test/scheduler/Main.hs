@@ -53,15 +53,15 @@ main = do
   let (topWaiting, topStarts) = step (Completed "input") inputRunning
   assert "continuation starts only after dependency" (topStarts == [Start "top"])
   let downloads = either error id $ do
-        withBuild <- addJob "build" BuildJob [] (initialState 1 Nothing True)
-        addJob "download" DownloadJob [] withBuild
+        withBuild <- addJob "z-build" BuildJob [] (initialState 1 Nothing True)
+        addJob "a-download" DownloadJob [] withBuild
       (_, defaultStarts) = step Tick downloads
-  assert "default download shares build slot" (length defaultStarts == 1)
+  assert "default request order controls shared slot" (defaultStarts == [Start "z-build"])
   separate <- either (error . ("add separate jobs: " ++)) pure $ do
-    withBuild <- addJob "build" BuildJob [] (initialState 1 (Just 1) True)
-    addJob "download" DownloadJob [] withBuild
+    withBuild <- addJob "z-build" BuildJob [] (initialState 1 (Just 1) True)
+    addJob "a-download" DownloadJob [] withBuild
   let (_, separateStarts) = step Tick separate
-  assert "separate download slot overlaps build" (separateStarts == [Start "build", Start "download"])
+  assert "separate download slot overlaps build" (separateStarts == [Start "z-build", Start "a-download"])
   merged <- either (error . ("merge shared job: " ++)) pure $
     addJob "build" BuildJob [] (initialState 1 (Just 1) True)
   let (mergedRunning, _) = step Tick merged

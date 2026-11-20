@@ -12,7 +12,7 @@ module Goonix.Build.Runtime
 
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar, readMVar)
-import Control.Concurrent.STM (TQueue, TVar, atomically, newTQueueIO, newTVarIO, readTQueue, readTVar, retry, writeTQueue, writeTVar)
+import Control.Concurrent.STM (TQueue, TVar, atomically, newTQueueIO, newTVarIO, readTQueue, readTVar, retry, tryReadTQueue, writeTQueue, writeTVar)
 import Control.Exception (SomeException, fromException, mask, onException, throwIO, try, toException, finally, uninterruptibleMask_)
 import Control.Monad (foldM, forM, forM_, unless, void)
 import Data.ByteString (ByteString)
@@ -33,6 +33,8 @@ data Outcome a = Done | Need a deriving (Eq, Show)
 type Dependency = (ByteString, Set.Set ByteString, JobKind)
 data Result = Result !ByteString !(Either SomeException (Outcome [Dependency]))
 
+data RuntimeEvent = Cancelled | Finished | Progress Result | Stalled [ByteString]
+
 data Runtime = Runtime
   { rtSpecs :: !(TVar (Map.Map ByteString JobSpec))
   , rtQueue :: !(TQueue Result)
@@ -52,7 +54,7 @@ runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs cance
   runtime <- Runtime <$> newTVarIO Map.empty <*> newTQueueIO
     <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> pure keepGoing <*> newTVarIO False
   forM_ initialSpecs (register runtime)
-  watcher <- forkIO $ cancel >> atomically (writeTVar (rtCancelled runtime) True) >> cancelActive runtime
+  watcher <- forkIO $ cancel >> atomically (writeTVar (rtCancelled runtime) True)
   dispatch runtime state `onException` uninterruptibleMask_ (cancelActive runtime)
     `finally` killThread watcher
   where
@@ -69,12 +71,23 @@ runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs cance
         stopped <- readTVar (rtCancelled runtime)
         active <- readTVar (rtActive runtime)
         let unfinished = Map.filter (\job -> status job == Waiting || status job == Running) (jobs next)
-        if stopped || (Map.null unfinished && Map.null active)
-          then pure Nothing
-          else if Map.null active then retry else Just <$> readTQueue (rtQueue runtime)
+        if stopped
+          then pure Cancelled
+          else if Map.null unfinished && Map.null active
+            then pure Finished
+            else do
+              queued <- tryReadTQueue (rtQueue runtime)
+              case queued of
+                Just result -> pure (Progress result)
+                Nothing | Map.null active -> pure (Stalled (Map.keys unfinished))
+                Nothing -> retry
       case event of
-        Nothing -> finish runtime
-        Just result -> handleResult runtime next result >>= dispatch runtime
+        Cancelled -> do
+          uninterruptibleMask_ (cancelActive runtime)
+          throwIO (storeError "client disconnected during build")
+        Finished -> finish runtime
+        Progress result -> handleResult runtime next result >>= dispatch runtime
+        Stalled waiting -> throwIO (storeError ("build cannot continue; waiting jobs: " <> C.unpack (C.intercalate ", " waiting)))
 
     finish runtime = do
       failures <- Map.elems <$> atomically (readTVar (rtFailures runtime))
@@ -93,7 +106,7 @@ runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs cance
           atomically $ writeTVar (rtFailures runtime) =<<
             Map.insert name exception <$> readTVar (rtFailures runtime)
           forM_ actions (perform runtime)
-          unless (rtKeepGoing runtime) $ do
+          unless (rtKeepGoing runtime) $ uninterruptibleMask_ $ do
             cancelActive runtime
             throwIO (originalError exception)
           pure next

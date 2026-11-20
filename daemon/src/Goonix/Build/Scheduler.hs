@@ -39,6 +39,7 @@ data State = State
   , slots :: !Int
   , downloadSlots :: !(Maybe Int)
   , keepGoing :: !Bool
+  , jobOrder :: ![JobId]
   } deriving (Eq, Show)
 
 data Event = Tick | Completed JobId | FailedEvent JobId | NeedsDependencies JobId [JobId]
@@ -48,14 +49,17 @@ data Action = Start JobId | Finish JobId | Fail JobId | ReportFailure JobId
   deriving (Eq, Show)
 
 initialState :: Int -> Maybe Int -> Bool -> State
-initialState slots downloads keepGoing = State Map.empty (max 0 slots) (max 0 <$> downloads) keepGoing
+initialState slots downloads keepGoing = State Map.empty (max 0 slots) (max 0 <$> downloads) keepGoing []
 
 addJob :: JobId -> JobKind -> [JobId] -> State -> Either String State
 addJob name kind required state
   | Map.member name (jobs state) = Right state { jobs = Map.adjust merge name (jobs state) }
   | name `elem` required = Left "self-dependent derivation job"
   | any (`Map.notMember` jobs state) required = Left "unknown dependency"
-  | otherwise = Right state { jobs = Map.insert name (Job required Waiting kind) (jobs state) }
+  | otherwise = Right state
+      { jobs = Map.insert name (Job required Waiting kind) (jobs state)
+      , jobOrder = jobOrder state ++ [name]
+      }
   where
     merge job
       | status job == Waiting = job { dependencies = dependencies job ++ filter (`notElem` dependencies job) required }
@@ -86,7 +90,7 @@ step event state = schedule $ case event of
 
 schedule :: State -> (State, [Action])
 schedule state =
-  let candidates = [name | (name, job) <- Map.toList (jobs state), status job == Waiting,
+  let candidates = [name | name <- jobOrder state, Just job <- [Map.lookup name (jobs state)], status job == Waiting,
         all (succeeded state) (dependencies job)]
       (chosen, _) = choose state [] candidates
       state' = state { jobs = foldl (\js name -> Map.adjust (\job -> job { status = Running }) name js) (jobs state) chosen }
