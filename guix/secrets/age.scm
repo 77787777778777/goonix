@@ -6,6 +6,7 @@
   #:use-module (gcrypt hash)
   #:use-module (gcrypt mac)
   #:use-module (gcrypt random)
+  #:use-module (gcrypt pk-crypto)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
@@ -18,9 +19,15 @@
   #:export (generate-x25519-identity
             x25519-identity-public
             parse-x25519-identity
+            valid-x25519-identity?
             parse-age-recipient
             encrypt-age
             read-ssh-identity
+            read-ssh-identity-text
+            generate-ssh-key-pair
+            ssh-public-key-text
+            ssh-recipient-fingerprint
+            ssh-identity-public-text
             unwrap-ssh-stanza
             encrypt-x25519
             decrypt-x25519
@@ -138,9 +145,15 @@
 (define (generate-x25519-identity)
   (bech32 "AGE-SECRET-KEY-" (gen-random-bv 32)))
 (define (x25519-identity-public identity)
-  (bech32 "age" (x25519-public-key (unbech32 "AGE-SECRET-KEY-" identity))))
+  (bech32 "age" (x25519-public-key (unbech32 "AGE-SECRET-KEY-"
+                                             (string-trim-right identity #\newline)))))
+(define (valid-x25519-identity? text)
+  (false-if-exception
+   (and (string-prefix? "AGE-SECRET-KEY-" text)
+        (= 32 (bytevector-length
+               (unbech32 "AGE-SECRET-KEY-" (string-trim-right text #\newline)))))))
 (define (parse-x25519-identity text)
-  (find (lambda (line) (string-prefix? "AGE-SECRET-KEY-" line))
+  (find (lambda (line) (valid-x25519-identity? line))
         (string-split text #\newline)))
 (define (parse-age-recipient text) (unbech32 "age" text))
 
@@ -186,12 +199,18 @@
 ;; All stanza details below follow age v1.3.2 agessh/agessh.go:
 ;; sshFingerprint and Ed25519Recipient.Wrap (lines 35-38 and 205-250).
 ;; The tag is raw base64 of SHA-256(SSH blob)[:4]; the tweak is HKDF with
-;; empty salt, SSH blob as IKM and the SSH label as info.  Go's hkdf.New
-;; takes IKM before salt, hence hkdf(blob, empty, label) below.  The wrapping
+;; empty secret, SSH blob as salt and the SSH label as info.  Go's hkdf.New
+;; takes secret before salt, hence hkdf(blob, empty, label) below.  The wrapping
 ;; key instead uses ephemeral || converted recipient as salt.
 (define ssh-label (utf8 "age-encryption.org/v1/ssh-ed25519"))
 (define (ssh-fingerprint blob)
   (raw64 (bytevector-slice (bytevector-hash blob (hash-algorithm sha256)) 0 4)))
+(define (ssh-recipient-fingerprint text)
+  (ssh-fingerprint (car (parse-ssh-public text))))
+(define (ssh-identity-public-text identity)
+  (match identity
+    (('ssh blob public secret) (ssh-public-key-text public))
+    (_ (error "not an SSH identity"))))
 (define (wrap-ssh file-key blob converted-public)
   (let* ((secret (gen-random-bv 32))
          (ephemeral (x25519-public-key secret))
@@ -218,9 +237,8 @@
                       (drop lines (+ start stop 2))))
     (base64-decode (string-concatenate
                     (take (drop lines (+ start 1)) stop)) base64-alphabet)))
-(define (read-ssh-identity file)
-  (let ((bytes (read-pem-base64 (call-with-input-file file get-string-all)
-                                "OPENSSH PRIVATE KEY")))
+(define (read-ssh-identity-text text)
+  (let ((bytes (read-pem-base64 text "OPENSSH PRIVATE KEY")))
     (let-values (((cipher offset) (read-ssh-field bytes 15)))
       (let-values (((kdf offset) (read-ssh-field bytes offset)))
         (let-values (((options offset) (read-ssh-field bytes offset)))
@@ -256,6 +274,52 @@
                         (list 'ssh public-blob public
                               (ed25519-seed->x25519
                                (bytevector-slice key-pair 0 32)))))))))))))))
+(define (read-ssh-identity file)
+  (read-ssh-identity-text (call-with-input-file file get-string-all)))
+
+(define (ssh-public-key-text public)
+  (string-append "ssh-ed25519 " (base64-encode (ssh-key-blob public)
+                                               0 (bytevector-length (ssh-key-blob public))
+                                               #f #f base64-alphabet #f) "\n"))
+(define (generate-ssh-key-pair)
+  "Return an unencrypted OpenSSH private-key text and its public-key text.
+The seed and public point come from libgcrypt's Ed25519 implementation."
+  (let* ((key (generate-key (string->canonical-sexp
+                             "(genkey (ecc (curve Ed25519) (flags eddsa)))")))
+         (private (find-sexp-token key 'private-key))
+         (ecc (find-sexp-token private 'ecc))
+         (seed (cadr (canonical-sexp->sexp (find-sexp-token ecc 'd))))
+         (public (cadr (canonical-sexp->sexp (find-sexp-token ecc 'q)))))
+    (unless (and (= 32 (bytevector-length seed)) (= 32 (bytevector-length public))
+                 (equal? (x25519-public-key (ed25519-seed->x25519 seed))
+                         (ed25519-public->x25519 public)))
+      (error "libgcrypt returned an inconsistent Ed25519 key pair"))
+    (let* ((check (gen-random-bv 4))
+         (body (bv-append check check
+                          (ssh-string (utf8 "ssh-ed25519"))
+                          (ssh-string public)
+                          (ssh-string (bv-append seed public))
+                          (ssh-string (utf8 "goonix"))))
+         (padding (let loop ((n 1) (out '()))
+                    (if (zero? (modulo (+ (bytevector-length body) (length out)) 8))
+                        (list->u8vector (reverse out))
+                        (loop (+ n 1) (cons (modulo n 255) out)))))
+         (bytes (bv-append (utf8 "openssh-key-v1\0")
+                           (ssh-string (utf8 "none"))
+                           (ssh-string (utf8 "none"))
+                           (ssh-string (zero 0)) (ssh-u32 1)
+                           (ssh-string (ssh-key-blob public))
+                           (ssh-string (bv-append body padding))))
+         (encoded (armor64 bytes)))
+      (values (string-append "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                           (let loop ((rest encoded) (lines '()))
+                             (if (string-null? rest)
+                                 (string-concatenate (reverse lines))
+                                 (loop (substring rest (min 70 (string-length rest)))
+                                       (cons (string-append (substring rest 0 (min 70 (string-length rest))) "\n") lines))))
+                           "-----END OPENSSH PRIVATE KEY-----\n")
+            (ssh-public-key-text public)))))
+
 (define (wrap-lines body)
   (let ((s (armor64 body)))
     (let loop ((s s))
@@ -434,7 +498,8 @@
 (define (unwrap-stanza identity stanza)
   (match stanza
     (("X25519" (ephemeral-text) body)
-     (let* ((secret (unbech32 "AGE-SECRET-KEY-" identity))
+     (let* ((secret (unbech32 "AGE-SECRET-KEY-"
+                               (string-trim-right identity #\newline)))
             (ephemeral (pad64 ephemeral-text))
             (public (x25519-public-key secret))
             (shared (x25519 secret ephemeral))

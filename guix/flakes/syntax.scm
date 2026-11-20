@@ -28,7 +28,7 @@
             flake-input-introduction flake-input-same-as
             flake-option? flake-option-name flake-option-type
             flake-option-default flake-option-description
-            read-data-file read-data-string read-flake
+            read-data-file read-data-string read-data-port read-flake
             sexp->input flake-input->sexp))
 
 (define-record-type* <flake> flake make-flake

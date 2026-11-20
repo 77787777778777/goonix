@@ -25,7 +25,9 @@ MODULES +=					\
   guix/scripts/flake.scm			\
   guix/scripts/run.scm				\
   guix/secrets/gcrypt.scm			\
-  guix/secrets/age.scm
+  guix/secrets/age.scm				\
+  guix/secrets/vault.scm			\
+  guix/scripts/secrets.scm
 
 SCM_TESTS +=					\
   tests/ca.scm					\
@@ -45,7 +47,8 @@ SCM_TESTS +=					\
   tests/pure-eval.scm				\
   tests/store-path-check.scm			\
   tests/secrets-age.scm				\
-  tests/secrets-age-vectors.scm
+  tests/secrets-age-vectors.scm			\
+  tests/secrets-vault.scm
 
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
@@ -57,7 +60,8 @@ SH_TESTS +=					\
   tests/guix-flake-shell.sh			\
   tests/guix-flake.sh				\
   tests/guix-secrets-age.sh			\
-  tests/guix-secrets-ssh-age.sh
+  tests/guix-secrets-ssh-age.sh		\
+  tests/guix-secrets.sh
 
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
@@ -73,6 +77,7 @@ EXTRA_DIST +=					\
   tests/fixtures/ca-self-token.bz2			\
   tests/fixtures/ca-self-token.zip			\
   tests/fixtures/ca-placeholder-boundary.gz		\
+  tests/fixtures/age-identity.scrypt		\
   $(wildcard $(srcdir)/tests/fixtures/age/*)
 
 if CAN_RUN_TESTS
