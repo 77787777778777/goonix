@@ -12,6 +12,7 @@
 (define-module (test-flake-eval)
   #:use-module (guix flakes lock)
   #:use-module (guix flakes resolve)
+  #:use-module (guix flakes syntax)
   #:use-module (guix flakes evaluate)
   #:use-module ((guix pure-eval) #:select (pure-eval-supported?))
   #:use-module ((guix git) #:select (%repository-cache-directory))
@@ -141,6 +142,88 @@ body, after the definitions the tests share."
   "Build DERIVATION and return the text of its output."
   (build-derivations %store (list derivation))
   (contents (output-name derivation)))
+
+
+(test-assert "secret references do not depend on identities"
+  (let ((directory #f))
+    (with-workspace root
+      (set! directory root)
+      (flake! root '()
+              "`((packages (sample . ,(tool \"sample\" (secret in 'token)))))")
+      (let ((first (evaluate-flake %store root 'packages 'sample)))
+        (setenv "GUIX_SECRETS_IDENTITY" "/tmp/other-identity")
+        (let ((second (evaluate-flake %store root 'packages 'sample)))
+          (unsetenv "GUIX_SECRETS_IDENTITY")
+          (and (string=? (derivation-file-name first)
+                         (derivation-file-name second))
+               (begin
+                 (build-derivations %store (list first))
+                 (string-contains (contents (derivation->output-path first))
+                                  "/run/secrets/token"))))))))
+
+(test-assert "a public half is available as a tracked file"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret-public in 'guest)))))")
+    (write-file (string-append directory "/secrets/guest.pub")
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpublic\n")
+    (git directory "add" "secrets/guest.pub")
+    (git directory "-c" "user.name=Goonix" "-c" "user.email=goonix@example.org"
+         "commit" "-m" "public half")
+    (let ((derivation (evaluate-flake %store directory 'packages 'sample)))
+      (build-derivations %store (list derivation))
+      (and (string-contains (contents (derivation->output-path derivation))
+                            "/secrets/guest.pub")
+           (not (string-contains (contents (derivation->output-path derivation))
+                                 "PRIVATE KEY"))))))
+
+(test-equal "local options feed flake evaluation without changing the repository"
+  "machine-value"
+  (with-workspace directory
+    (flake! directory '((options (machine string "default" "Machine value")))
+            "`((packages (sample . ,(tool \"sample\" (option in 'machine)))))")
+    (write-file (string-append directory "/flake.local.scm")
+                "(flake-local (version 1) (options (machine \"machine-value\")))")
+    (built (evaluate-flake %store directory 'packages 'sample))))
+
+(test-assert "local input overrides still parse alongside options"
+  (with-workspace directory
+    (let ((input (string-append directory "/input")))
+      (mkdir input)
+      (write-file (string-append directory "/flake.local.scm")
+                  "(flake-local (version 1) (inputs (dep (local \"input\"))) (options (machine \"x\")))")
+      (and (string=? "input" (flake-input-path (assq-ref (read-local-overrides directory) 'dep)))
+           (string=? "x" (assq-ref (read-local-options directory) 'machine))))))
+
+(test-assert "duplicate local options are refused"
+  (with-workspace directory
+    (write-file (string-append directory "/flake.local.scm")
+                "(flake-local (version 1) (options (machine \"x\")) (options (machine \"y\")))")
+    (raises? (read-local-options directory))))
+
+(test-assert "secret names cannot escape their runtime directory"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret in '../etc/passwd')))))")
+    (raises? (evaluate-flake %store directory 'packages 'sample))))
+
+(test-assert "secret-public refuses a private identity in the public path"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\" (secret-public in 'guest)))))")
+    (write-file (string-append directory "/secrets/guest.pub")
+                "AGE-SECRET-KEY-1not-a-real-key\n")
+    (git directory "add" "secrets/guest.pub")
+    (git directory "-c" "user.name=Goonix" "-c" "user.email=goonix@example.org"
+         "commit" "-m" "private half in public path")
+    (raises? (evaluate-flake %store directory 'packages 'sample))))
+
+(test-assert "secret contents cannot be opened during evaluation"
+  (with-workspace directory
+    (flake! directory '()
+            "`((packages (sample . ,(tool \"sample\"
+  (call-with-input-file (secret in 'token) get-string-all)))))")
+    (raises? (evaluate-flake %store directory 'packages 'sample))))
 
 
 ;;;

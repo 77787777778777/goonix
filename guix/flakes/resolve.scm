@@ -30,6 +30,7 @@
             lock-flake
             effective-flake-lock
             read-local-overrides
+            read-local-options
             parse-input-override
 
             lock-node-tree
@@ -620,22 +621,51 @@ path, or the fields of an input as in flake.scm, such as (git \"URL\")
              (read-data-string (string-append "(" spec ")"))
              `((local ,spec))))))
 
-(define (read-local-overrides directory)
-  "Return the overrides of 'flake.local.scm' in DIRECTORY, an alist of names
-and <flake-input> records; the empty list when there is no such file."
+(define (read-local-members directory)
+  "Return the INPUTS and OPTIONS members of DIRECTORY's local data file."
   (let ((file (string-append directory "/flake.local.scm")))
     (if (file-exists? file)
         (match (read-data-file file)
-          (('flake-local ('version 1) ('inputs . inputs))
-           (map (lambda (datum)
-                  (let ((input (sexp->input datum)))
-                    (cons (flake-input-name input) input)))
-                inputs))
+          (('flake-local ('version 1) members ...)
+           (for-each (lambda (member)
+                       (match member
+                         (((or 'inputs 'options) . _) #t)
+                         (_ (raise (formatted-message
+                                    (G_ "~a: unknown local member") file)))))
+                     members)
+           (when (> (length (filter (lambda (member)
+                                     (and (pair? member) (eq? 'options (car member))))
+                                   members)) 1)
+             (raise (formatted-message (G_ "~a: duplicate options member") file)))
+           (when (> (length (filter (lambda (member)
+                                     (and (pair? member) (eq? 'inputs (car member))))
+                                   members)) 1)
+             (raise (formatted-message (G_ "~a: duplicate inputs member") file)))
+           (values (or (assq 'inputs members) '(inputs))
+                   (or (assq 'options members) '(options))))
           (_ (raise (formatted-message
-                     (G_ "~a: expected (flake-local (version 1) (inputs \
-...))")
-                     file))))
-        '())))
+                     (G_ "~a: expected (flake-local (version 1) ...)") file))))
+        (values '(inputs) '(options)))))
+
+(define (read-local-options directory)
+  "Return the data-only local options in DIRECTORY's flake.local.scm."
+  (let-values (((inputs options) (read-local-members directory)))
+    (let ((file (string-append directory "/flake.local.scm")))
+      (map (lambda (datum)
+             (match datum
+               (((? symbol? name) value) (cons name value))
+               (_ (raise (formatted-message
+                          (G_ "~a: expected (NAME VALUE) local option") file)))))
+           (cdr options)))))
+
+(define (read-local-overrides directory)
+  "Return the overrides of 'flake.local.scm' in DIRECTORY, an alist of names
+and <flake-input> records; the empty list when there is no such file."
+  (let-values (((inputs options) (read-local-members directory)))
+    (map (lambda (datum)
+           (let ((input (sexp->input datum)))
+             (cons (flake-input-name input) input)))
+         (cdr inputs))))
 
 (define (overrides-key directory overrides)
   ;; What an effective lock depends on: the flake, its lock, and what the

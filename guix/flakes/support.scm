@@ -20,12 +20,14 @@
   #:use-module (guix search-paths)
   #:use-module ((guix utils) #:select (%current-system))
   #:use-module (ice-9 match)
+  #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   ;; 'system' is also the name of a procedure of Guile; a flake means this
   ;; one.
   #:replace (system)
   #:export (option target
+            secret secret-public
             input-source input-output
             self self-file self-revision source-set
 
@@ -78,6 +80,33 @@
   (match (assq name (context-options context))
     ((_ . value) value)
     (#f (error "the flake declares no such option" name))))
+
+(define (secret-name-string name)
+  (unless (and (symbol? name)
+               (let ((text (symbol->string name)))
+                 (and (not (string-null? text))
+                      (string-every (lambda (char)
+                                      (or (char-alphabetic? char)
+                                          (char-numeric? char)
+                                          (memv char '(#\- #\_ #\+ #\. #\? #\!))))
+                                    text))))
+    (error "secret name must be a safe relative name" name))
+  (symbol->string name))
+
+(define (secret context name)
+  "Return the runtime path of NAME, never its contents."
+  (string-append "/run/secrets/" (secret-name-string name)))
+
+(define (secret-public context name)
+  "Return the tracked public half of NAME, without opening an identity."
+  (let ((file (self-file context
+                         (string-append "secrets/" (secret-name-string name) ".pub"))))
+    (unless (and (file-exists? file)
+                 (let ((text (call-with-input-file file get-string-all)))
+                   (and (not (string-contains text "PRIVATE KEY"))
+                        (not (string-prefix? "AGE-SECRET-KEY-" text)))))
+      (error "secret-public: no tracked public half" name))
+    file))
 
 (define (input context name)
   (or (assq name (context-inputs context))

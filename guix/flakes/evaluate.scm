@@ -538,7 +538,10 @@ lock'")
               (instance (id "")
                         (tree (import-tracked-tree store directory))
                         (edges (flake-lock-inputs lock))
-                        (options options)
+                        (options (append options
+                                         (remove (lambda (entry)
+                                                   (assq (car entry) options))
+                                                 (read-local-options directory))))
                         (revision (tracked-tree-revision directory)))))))
 
 (define* (flake-answers store directory want
