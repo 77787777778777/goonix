@@ -6,6 +6,7 @@ module Goonix.Store.Server
   ( serve
   , serveSocket
   , serveListener
+  , openListener
   , activationSockets
   , handleConnection
   , ServerConfig (..)

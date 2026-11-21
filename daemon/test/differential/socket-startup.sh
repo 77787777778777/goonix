@@ -88,12 +88,58 @@ start_and_connect() {
 }
 
 status=0
+# Two --listen paths in different directories: both sockets must appear (0666)
+# and accept a client.  Binding mutates the process-wide umask and cwd, so the
+# daemon must open every listener sequentially before forking accept loops;
+# otherwise the two binds race (one binds ./socket in the other's directory).
+start_two_listeners() {
+  local name=$1 daemon=$2
+  local fixture=$out/$name
+  mkdir -p "$fixture"
+  "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture/base" >/dev/null
+  export NIX_STORE_DIR="$fixture/base/store"
+  export GUIX_DATABASE_DIRECTORY="$fixture/base/db"
+  export GUIX_STATE_DIRECTORY="$fixture/var"
+  export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
+  export GUIX_CONFIGURATION_DIRECTORY="$fixture/etc"
+  local s1="$fixture/var/daemon-socket/socket"
+  local s2="$fixture/var/other-socket/socket"
+  export GUIX_DAEMON_SOCKET="$s1"
+  goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --listen="$s1" --listen="$s2" >"$fixture/daemon.log" 2>&1
+  local pid=$GOONIX_TEST_PID scope=$GOONIX_TEST_SCOPE
+  local i
+  for i in $(seq 1 300); do test -S "$s1" && test -S "$s2" && break; kill -0 "$pid" 2>/dev/null || break; sleep .01; done
+  if ! test -S "$s1" || ! test -S "$s2"; then
+    echo "FAIL: $name: both sockets did not appear (s1=$(test -S "$s1" && echo yes || echo no) s2=$(test -S "$s2" && echo yes || echo no))" >&2
+    cat "$fixture/daemon.log" >&2 || true
+    goonix_stop_capped "$pid" "$scope"
+    return 1
+  fi
+  local m1 m2
+  m1=$(stat -c '%a' "$s1"); m2=$(stat -c '%a' "$s2")
+  if test "$m1" != 666 || test "$m2" != 666; then
+    echo "FAIL: $name: socket modes $m1/$m2, want 666/666" >&2
+    goonix_stop_capped "$pid" "$scope"
+    return 1
+  fi
+  if ! "$out/socket-connect" "$s1" >"$fixture/c1.out" 2>"$fixture/c1.err" \
+     || ! "$out/socket-connect" "$s2" >"$fixture/c2.out" 2>"$fixture/c2.err"; then
+    echo "FAIL: $name: a client could not connect to both sockets" >&2
+    cat "$fixture/c1.err" "$fixture/c2.err" >&2 || true
+    goonix_stop_capped "$pid" "$scope"
+    return 1
+  fi
+  goonix_stop_capped "$pid" "$scope"
+  echo "PASS: $name"
+}
+
 for pair in "cxx:$cxx" "hs:$hs"; do
   name=${pair%%:*}; daemon=${pair#*:}
   start_and_connect "$name-empty" "$daemon" "$out/$name-empty/var/daemon-socket/socket" || status=1
   start_and_connect "$name-long" "$daemon" "$out/$name-long/$long/var/daemon-socket/socket" "" c || status=1
   start_and_connect "$name-stale" "$daemon" "$out/$name-stale/var/daemon-socket/socket" stale || status=1
   start_and_connect "$name-umask" "$daemon" "$out/$name-umask/var/daemon-socket/socket" umask || status=1
+  start_two_listeners "$name-two" "$daemon" || status=1
 done
 if test "$status" -eq 0; then
   printf 'socket start-up differential: PASS\n'
