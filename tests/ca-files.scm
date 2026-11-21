@@ -101,10 +101,10 @@
          (let* ((fetched-files '())
                 (n (assemble-file-tree
                     files dst
-                    (lambda (entry dest)
+                    (lambda (entry)
                       (set! fetched-files (cons (car entry) fetched-files))
-                      ;; Fetch from src (the "server").
-                      (copy-file (string-append src "/" (car entry)) dest))
+                      ;; Fetch from src (the "server"): return an input port.
+                      (open-input-file (string-append src "/" (car entry))))
                     #:links-dir links)))
            (test-equal "exactly one file fetched (the one not in .links)"
              1 n)
@@ -137,8 +137,8 @@
               ;; First assembly: nothing in .links, all three fetched.
               (n1 (assemble-file-tree
                    files1 dst1
-                   (lambda (entry dest)
-                     (copy-file (string-append v1 "/" (car entry)) dest))
+                   (lambda (entry)
+                     (open-input-file (string-append v1 "/" (car entry))))
                    #:links-dir links)))
          (test-equal "first assembly fetches all three" 3 n1)
          ;; Populate .links from dst1 (as the daemon's dedup would).
@@ -152,9 +152,9 @@
          (let* ((fetched '())
                 (n2 (assemble-file-tree
                      files2 dst2
-                     (lambda (entry dest)
+                     (lambda (entry)
                        (set! fetched (cons (car entry) fetched))
-                       (copy-file (string-append v2 "/" (car entry)) dest))
+                       (open-input-file (string-append v2 "/" (car entry))))
                      #:links-dir links)))
            (test-equal "re-assembly after a one-file change fetches one file"
              1 n2)
@@ -203,5 +203,114 @@
              (and (= 1 (length entries))
                   (eq? 'symlink (cadr (car entries)))
                   (string=? "" (car (car entries)))))))))))
+
+;;; A malicious cache: the file list is untrusted.  Each bad list must be
+;;; refused whole BEFORE the first write, with nothing written or chmodded
+;;; outside the destination.  These fail on 4d445f5fdfb (no validation, the
+;;; path/hash went straight into mkdir-p / link / chmod).
+(define %good-hash (make-string 52 #\a))
+
+(test-group "a malicious file list is refused whole, nothing written outside"
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((dst (string-append root "/dst"))
+           (outside (string-append root "/outside"))
+           (links (string-append root "/links")))
+       (mkdir dst) (mkdir outside) (mkdir links)
+       ;; A marker file outside the destination, with a known mode.
+       (call-with-output-file (string-append outside "/marker")
+         (lambda (p) (display "OUTSIDE-MARKER" p)))
+       (chmod (string-append outside "/marker") #o644)
+       (define (entries dir)
+         (scandir dir (lambda (e) (not (member e '("." ".."))))))
+       (define (outside-untouched?)
+         (and (string=? "OUTSIDE-MARKER"
+                        (read-all (string-append outside "/marker")))
+              (= #o644 (logand (stat:mode (stat (string-append outside "/marker")))
+                               #o777))
+              ;; No new files appeared outside.
+              (equal? '("marker") (entries outside))))
+       (define (refused? files)
+         ;; assemble-file-tree must raise before writing anything.
+         (catch #t
+           (lambda ()
+             (assemble-file-tree
+              files dst
+              (lambda (entry)
+                (open-input-file (string-append outside "/marker")))
+              #:links-dir links)
+             #f)                            ;did NOT raise -> bad
+           (lambda (k . a) #t)))            ;raised -> refused
+       (test-assert "a .. path is refused"
+         (refused? (list (list "../outside/evil" 'regular %good-hash 5))))
+       (test-assert "nothing written outside after a .. path"
+         (outside-untouched?))
+       (test-assert "a hash containing / is refused"
+         (refused? (list (list "a" 'regular "../../etc/shadow" 5))))
+       (test-assert "a hash containing .. is refused"
+         (refused? (list (list "a" 'regular
+                                 (string-append ".." (make-string 50 #\a)) 5))))
+       (test-assert "an unknown type is refused"
+         (refused? (list (list "a" 'fifo %good-hash 5))))
+       (test-assert "a wrong-length hash is refused"
+         (refused? (list (list "a" 'regular (make-string 51 #\a) 5))))
+       (test-assert "a non-base32 hash is refused"
+         (refused? (list (list "a" 'regular (make-string 52 #\e) 5))))
+       (test-assert "a negative size is refused"
+         (refused? (list (list "a" 'regular %good-hash -1))))
+       (test-assert "nothing written outside after all bad lists"
+         (outside-untouched?))
+       (test-assert "the destination is still empty"
+         (null? (entries dst)))))))
+
+(test-group "string->file-list refuses a malicious serialized list"
+  (test-assert "a .. path line yields #f"
+    (not (string->file-list
+          (string-append %file-list-version "\n../outside/evil regular "
+                         %good-hash " 5\n"))))
+  (test-assert "a hash with / yields #f"
+    (not (string->file-list
+          (string-append %file-list-version "\na regular ../../etc/shadow 5\n"))))
+  (test-assert "an unknown type yields #f"
+    (not (string->file-list
+          (string-append %file-list-version "\na fifo " %good-hash " 5\n"))))
+  (test-assert "a good list still parses"
+    (valid-file-list?
+     (string->file-list
+      (string-append %file-list-version "\na regular " %good-hash " 5\n")))))
+
+(test-group "a symlink followed by a file beneath it is refused"
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((dst (string-append root "/dst"))
+           (outside (string-append root "/outside"))
+           (links (string-append root "/links")))
+       (mkdir dst) (mkdir outside) (mkdir links)
+       (call-with-output-file (string-append outside "/marker")
+         (lambda (p) (display "OUTSIDE-MARKER" p)))
+       ;; A symlink entry "a" -> outside, then a regular file "a/evil" beneath
+       ;; it.  The list is valid per-entry, but assembly must refuse to write
+       ;; through the symlink: ensure-parents lstats "a" and finds a symlink.
+       (let ((files (list (list "a" 'symlink %good-hash 7)
+                          (list "a/evil" 'regular %good-hash 5))))
+         (test-assert "assembly refuses to write through a symlink parent"
+           (catch #t
+             (lambda ()
+               (assemble-file-tree
+                files dst
+                (lambda (entry)
+                  (match entry
+                    ((_ 'symlink _ _) outside)
+                    ((_ _ _ _) (open-input-file
+                                (string-append outside "/marker")))))
+                #:links-dir links)
+               #f)
+             (lambda (k . a) #t)))
+         (test-assert "nothing written outside through the symlink"
+           (and (string=? "OUTSIDE-MARKER"
+                          (read-all (string-append outside "/marker")))
+                (equal? '("marker")
+                        (scandir outside
+                                 (lambda (e) (not (member e '("." "..")))))))))))))
 
 (test-end "ca-files")

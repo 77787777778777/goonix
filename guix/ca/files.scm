@@ -11,7 +11,8 @@
 
 (define-module (guix ca files)
   #:use-module (guix hash)
-  #:use-module (guix base32)
+  #:use-module ((guix base32) #:select (%nix-base32-charset
+                                         bytevector->nix-base32-string))
   #:use-module (guix serialization)
   #:use-module (guix store)
   #:use-module (guix narinfo)
@@ -33,6 +34,7 @@
   #:export (store-item-files
             file-list->string
             string->file-list
+            valid-file-list?
             links-path
             file-in-links?
             assemble-file-tree
@@ -121,24 +123,63 @@ regular file / symlink."
                            type hash size)))
                 files))))
 
+(define (valid-file-entry? entry)
+  "Whether ENTRY is a well-formed file-list entry: a non-empty path whose
+components are non-empty and not \".\" or \"..\" (or the empty path for a
+single-file item), a known type, a nix-base32 sha256 hash of exactly 52
+characters, and a non-negative integer size.  A cache is untrusted: any entry
+failing this can name a path outside the destination or a .links file outside
+the store, so the whole list is refused."
+  (match entry
+    ((path type hash size)
+     (and (string? path)
+          (or (string-null? path)
+              (every (lambda (c)
+                       (and (not (string-null? c))
+                            (not (string=? c "."))
+                            (not (string=? c ".."))))
+                     (string-split path #\/)))
+          (memq type '(regular executable symlink directory))
+          (string? hash)
+          (= 52 (string-length hash))
+          (string-every %nix-base32-charset hash)
+          (integer? size)
+          (>= size 0)))
+    (_ #f)))
+
+(define (valid-file-list? files)
+  "Whether FILES is a list of well-formed entries (see valid-file-entry?)."
+  (and (list? files)
+       (every valid-file-entry? files)))
+
 (define (string->file-list str)
-  "Parse STR, a serialized file list, back to a list of entries."
+  "Parse STR, a serialized file list, back to a list of entries.  A list with
+any malformed entry is refused whole (returns #f), so the substituter falls
+back to the NAR rather than trusting a malicious cache's paths or hashes."
   (let ((lines (string-split str #\newline)))
     (match lines
       ((version rest ...)
-       (unless (string=? version %file-list-version)
-         (error "unknown file list version" version))
-       (filter-map
-        (lambda (line)
-          (and (not (string-null? line))
-               (match (string-tokenize line)
-                 ((path type hash size)
-                  (list (if (string=? path ".") "" path)
-                        (string->symbol type)
-                        hash
-                        (string->number size)))
-                 (_ #f))))
-        rest)))))
+       (and (string=? version %file-list-version)
+            (let ((entries
+                   (filter-map
+                    (lambda (line)
+                      (and (not (string-null? line))
+                           (match (string-tokenize line)
+                             ((path type hash size)
+                              (list (if (string=? path ".") "" path)
+                                    (string->symbol type)
+                                    hash
+                                    (string->number size)))
+                             (_ #f))))
+                    rest)))
+              ;; Every non-empty line must parse to a valid entry; a line that
+              ;; does not parse, or an entry that fails validation, refuses the
+              ;; whole list.
+              (and (= (length entries)
+                      (count (lambda (l) (not (string-null? l))) rest))
+                   (valid-file-list? entries)
+                   entries))))
+      (_ #f))))
 
 (define (links-path store hash)
   "Return the .links path for HASH in STORE's store directory."
@@ -150,47 +191,112 @@ regular file / symlink."
 
 (define* (assemble-file-tree files root fetch-file #:key (links-dir #f))
   "Assemble the file tree described by FILES under ROOT.  FETCH-FILE is called
-as (FETCH-FILE ENTRY DESTINATION) to write a file's content; it is called only
-for files whose hash is not already in LINKS-DIR (when given), which are
-hard-linked instead.  Returns the number of files fetched."
+as (FETCH-FILE ENTRY) and returns an input port with the file's content (or,
+for a symlink, its target string); it is called only for files whose hash is
+not already in LINKS-DIR (when given), which are hard-linked instead.  Returns
+the number of files fetched.
+
+FILES is untrusted (it comes from a cache).  Every entry is validated first
+and the whole list refused if any is bad.  The tree is built without following
+symlinks: each parent directory is created with mkdir and checked with lstat to
+be a real directory inside ROOT, an entry whose parent is a symlink is refused,
+files are created fresh with O_NOFOLLOW|O_EXCL, and a .links entry is linked
+only when it is a regular file.  Nothing is written or chmodded outside ROOT."
   (define fetched 0)
+
+  (define (links-file hash)
+    ;; HASH is validated (52 nix-base32 chars), so this cannot escape .links.
+    (string-append links-dir "/" hash))
+
   (define (have-links? hash)
-    (and links-dir (file-exists? (string-append links-dir "/" hash))))
+    (and links-dir
+         (let ((lf (links-file hash)))
+           (and (file-exists? lf)
+                (eq? 'regular (stat:type (lstat lf)))))))
+
   (define (link-from-links hash dest)
-    ;; Hard-link from .links; fall back to a copy when they are on different
-    ;; filesystems (the assembly root need not be in the store).
+    ;; Hard-link from .links; fall back to a copy on a different filesystem.
+    ;; The .links entry is already read-only; its mode is left alone.
     (catch 'system-error
-      (lambda () (link (string-append links-dir "/" hash) dest))
+      (lambda () (link (links-file hash) dest))
       (lambda args
         (if (= EXDEV (system-error-errno args))
-            (copy-file (string-append links-dir "/" hash) dest)
+            (copy-file (links-file hash) dest)
             (apply throw args)))))
-  (for-each
-   (match-lambda
-     ((path type hash size)
-      (let ((dest (if (string-null? path) root (string-append root "/" path))))
-        (unless (file-exists? (dirname dest))
-          (mkdir-p (dirname dest)))
-        (case type
-          ((symlink)
-           ;; Symlinks are cheap; always recreate (not fetched).
-           (symlink (fetch-file (list path type hash size) 'symlink-target)
-                    dest))
-          ((regular executable)
-           (cond
-            ((have-links? hash)
-             (link-from-links hash dest))
-            (else
-             (fetch-file (list path type hash size) dest)
-             (set! fetched (+ fetched 1))))
-           (chmod dest (if (eq? type 'executable) #o555 #o444)))))))
-   ;; Deepest paths last so parents exist; sort by depth then name.
-   (sort files (lambda (a b)
-                 (let ((da (string-count (car a) #\/))
-                       (db (string-count (car b) #\/)))
-                   (if (= da db)
-                       (string<? (car a) (car b))
-                       (< da db))))))
+
+  (define (ensure-parents path)
+    ;; Create each parent directory of PATH (relative to ROOT) with mkdir and
+    ;; verify with lstat that it is a real directory inside ROOT.  Refuse if
+    ;; any component is a symlink or a non-directory.
+    (let loop ((dir root) (components (string-split path #\/)))
+      (match components
+        ((or () (_)) #t)                    ;no parent to create for the leaf
+        ((next . more)
+         (let ((sub (string-append dir "/" next)))
+           (if (file-exists? sub)
+               (unless (eq? 'directory (stat:type (lstat sub)))
+                 (error "parent is not a real directory" sub))
+               (begin (mkdir sub) (chmod sub #o755)))
+           (loop sub more))))))
+
+  (define (copy-in input output)
+    (let loop ()
+      (let ((bv (get-bytevector-n input 65536)))
+        (unless (eof-object? bv)
+          (put-bytevector output bv)
+          (loop)))))
+
+  (define (write-regular entry dest type)
+    ;; Create DEST fresh with O_NOFOLLOW|O_EXCL so a symlink at DEST is never
+    ;; followed and an existing file is never clobbered.  FETCH-FILE returns an
+    ;; input port with the content.  chmod the file we created, never a path
+    ;; that could resolve outside ROOT.
+    (let ((out (open dest (logior O_WRONLY O_CREAT O_EXCL O_NOFOLLOW) #o600))
+          (in (fetch-file entry)))
+      (dynamic-wind
+        (const #t)
+        (lambda () (copy-in in out))
+        (lambda () (close-port out) (close-port in))))
+    (set! fetched (+ fetched 1))
+    (chmod dest (if (eq? type 'executable) #o555 #o444)))
+
+  (define (assemble-entry entry)
+    (match entry
+      ((path type hash size)
+       (let ((dest (if (string-null? path) root (string-append root "/" path))))
+         (unless (string-null? path)
+           (ensure-parents path))
+         (case type
+           ((directory)
+            (unless (file-exists? dest)
+              (mkdir dest)
+              (chmod dest #o755)))
+           ((symlink)
+            ;; FETCH-FILE returns the target string; stored as-is, never
+            ;; followed during assembly.
+            (symlink (fetch-file entry) dest))
+           ((regular executable)
+            (if (have-links? hash)
+                (link-from-links hash dest)
+                (write-regular entry dest type))))))))
+
+  ;; Validate the whole untrusted list before the first write.
+  (unless (valid-file-list? files)
+    (error "invalid file list" files))
+  ;; The destination root itself may not exist yet (the substituter passes a
+  ;; fresh <temp>/restored path); create it as a real directory.
+  (unless (file-exists? root)
+    (mkdir root)
+    (chmod root #o755))
+  ;; Deepest paths last so parents exist; sort by depth then name.
+  (for-each assemble-entry
+            (sort files
+                  (lambda (a b)
+                    (let ((da (string-count (car a) #\/))
+                          (db (string-count (car b) #\/)))
+                      (if (= da db)
+                          (string<? (car a) (car b))
+                          (< da db))))))
   fetched)
 
 (define (render-file-list store request name)
@@ -277,27 +383,21 @@ Returns the number of files fetched over the network."
         text)))
   (let* ((list-text (fetch-text (url "goonix" "files" name)))
          (files (string->file-list list-text)))
+    (unless files
+      (error "invalid file list from cache" name))
     (assemble-file-tree
      files root
-     (lambda (entry dest)
+     (lambda (entry)
        (match entry
          ((path 'symlink hash size)
-          ;; A symlink's "content" is its target; the list does not carry the
-          ;; target string, so symlinks are fetched as a file would be.  For
-          ;; the gate's regular-file items this branch is not used.
           (error "symlink file-level fetch not supported" path))
          ((path type hash size)
+          ;; Return an input port with the file's content; assemble-file-tree
+          ;; creates the destination safely and copies from it.
           (let-values (((port resp)
                         (http-fetch (url "goonix" "file" name path)
                                     #:timeout timeout)))
-            (call-with-output-file dest
-              (lambda (out)
-                (let loop ()
-                  (let ((bv (get-bytevector-n port 65536)))
-                    (unless (eof-object? bv)
-                      (put-bytevector out bv)
-                      (loop))))))
-            (close-port port)))))
+            port))))
      #:links-dir links-dir)))
 
 (define* (substitute-files/nar narinfo destination
@@ -328,42 +428,51 @@ caller falls back to the NAR."
              (values #f #f)))
     (let* ((list-text (fetch-text (url "goonix" "files" name)))
            (files (string->file-list list-text)))
-      ;; Delete DESTINATION first, as download-nar does.
-      (catch 'system-error
-        (lambda () (delete-file-recursively destination))
-        (const #f))
-      (assemble-file-tree
-       files destination
-       (lambda (entry dest)
-         (match entry
-           ((path 'symlink hash size)
-            (error "symlink file-level fetch not supported" path))
-           ((path type hash size)
-            (let-values (((port resp)
-                          (http-fetch (url "goonix" "file" name path)
-                                      #:timeout timeout)))
-              (call-with-output-file dest
-                (lambda (out)
-                  (let loop ()
-                    (let ((bv (get-bytevector-n port 65536)))
-                      (unless (eof-object? bv)
-                        (put-bytevector out bv)
-                        (loop))))))
-              (close-port port))
-            ;; Deduplicate the fetched file into the store's .links, as the
-            ;; NAR path's dump-file/deduplicate does, so a later item sharing
-            ;; this file hard-links it instead of fetching it again.
+      (if (not files)
+          ;; A malformed (malicious) file list: fall back to the NAR.
+          (values #f #f)
+          (begin
+            ;; Delete DESTINATION first, as download-nar does.
+            (catch 'system-error
+              (lambda () (delete-file-recursively destination))
+              (const #f))
+            (assemble-file-tree
+             files destination
+             (lambda (entry)
+               (match entry
+                 ((path 'symlink hash size)
+                  (error "symlink file-level fetch not supported" path))
+                 ((path type hash size)
+                  ;; Return an input port with the file's content;
+                  ;; assemble-file-tree creates the destination safely
+                  ;; (O_NOFOLLOW|O_EXCL) and copies.
+                  (let-values (((port resp)
+                                (http-fetch (url "goonix" "file" name path)
+                                            #:timeout timeout)))
+                    port))))
+             #:links-dir links-dir)
+            ;; Deduplicate the assembled files into the store's .links, as the
+            ;; NAR path's dump-file/deduplicate does, so a later item sharing a
+            ;; file hard-links it instead of fetching it again.  Only regular
+            ;; files past the dedup minimum are registered.
             (when links-dir
-              (deduplicate dest (nar-sha256 dest)
-                           #:store (dirname links-dir))))))
-       #:links-dir links-dir)
-      ;; The actual NAR hash of the assembled tree, computed the same way the
-      ;; daemon's hashPath does (file-hash* recursive writes the NAR form).
-      (let-values (((algorithm expected)
-                    (narinfo-hash-algorithm+value narinfo)))
-        (values expected
-                (file-hash* destination #:algorithm algorithm
-                            #:recursive? #t
-                            #:select? (const #t)))))))
+              (for-each (match-lambda
+                          ((path type hash size)
+                           (when (memq type '(regular executable))
+                             (let ((file (if (string-null? path)
+                                             destination
+                                             (string-append destination "/" path))))
+                               (deduplicate file (nar-sha256 file)
+                                            #:store (dirname links-dir))))))
+                        files))
+            ;; The actual NAR hash of the assembled tree, computed the same way
+            ;; the daemon's hashPath does (file-hash* recursive writes the NAR
+            ;; form).
+            (let-values (((algorithm expected)
+                          (narinfo-hash-algorithm+value narinfo)))
+              (values expected
+                      (file-hash* destination #:algorithm algorithm
+                                  #:recursive? #t
+                                  #:select? (const #t)))))))))
 
 ;;; files.scm ends here

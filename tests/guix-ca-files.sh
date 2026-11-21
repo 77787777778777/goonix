@@ -66,6 +66,12 @@ done
 # Client: a real guix build of V1 then V2 through the client daemon, with
 # substitutes enabled.  The daemon's substituter assembles each item from its
 # files (hard-linking .links, fetching the rest over /goonix/file).
+# LIMIT (recorded, not fixed here): .links holds only files of at least 8192
+# bytes (the daemon's deduplication minimum), so smaller files are fetched
+# again every time.  "A change in one file fetches one file" holds only when
+# the OTHER files are at least that size; the padded fixture (9000-byte files)
+# is what makes this gate pass.  A later step could look up small files in the
+# same-named items already in the store.
 client=$root/client
 mkdir -p "$client/store" "$client/db" "$client/etc" "$client/log"
 chmod 700 "$client/etc"
