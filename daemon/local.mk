@@ -91,6 +91,9 @@ EXTRA_DIST += \
   daemon/test/differential/prepare-readonly-fixture.sh \
   daemon/test/differential/read-only.sh daemon/test/differential/transports.sh \
   daemon/test/differential/guix-readonly.sh \
+  daemon/test/differential/socket-startup.sh \
+  daemon/test/differential/stale-socket.c daemon/test/differential/socket-connect.c \
+  daemon/test/differential/socket-query.c \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
