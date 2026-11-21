@@ -18,6 +18,7 @@
   #:use-module (guix utils)
   #:use-module (guix derivations)
   #:use-module (guix ca)
+  #:use-module (guix ca opaque)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (%package-addressing-policy
@@ -90,7 +91,15 @@
 
 (define (package-addressing package)
   "Return the kind to request for PACKAGE's own derivation."
-  (cond ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
+  (cond ((and (opaque-package? package)
+              (memq (%package-addressing-policy) '(content full)))
+         ;; goonix: the opaque table forces resolved-addressing under the
+         ;; content/full policies.  Under mixed/adopted/input the upstream
+         ;; graph is kept byte-identical (an input-addressed dependent may not
+         ;; take a resolved dependency), so only the explicit opaque property
+         ;; — upstream's own marking — applies there.
+         'resolved)
+        ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
          'resolved)
         ((memq (%package-addressing-policy) '(content full)) 'content)
         ((eq? (%package-addressing-policy) 'mixed)
@@ -108,8 +117,7 @@
 policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
   (and (eq? (%package-addressing-policy) 'adopted)
        ((%upstream-package?) package)
-       (not (eq? 'opaque
-                 (assq-ref (package-properties package) 'self-references)))))
+       (not (opaque-package? package))))
 
 (define (package-addressing-key)
   "Return the current mode and marker for the package derivation cache."

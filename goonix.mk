@@ -13,6 +13,7 @@ MODULES +=					\
   guix/ca/graft.scm				\
   guix/ca/build/graft.scm			\
   guix/ca/adopt.scm				\
+  guix/ca/opaque.scm				\
   guix/ca/files.scm				\
   guix/download-cache.scm			\
   guix/ca/scan.scm				\
@@ -46,6 +47,7 @@ SCM_TESTS +=					\
   tests/ca-adopt.scm				\
   tests/ca-files.scm				\
   tests/ca-full.scm				\
+  tests/ca-opaque.scm				\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\
