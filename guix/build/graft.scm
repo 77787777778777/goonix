@@ -300,12 +300,9 @@ a list of store file name pairs."
               matches)))
 
 (define* (rewrite-directory directory output mapping
-                            #:optional (store (%store-directory))
-                            #:key (own-outputs '())) ;goonix: CA graft own outputs
+                            #:optional (store (%store-directory)))
   "Copy DIRECTORY to OUTPUT, replacing strings according to MAPPING, a list of
-file name pairs.  OWN-OUTPUTS is the list of output file names this graft
-writes; a replacement may be one of them even when its hash part is a
-content-addressing self-token rather than nix-base32." ;goonix: own-outputs doc
+file name pairs."
 
   (define hash-mapping
     ;; List of hash/replacement pairs, where the hash is a nix-base32 string
@@ -324,23 +321,11 @@ content-addressing self-token rather than nix-base32." ;goonix: own-outputs doc
                     (valid-hash? hash)
                     (eqv? #\- (string-ref s end))
                     (list hash all)))))
-      ;; goonix: a content-addressed graft writes its own output at a
-      ;; self-token (reserved alphabet "eout", not nix-base32).  Accept such
-      ;; a replacement only when the whole string is one of OWN-OUTPUTS, the
-      ;; outputs this graft writes; the daemon finalises the token to the
-      ;; content address.  The origin side stays nix-base32.
-      (define (replacement-hash+rest s)
-        (or (hash+rest s)
-            (and (member s own-outputs)
-                 (< end (string-length s))
-                 (string-prefix? prefix s)
-                 (eqv? #\- (string-ref s end))
-                 (list (substring s start end) (substring s start)))))
 
       (map (match-lambda
              (((= hash+rest (origin-hash origin-string))
                .
-               (= replacement-hash+rest (replacement-hash replacement-string))) ;goonix: accept own-output token
+               (= hash+rest (replacement-hash replacement-string)))
               (unless (= (string-length origin-string)
                          (string-length replacement-string))
                 (error "replacement length differs from the original length"
@@ -402,16 +387,10 @@ content-addressing self-token rather than nix-base32." ;goonix: own-outputs doc
   "Apply the grafts described by MAPPING on OLD-OUTPUTS, leading to
 NEW-OUTPUTS.  MAPPING must be a list of file name pairs; OLD-OUTPUTS and
 NEW-OUTPUTS are lists of output name/file name pairs."
-  ;; goonix: the outputs this graft writes may be content-addressing
-  ;; self-tokens; tell rewrite-directory so it accepts them as replacements.
-  (define own-outputs
-    (match new-outputs
-      (((names . files) ...) files)))
   (for-each (lambda (input output)
               (format log-port "grafting '~a' -> '~a'...~%" input output)
               (force-output)
-              (rewrite-directory input output mapping
-                                 #:own-outputs own-outputs)) ;goonix: pass own outputs
+              (rewrite-directory input output mapping))
             (match old-outputs
               (((names . files) ...)
                files))

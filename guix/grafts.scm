@@ -116,14 +116,16 @@ are not recursively applied to dependencies of DRV."
 
 
   (define build
-    (with-imported-modules '((guix build graft)
-                             (guix build utils)
-                             (guix build debug-link)
-                             (guix elf))
+    (with-imported-modules ((@ (guix ca graft) goonix-graft-modules) ;goonix: CA graft module
+                            drv '((guix build graft)
+                                  (guix build utils)
+                                  (guix build debug-link)
+                                  (guix elf)))
       #~(begin
           (use-modules (guix build graft)
                        (guix build utils)
                        (ice-9 match))
+          #+@((@ (guix ca graft) goonix-graft-load) drv) ;goonix: CA graft module load
 
           (define %outputs
             (ungexp (outputs->gexp outputs)))
@@ -140,7 +142,8 @@ are not recursively applied to dependencies of DRV."
                                           (cons (assoc-ref old-outputs name)
                                                 file)))
                                        %outputs))))
-            (graft old-outputs %outputs mapping)))))
+            ((ungexp ((@ (guix ca graft) goonix-graft-procedure) drv)) ;goonix: CA graft procedure
+             old-outputs %outputs mapping)))))
 
 
   (define properties

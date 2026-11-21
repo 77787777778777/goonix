@@ -10,6 +10,8 @@ MODULES +=					\
   guix/ca/policy.scm				\
   guix/ca/sharing.scm				\
   guix/ca/records.scm				\
+  guix/ca/graft.scm				\
+  guix/ca/build/graft.scm			\
   guix/download-cache.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
@@ -38,6 +40,7 @@ SCM_TESTS +=					\
   tests/ca-build.scm				\
   tests/ca-compiler.scm				\
   tests/ca-grafts.scm				\
+  tests/ca-graft-identity.scm			\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\

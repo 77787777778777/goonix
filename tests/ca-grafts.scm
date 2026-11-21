@@ -2,14 +2,16 @@
 ;;;
 ;;; A graft that changes nothing yields the original path; a real
 ;;; replacement yields a different path and rewrites the reference.  The
-;;; graft derivation is content-addressed (mixed policy), so it writes its
-;;; own output at a self-token; the rewriter accepts that token as a
-;;; replacement (guix/build/graft.scm, #:own-outputs) and the daemon
-;;; finalises it to the content address.
+;;; graft of a content-addressed derivation writes its own output at a
+;;; self-token; (guix ca build graft) applies it through upstream's rewriter
+;;; in two passes, and the daemon finalises the token to the content address.
+;;; An input-addressed graft derivation is exactly upstream's.
 (use-modules (guix)
              (guix tests)
              (guix grafts)
              (guix gexp)
+             (guix ca)
+             (guix ca graft)
              (guix ca policy)
              (guix derivations)
              (guix monads)
@@ -93,6 +95,42 @@
              ;; orig's own text ("hello") is preserved.
              (string=? (string-append real-path "/hello")
                        (read-all path)))))))
+
+;;; An input-addressed graft derivation is exactly upstream's: the two
+;;; goonix helpers return the module list unchanged and the plain 'graft'
+;;; symbol, so the builder text and the module list — and hence the
+;;; derivation — are upstream's.
+(let* ((ia-name (fresh-name "ca-graft-ia"))
+       (ia-drv  (run-with-store store
+                  (gexp->derivation ia-name
+                    #~(call-with-output-file #$output
+                        (lambda (p) (display "IA" p)))
+                    #:addressing 'input
+                    #:guile-for-build guile-drv)))
+       (_       (build-derivations store (list ia-drv)))
+       (base-modules '((guix build graft) (guix build utils)
+                       (guix build debug-link) (guix elf))))
+  (test-assert "an input-addressed target is not a self-token"
+    (not (token-store-path? (derivation->output-path ia-drv))))
+  (test-equal "the graft module list is unchanged for an input-addressed target"
+    base-modules
+    (goonix-graft-modules ia-drv base-modules))
+  (test-eq "the graft procedure is the plain symbol for an input-addressed target"
+    'graft
+    (goonix-graft-procedure ia-drv))
+  (test-assert "an input-addressed graft derivation has no CA addressing marker"
+    (let* ((repl    (run-with-store store
+                      (gexp->derivation ia-name
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "REPL" p)))
+                        #:addressing 'input
+                        #:guile-for-build guile-drv)))
+           (_       (build-derivations store (list repl)))
+           (grafted (graft-derivation store ia-drv
+                      (list (graft (origin ia-drv) (replacement repl)))
+                      #:guile guile-drv)))
+      (not (assoc-ref (derivation-builder-environment-vars grafted)
+                      "goonixAddressing")))))
 
 (close-connection store)
 (test-end)
