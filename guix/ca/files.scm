@@ -17,6 +17,7 @@
   #:use-module ((guix build utils) #:select (mkdir-p))
   #:use-module ((guix build download) #:select (http-fetch))
   #:use-module (web uri)
+  #:use-module (web response)
   #:use-module (ice-9 ftw)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
@@ -31,6 +32,7 @@
             assemble-file-tree
             render-file-list
             render-file
+            safe-item-file
             substitute-files
             %file-list-version))
 
@@ -192,24 +194,59 @@ response headers and the body string.  A missing item gives a 404."
     (if (valid-path? store item)
         (values '((content-type . (text/plain (charset . "UTF-8"))))
                 (file-list->string (store-item-files item)))
-        (values '((content-type . (text/plain)))
-                "not found"))))
+        (values (build-response #:code 404) "not found"))))
+
+(define (safe-item-file item path)
+  "Resolve PATH (relative, slash-separated) under the store item directory
+ITEM, returning the absolute file name only when it is a regular file safely
+inside ITEM, else #f.  Rejects empty, \".\" and \"..\" components, and refuses
+a symlink anywhere along the path (a mid-path symlink could lead out of the
+item, and upstream's NAR serving never follows one).  Each component is
+checked with lstat so the final component's type is not the only guard."
+  (and (not (string-null? path))
+       (let ((components (string-split path #\/)))
+         (and (every (lambda (c)
+                       (and (not (string-null? c))
+                            (not (string=? c "."))
+                            (not (string=? c ".."))))
+                     components)
+              (let loop ((dir item) (rest components))
+                (match rest
+                  (() #f)
+                  ((last)
+                   (let ((file (string-append dir "/" last)))
+                     (and (file-exists? file)
+                          (eq? 'regular (stat:type (lstat file)))
+                          file)))
+                  ((next . more)
+                   (let ((sub (string-append dir "/" next)))
+                     ;; The intermediate component must be a real directory,
+                     ;; not a symlink (which could point outside the item).
+                     (and (file-exists? sub)
+                          (eq? 'directory (stat:type (lstat sub)))
+                          (loop sub more))))))))))
 
 (define (render-file store request name path)
   "Render the raw bytes of one file (PATH, relative) of the store item NAME.
 Returns two values: the response headers (with x-raw-file for the web server)
-and #f.  A missing item or file gives a 404."
+and #f.  A missing item or file, or a path that escapes the item, gives a 404."
+  (define (not-found)
+    (values (build-response #:code 404) "not found"))
   (let* ((item (string-append (%store-prefix) "/" name))
-         (file (string-append item "/" path)))
-    (if (and (valid-path? store item)
-             (file-exists? file)
-             (eq? 'regular (stat:type (lstat file))))
+         (file (and (valid-path? store item)
+                    (safe-item-file item path))))
+    ;; Second guard: the canonical (symlink-resolved) file must stay inside the
+    ;; canonical item directory.  safe-item-file already refuses a symlink on
+    ;; any component; this catches anything that slips through.
+    (if (and file
+             (let ((canon-item (canonicalize-path item))
+                   (canon-file (canonicalize-path file)))
+               (string-prefix? (string-append canon-item "/") canon-file)))
         (values `((content-type . (application/octet-stream
                                    (charset . "ISO-8859-1")))
                   (x-raw-file . ,file))
                 #f)
-        (values '((content-type . (text/plain)))
-                "not found"))))
+        (not-found))))
 
 (define* (substitute-files cache-url name root #:key (links-dir #f) timeout)
   "File-level substitution: fetch the file list of the store item NAME from

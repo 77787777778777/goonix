@@ -85,5 +85,34 @@ v1=$(sed -n 's/.*(v1-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
 v2=$(sed -n 's/.*(v2-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
 test "$(grep -c "^GET /goonix/file/$v1/" "$root/publish.log")" -eq 3
 test "$(grep -c "^GET /goonix/file/$v2/" "$root/publish.log")" -eq 1
+
+# Security regression: /goonix/file must not serve anything outside the item.
+# A secret file outside the store item; requests with "..", "%2e%2e" and a
+# mid-path symlink must get 404 and must NOT contain the secret's bytes.
+# This fails on b004167fc31 (the lstat-only-last-component render-file).
+printf 'TRAVERSAL-SECRET-BYTES\n' > "$root/secret-outside"
+# A store item with a mid-path symlink leading to the secret's directory.
+# The store item is read-only; make it writable for this regression fixture.
+chmod -R u+w "$store/$v1"
+ln -s "$root" "$store/$v1/escape"
+check_traversal() {
+  local req="$1" body code
+  body=$(curl -s -o "$root/trav-body" -w '%{http_code}' "$url/goonix/file/$v1/$req")
+  code="$body"
+  if test "$code" != 404; then
+    printf 'FAIL: traversal %s gave %s, expected 404\n' "$req" "$code" >&2
+    exit 1
+  fi
+  if grep -qF 'TRAVERSAL-SECRET-BYTES' "$root/trav-body"; then
+    printf 'FAIL: traversal %s leaked outside bytes\n' "$req" >&2
+    exit 1
+  fi
+}
+check_traversal '../../../secret-outside'
+check_traversal 'sub/../../../secret-outside'
+check_traversal '%2e%2e/%2e%2e/%2e%2e/secret-outside'
+check_traversal 'escape/secret-outside'
+# A normal file still serves (the guard did not break the happy path).
+test "$(curl -s -o /dev/null -w '%{http_code}' "$url/goonix/file/$v1/a")" = 200
 completed=true
 printf 'CA-7 file-level substitution gate: PASS\n'

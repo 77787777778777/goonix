@@ -162,4 +162,35 @@
            (test-assert "the changed content is present"
              (string=? "BETA-CHANGED" (read-all (string-append dst2 "/b"))))))))))
 
+(test-group "safe-item-file refuses paths that escape the item"
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((item (string-append root "/item"))
+           (outside (string-append root "/outside")))
+       (mkdir item)
+       (mkdir outside)
+       (call-with-output-file (string-append outside "/secret")
+         (lambda (p) (display "OUTSIDE-SECRET" p)))
+       (make-tree item '(("a" . "alpha") ("sub/b" . "beta")))
+       ;; A mid-path symlink leading out of the item.
+       (symlink outside (string-append item "/lib"))
+       (test-assert "a normal file resolves"
+         (string=? (string-append item "/a")
+                   (safe-item-file item "a")))
+       (test-assert "a nested file resolves"
+         (string=? (string-append item "/sub/b")
+                   (safe-item-file item "sub/b")))
+       (test-assert ".. is refused"
+         (not (safe-item-file item "../outside/secret")))
+       (test-assert "a mid-path .. is refused"
+         (not (safe-item-file item "sub/../../outside/secret")))
+       (test-assert "a leading . is refused"
+         (not (safe-item-file item "./a")))
+       (test-assert "an empty component is refused"
+         (not (safe-item-file item "sub//b")))
+       (test-assert "a mid-path symlink is refused"
+         (not (safe-item-file item "lib/secret")))
+       (test-assert "a missing file is refused"
+         (not (safe-item-file item "nope")))))))
+
 (test-end "ca-files")
