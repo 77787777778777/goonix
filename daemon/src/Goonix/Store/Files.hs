@@ -432,26 +432,45 @@ ownCollectorHolds :: RawFilePath -> IO Bool
 ownCollectorHolds gcPath = Set.member gcPath <$> readTVarIO ownCollector
 
 -- | Run a collection under the exclusive GC lock, with the own-collector flag
--- set, and release BOTH the flag and the lock while holding tempRootLock.
+-- set.  Acquire-and-flag-set is ONE step under tempRootLock; the collection body
+-- runs without tempRootLock; release of BOTH the flag and the lock is under
+-- tempRootLock.
 --
--- The release ordering matters.  A new client checks ownCollectorHolds and then
--- creates its temporary-root file, both under tempRootLock (withTempRootFile).
--- If the collector cleared the flag and released the GC lock WITHOUT
--- tempRootLock, a client could see the flag set, skip the shared GC lock, and
--- create its file after this process's collection ended but before another
--- process's collector took the GC lock and enumerated temproots/ — the same gap
--- the shared lock at creation exists to close, narrowed to a few microseconds.
--- Clearing the flag and releasing the lock under tempRootLock means a client
--- that saw the flag set has finished creating its file (it holds tempRootLock
--- through openRoot) before this release completes, so no other process can take
--- the GC lock until the file exists.
+-- The acquire ordering matters as much as the release.  A new client checks
+-- ownCollectorHolds and then creates its temporary-root file (or takes the
+-- shared GC lock), all under tempRootLock (withTempRootFile).  If the collector
+-- took the exclusive GC lock and only THEN set the flag, a client arriving in
+-- between would see the flag unset, take tempRootLock, and block in
+-- withGCReadLock on the collector's exclusive lock — while still holding
+-- tempRootLock.  The collector's release then waits for tempRootLock: deadlock.
+-- Acquiring the lock and setting the flag together under tempRootLock means a
+-- client enters either BEFORE (flag unset; it takes the shared lock and lets go
+-- of it before the collector can get the exclusive one) or AFTER (flag set; it
+-- skips the shared lock).  While the flag is set, new clients skip the GC lock
+-- and never block inside tempRootLock, so the collection body's brief
+-- tempRootLock uses (withOtherTemporaryRoots, appendTempRoot) are safe.
+--
+-- The release ordering closes the cross-process gap: a client that saw the flag
+-- set holds tempRootLock through openRoot, so it has finished creating its file
+-- before this release completes; no other process can take the GC lock and
+-- enumerate temproots/ until the file exists.
 withCollectorGCLock :: RawFilePath -> IO a -> IO a
 withCollectorGCLock gcPath action = do
   mkdirParents (parent gcPath)
-  bracket (acquireFileLock gcPath Exclusive) (const releaseLocked) $ \_ -> do
-    atomically (modifyTVar' ownCollector (Set.insert gcPath))
-    action
+  bracket acquireLocked (const releaseLocked) $ \_ -> action
   where
+    acquireLocked = withMVar tempRootLock $ \() -> do
+      acquireFileLock gcPath Exclusive
+      -- Test-only: widen the acquire -> flag-set window so the deadlock ordering
+      -- can be stressed (collector-acquire-race.sh).  No-op unless the env var
+      -- is set.  The delay is INSIDE tempRootLock, so a new client cannot enter
+      -- between the acquire and the flag-set; with the pre-fix acquire (lock
+      -- taken, flag set later, both outside tempRootLock) a client could.
+      flagDelay <- lookupEnv "GOONIX_TEST_COLLECTOR_FLAG_DELAY_US"
+      forM_ flagDelay $ \value -> case reads value of
+        [(micros, "")] | micros > 0 -> threadDelay micros
+        _ -> pure ()
+      atomically (modifyTVar' ownCollector (Set.insert gcPath))
     releaseLocked = withMVar tempRootLock $ \() -> uninterruptibleMask_ $ do
       atomically (modifyTVar' ownCollector (Set.delete gcPath))
       releaseFileLock gcPath False
