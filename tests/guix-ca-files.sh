@@ -63,17 +63,27 @@ for i in $(seq 1 100); do
   sleep .1
 done
 
-# Client: substitute V1 (all three files fetched), then V2 (one file fetched).
+# Client: a real guix build of V1 then V2 through the client daemon, with
+# substitutes enabled.  The daemon's substituter assembles each item from its
+# files (hard-linking .links, fetching the rest over /goonix/file).
 client=$root/client
 mkdir -p "$client/store" "$client/db" "$client/etc" "$client/log"
+chmod 700 "$client/etc"
+{
+  printf '(acl (entry '
+  cat tests/keys/openpgp/signing-key.pub
+  printf ' (tag (guix import))))\n'
+} > "$client/etc/acl"
 cat > "$root/client-part.sh" <<EOF
 set -euo pipefail
 export NIX_STORE_DIR=$store GUIX_DATABASE_DIRECTORY=$client/db
 export GUIX_CONFIGURATION_DIRECTORY=$client/etc GUIX_STATE_DIRECTORY=$client
 export GUIX_DAEMON_SOCKET=$client/socket GUIX_LOG_DIRECTORY=$client/log
 export GOONIX_SERVER_URL=$url
+export GOONIX_SHELL_SOURCE=$root/shell
+export GOONIX_MKDIR_SOURCE=$HOME/.cache/goonix-test-seed/3c68020130d6d813-mkdir
 ./pre-inst-env ./guix-daemon --disable-chroot --listen="\$GUIX_DAEMON_SOCKET" \
-  --substitute-urls= >"$root/client-daemon.log" 2>&1 &
+  --substitute-urls="$url" >"$root/client-daemon.log" 2>&1 &
 daemon_pid=\$!
 trap 'kill "\$daemon_pid" 2>/dev/null || true' EXIT
 for i in \$(seq 1 100); do test -S "\$GUIX_DAEMON_SOCKET" && break; sleep .1; done
@@ -82,14 +92,18 @@ EOF
 unshare --user --map-root-user --mount bash -c \
   "mount --bind '$client/store' '$store' && exec unshare --user --map-user=$(id -u) --map-group=$(id -g) bash '$root/client-part.sh'"
 
-# The gate: V1 fetched three files, V2 fetched exactly one.
-grep -F 'V1_FETCHED=3' "$root/result"
-grep -F 'V2_FETCHED=1' "$root/result"
-# The server saw three /goonix/file/ requests for V1 and one for V2.
+# The gate: a real build substituted V1 (three files) and V2 (one file).
+grep -F 'BUILD_OK=1' "$root/result"
 v1=$(sed -n 's/.*(v1-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
 v2=$(sed -n 's/.*(v2-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
+# The server saw three /goonix/file/ requests for V1 and one for V2.
 test "$(grep -c "^GET /goonix/file/$v1/" "$root/publish.log")" -eq 3
 test "$(grep -c "^GET /goonix/file/$v2/" "$root/publish.log")" -eq 1
+# No NAR was fetched for V2 (file-level substitution replaced the NAR).
+test "$(grep -c "^GET /nar/.*$v2" "$root/publish.log")" -eq 0
+# V2 is valid in the client store with the narinfo's hash (the daemon checked
+# it; the build succeeded and the content is right, asserted by the client).
+test -e "$client/store/$v2"
 
 # Security regression: /goonix/file must not serve anything outside the item.
 # A secret file outside the store item; requests with "..", "%2e%2e" and a

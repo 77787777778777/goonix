@@ -11,9 +11,15 @@
 (define mkdir-source (getenv "GOONIX_MKDIR_SOURCE"))
 (define mkdir-path (add-to-store store "ca-files-mkdir" #t "sha256" mkdir-source))
 
+;; Each file's content is a short tag padded past the daemon's deduplication
+;; minimum size (8192 bytes), so the daemon hard-links it into .links and a
+;; later item sharing the file fetches nothing for it.
+(define (pad tag)
+  (string-append tag (make-string (- 9000 (string-length tag)) #\x)))
+
 (define (item name a b c)
   (let ((script (format #f "'~a' \"$out\"; printf '%s' '~a' > \"$out/a\"; printf '%s' '~a' > \"$out/b\"; printf '%s' '~a' > \"$out/c\""
-                        mkdir-path a b c)))
+                        mkdir-path (pad a) (pad b) (pad c))))
     (derivation store name shell `("-c" ,script)
                 #:sources (list shell mkdir-path)
                 #:addressing 'input)))

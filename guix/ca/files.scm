@@ -14,8 +14,13 @@
   #:use-module (guix base32)
   #:use-module (guix serialization)
   #:use-module (guix store)
-  #:use-module ((guix build utils) #:select (mkdir-p))
-  #:use-module ((guix build download) #:select (http-fetch))
+  #:use-module (guix narinfo)
+  #:use-module ((guix http-client)
+                #:select (http-fetch http-get-error? network-error?))
+  #:use-module (guix diagnostics)
+  #:use-module ((guix store deduplication)
+                #:select (deduplicate nar-sha256))
+  #:use-module ((guix build utils) #:select (mkdir-p delete-file-recursively))
   #:use-module (web uri)
   #:use-module (web response)
   #:use-module (ice-9 ftw)
@@ -24,6 +29,7 @@
   #:use-module (rnrs io ports)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
+  #:use-module (srfi srfi-34)
   #:export (store-item-files
             file-list->string
             string->file-list
@@ -34,6 +40,7 @@
             render-file
             safe-item-file
             substitute-files
+            substitute-files/nar
             %file-list-version))
 
 ;;; Commentary:
@@ -264,7 +271,7 @@ Returns the number of files fetched over the network."
                                     (string-append cache-url "/"))
                                 (string-join components "/"))))
   (define (fetch-text uri)
-    (let-values (((port len) (http-fetch uri #:timeout timeout)))
+    (let-values (((port resp) (http-fetch uri #:timeout timeout)))
       (let ((text (get-string-all port)))
         (close-port port)
         text)))
@@ -280,7 +287,7 @@ Returns the number of files fetched over the network."
           ;; the gate's regular-file items this branch is not used.
           (error "symlink file-level fetch not supported" path))
          ((path type hash size)
-          (let-values (((port len)
+          (let-values (((port resp)
                         (http-fetch (url "goonix" "file" name path)
                                     #:timeout timeout)))
             (call-with-output-file dest
@@ -292,5 +299,71 @@ Returns the number of files fetched over the network."
                       (loop))))))
             (close-port port)))))
      #:links-dir links-dir)))
+
+(define* (substitute-files/nar narinfo destination
+                               #:key (links-dir #f) timeout
+                               (open-connection-for-uri #f))
+  "File-level substitution for the daemon's substituter: fetch the file list
+of NARINFO's item from its cache, assemble the tree under DESTINATION
+(hard-linking files already in LINKS-DIR, fetching the rest over
+/goonix/file), and return two values like 'download-nar': the expected NAR
+hash from NARINFO and the actual NAR hash of the assembled tree.  The caller's
+bytevector=? check of those two is what makes file-level fetching safe; it is
+unchanged.  Returns (values #f #f) when the cache offers no file list, so the
+caller falls back to the NAR."
+  (define cache-url (narinfo-uri-base narinfo))
+  (define name (basename (narinfo-path narinfo)))
+  (define (url . components)
+    (string->uri (string-append (if (string-suffix? "/" cache-url)
+                                    cache-url
+                                    (string-append cache-url "/"))
+                                (string-join components "/"))))
+  (define (fetch-text uri)
+    (let-values (((port resp) (http-fetch uri #:timeout timeout)))
+      (let ((text (get-string-all port)))
+        (close-port port)
+        text)))
+  (guard (c ((or (http-get-error? c) (network-error? c))
+             ;; No file list (or unreachable): fall back to the NAR.
+             (values #f #f)))
+    (let* ((list-text (fetch-text (url "goonix" "files" name)))
+           (files (string->file-list list-text)))
+      ;; Delete DESTINATION first, as download-nar does.
+      (catch 'system-error
+        (lambda () (delete-file-recursively destination))
+        (const #f))
+      (assemble-file-tree
+       files destination
+       (lambda (entry dest)
+         (match entry
+           ((path 'symlink hash size)
+            (error "symlink file-level fetch not supported" path))
+           ((path type hash size)
+            (let-values (((port resp)
+                          (http-fetch (url "goonix" "file" name path)
+                                      #:timeout timeout)))
+              (call-with-output-file dest
+                (lambda (out)
+                  (let loop ()
+                    (let ((bv (get-bytevector-n port 65536)))
+                      (unless (eof-object? bv)
+                        (put-bytevector out bv)
+                        (loop))))))
+              (close-port port))
+            ;; Deduplicate the fetched file into the store's .links, as the
+            ;; NAR path's dump-file/deduplicate does, so a later item sharing
+            ;; this file hard-links it instead of fetching it again.
+            (when links-dir
+              (deduplicate dest (nar-sha256 dest)
+                           #:store (dirname links-dir))))))
+       #:links-dir links-dir)
+      ;; The actual NAR hash of the assembled tree, computed the same way the
+      ;; daemon's hashPath does (file-hash* recursive writes the NAR form).
+      (let-values (((algorithm expected)
+                    (narinfo-hash-algorithm+value narinfo)))
+        (values expected
+                (file-hash* destination #:algorithm algorithm
+                            #:recursive? #t
+                            #:select? (const #t)))))))
 
 ;;; files.scm ends here
