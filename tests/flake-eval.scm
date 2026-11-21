@@ -717,6 +717,162 @@ NAME holds the file name of the child's package."
                            (output changed 'consumer)))))))))
 
 ;;;
+;;; Libraries and overrides in a system.
+;;;
+
+(define (system-flake-text library overrides)
+  "Return the text of a flake whose 'systems' output 'box' uses the service
+type that the library input LIBRARY defines, with OVERRIDES, an s-expression
+for the 'overrides' output."
+  ;; The gexp-bearing definitions are a plain string, inserted with ~a: a
+  ;; '#~(' written inside the format string would be read by 'format' as its
+  ;; '~(' case-conversion directive and mangled.
+  (define definitions
+    "  (define (text-of package)
+    #~(call-with-input-file #$package (@ (ice-9 rdelim) read-line)))
+  (define original (tool \"original\" \"original\"))
+  (define wrapper
+    (tool \"wrapper\" #~(string-append \"wrapped \" #$(text-of original))))
+  ;; A minimal system: a trivial kernel and no base packages or services, so
+  ;; lowering it does not pull in the whole world.  The library's service is
+  ;; what puts a package in the system profile.
+  (define box
+    (operating-system
+      (host-name \"box\")
+      (timezone \"Europe/Paris\")
+      (locale \"en_US.UTF-8\")
+      (kernel (tool \"kernel\" \"kernel\"))
+      (bootloader (bootloader-configuration
+                    (bootloader grub-bootloader)
+                    (targets (list \"/dev/sdX\"))))
+      (file-systems (list (file-system
+                            (device (file-system-label \"root\"))
+                            (mount-point \"/\")
+                            (type \"ext4\"))))
+      (packages '())
+      (services (list (library-service original)))))
+  `((systems (box . ,box))
+    (packages (original . ,original) (wrapper . ,wrapper))")
+  (format #f "(flake (format 1)
+ (inputs (library (git ~s) (as library)))
+ (outputs (lambda (in)
+  (use-modules (gnu) (library svc))
+~a
+~a
+~a
+    (overrides ~a)))))"
+          library %modules %tool definitions overrides))
+
+(define (library-with-service directory)
+  "Make DIRECTORY a library whose module (library svc) exports a service type
+that adds a package to the system profile, and return DIRECTORY."
+  (commit! directory
+           '(".guix-channel" . "(channel (version 0) (directory \"src\"))")
+           '("src/library/svc.scm"
+             . "(define-module (library svc)
+  #:use-module (gnu services)
+  #:use-module (gnu system)
+  #:export (library-service-type library-service))
+(define library-service-type
+  (service-type
+    (name 'library-svc)
+    (extensions (list (service-extension profile-service-type list)))
+    (default-value '())
+    (description \"A service type from a library.\")))
+(define (library-service package)
+  (service library-service-type package))"))
+  directory)
+
+(define (derivation-closure drv)
+  "Return the file names of DRV and every derivation in its input closure."
+  (let loop ((pending (list drv)) (seen '()))
+    (match pending
+      (() seen)
+      ((drv . rest)
+       (let ((name (derivation-file-name drv)))
+         (if (member name seen)
+             (loop rest seen)
+             (loop (append (map derivation-input-derivation
+                                (derivation-inputs drv))
+                           rest)
+                   (cons name seen))))))))
+
+(define (system-flake! directory library overrides)
+  "Make DIRECTORY a locked checkout whose flake.scm is the system flake that
+uses the library LIBRARY with OVERRIDES, a list of (override ORIGINAL
+REPLACEMENT) forms; return DIRECTORY."
+  ;; The 'overrides' output is an alist whose entries are (name . (override
+  ;; ...)), evaluated by the evaluator where 'original', 'wrapper' and the
+  ;; 'override' constructor are bound; so they are written as quasiquotes.
+  (let ((entries (string-join
+                  (map (lambda (form index)
+                         (format #f "(o~a . ,(override ~a ~a))"
+                                 index (cadr form) (caddr form)))
+                       overrides (iota (length overrides)))
+                  " ")))
+    (commit! directory
+             `("flake.scm" . ,(system-flake-text library entries)))
+    (lock! directory)))
+
+(define (system-derivation directory)
+  "Return the system derivation of the flake in DIRECTORY, through 'guix
+system build --derivation' (the command path), which lowers the system without
+fetching the sources of its packages."
+  (match (evaluate-flake-command %store directory 'system '(systems) 'box
+                                 '("build" "--no-grafts"))
+    ((name) (read-derivation-from-file name))))
+
+(test-equal "a service type from a library is used in a system"
+  '(#t #t)
+  (with-workspace directory
+    (let* ((library (library-with-service (string-append directory "/library")))
+           (root    (system-flake! (string-append directory "/root")
+                                   library '()))
+           (system (system-derivation root))
+           (original (evaluate-flake %store root 'packages 'original))
+           (closure (derivation-closure system)))
+      (list (derivation? system)
+            ;; The package the library's service adds is in the system's
+            ;; closure: the service type from the library is used.
+            (->bool (member (derivation-file-name original) closure))))))
+
+(test-equal "an override changes the system's closure, copying no package"
+  '(#t #t #t #t)
+  (with-workspace directory
+    (let* ((library (library-with-service (string-append directory "/library")))
+           (plain   (system-flake! (string-append directory "/plain")
+                                   library '()))
+           (changed (system-flake! (string-append directory "/changed")
+                                   library '((override original wrapper))))
+           (plain-system   (system-derivation plain))
+           (changed-system (system-derivation changed))
+           (changed-original (evaluate-flake %store changed 'packages 'original))
+           (changed-wrapper  (evaluate-flake %store changed 'packages 'wrapper))
+           (plain-closure   (derivation-closure plain-system))
+           (changed-closure (derivation-closure changed-system)))
+      (list
+       ;; The override changes the system's derivation (its closure).
+       (not (string=? (derivation-file-name plain-system)
+                      (derivation-file-name changed-system)))
+       ;; The replacement enters the system's closure: the wrapper is there
+       ;; with the override and not without it.
+       (and (->bool (member (derivation-file-name changed-wrapper)
+                            changed-closure))
+            (not (member (derivation-file-name changed-wrapper)
+                         plain-closure)))
+       ;; No package object is copied: the original, lowered under the
+       ;; override even by name, is the replacement's derivation — the
+       ;; mapping is consulted when a package becomes a derivation, not
+       ;; rewritten ahead of time.
+       (string=? (derivation-file-name changed-original)
+                 (derivation-file-name changed-wrapper))
+       ;; There is one wrapper derivation in the closure, not one per use.
+       (= 1 (length (filter (lambda (name)
+                              (string=? name
+                                        (derivation-file-name changed-wrapper)))
+                            changed-closure)))))))
+
+;;;
 ;;; The Guix that evaluates.
 ;;;
 
