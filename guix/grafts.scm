@@ -179,9 +179,20 @@ references."
                     (append-map (cut references/cached store <>) items))))
       (append-map (cut references/cached store <>) items)))
 
-  (let* ((self (map (cut derivation->output-path drv <>) outputs))
-         (refs (references* self)))
-    (remove (cut member <> self) refs)))
+  ;; goonix: a reserved output (a placeholder or a self token) is not a store
+  ;; item yet, so neither querying its references nor the build-on-missing
+  ;; fallback above may be tried on it: the daemon refuses reserved paths and
+  ;; drops the connection.  Ask the goonix helper first; it returns the
+  ;; references it can read and '() for an unrealised reserved output.
+  (let ((reserved ((@ (guix ca graft) goonix-unrealised-outputs) drv outputs)))
+    (if reserved
+        (let* ((self (map (cut derivation->output-path drv <>) outputs))
+               (refs ((@ (guix ca graft) goonix-references-of-realised)
+                      store drv outputs)))
+          (remove (cut member <> self) refs))
+        (let* ((self (map (cut derivation->output-path drv <>) outputs))
+               (refs (references* self)))
+          (remove (cut member <> self) refs)))))
 
 (define %graft-cache
   ;; Cache that maps derivation/outputs/grafts tuples to lists of grafts.

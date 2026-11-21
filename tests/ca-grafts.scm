@@ -15,6 +15,7 @@
              (guix ca policy)
              (guix derivations)
              (guix monads)
+             (guix build-system trivial)
              (gnu packages bootstrap)
              (ice-9 match)
              (ice-9 textual-ports)
@@ -184,6 +185,56 @@
                     (placeholder-path? (derivation->output-path grafted))
                     (not (token-store-path?
                            (realised-output-path store grafted "out"))))))))))
+
+(test-group "a graft over an unrealised reserved output does not query it"
+  ;; A resolved or opaque package lowered under 'content has PLACEHOLDER
+  ;; outputs until the daemon finalises them.  Computing its graft used to
+  ;; call non-self-references, which asked the daemon for the references of
+  ;; those placeholders; the store error made upstream's fallback try to
+  ;; BUILD the derivation, sending the placeholder to the daemon, which
+  ;; refuses reserved paths (assertNotReserved) and DROPS the connection.
+  ;; The goonix hook must skip reserved outputs instead.  Before the fix this
+  ;; group dies with "Connection reset by peer"; after it, the graft is
+  ;; computed and the connection is still usable.
+  (define (content-package name)
+    (package
+      (name name)
+      (version "1")
+      (source #f)
+      (build-system trivial-build-system)
+      (arguments
+       (list #:guile %bootstrap-guile
+             #:builder #~(call-with-output-file #$output
+                           (lambda (p) (display "PAYLOAD" p)))))
+      (synopsis "CA graft placeholder test")
+      (description "CA graft placeholder test")
+      (home-page #f)
+      (license #f)))
+  (let* ((pkg (content-package (fresh-name "ca-graft-unrealised")))
+         (drv (parameterize ((%package-addressing-policy 'content))
+                (package-derivation store pkg))))
+    (test-assert "the package's output is an unrealised placeholder"
+      (and (placeholder-path? (derivation->output-path drv))
+           (not (valid-path? store (derivation->output-path drv)))))
+    (test-assert "the goonix hook reports the reserved output"
+      (and (pair? (goonix-unrealised-outputs drv (derivation-output-names drv)))
+           (not (goonix-unrealised-outputs
+                 drv '()))))
+    (test-equal "no references are read from a reserved output"
+      '()
+      (goonix-references-of-realised store drv (derivation-output-names drv)))
+    ;; The graft itself: this is the call that used to kill the connection.
+    ;; A real graft pair, so the rewriting path is exercised rather than a
+    ;; no-op short circuit.
+    (test-assert "computing the graft over the placeholder succeeds"
+      (let ((orig (plain-drv (fresh-name "graft-orig") "ORIG"))
+            (repl (plain-drv (fresh-name "graft-repl") "REPL")))
+        (build-derivations store (list orig repl))
+        (derivation? (graft-derivation store drv
+                       (list (graft (origin orig) (replacement repl)))
+                       #:guile guile-drv))))
+    (test-assert "the connection is still usable afterwards"
+      (valid-path? store (derivation->output-path guile-drv)))))
 
 (close-connection store)
 (test-end)

@@ -11,11 +11,16 @@
 
 (define-module (guix ca graft)
   #:use-module (guix derivations)
+  #:use-module (guix store)
+  #:use-module ((guix ca) #:select (placeholder-path? token-store-path?))
+  #:use-module (srfi srfi-1)
   #:export (%graft-content-addressed?
             goonix-graft-modules
             goonix-graft-procedure
             goonix-graft-load
-            goonix-graft-addressing))
+            goonix-graft-addressing
+            goonix-unrealised-outputs
+            goonix-references-of-realised))
 
 ;;; Commentary:
 ;;;
@@ -87,5 +92,39 @@ when the graft writes self-tokens (DRV is content-addressed, or adoption
 forces it), otherwise #f so the graft's addressing is decided as upstream's
 is.  Returning #f keeps an input-addressed graft's derivation upstream's."
   (and (content-addressed-graft? drv) 'content))
+
+(define (reserved-path? path)
+  "Whether PATH is a goonix reserved name: a placeholder (not yet built) or a
+self token (the builder's own output).  Neither is a store item, so the
+daemon refuses operations on it."
+  (or (placeholder-path? path) (token-store-path? path)))
+
+(define (goonix-unrealised-outputs drv outputs)
+  "Return the OUTPUTS of DRV whose paths are reserved names, or #f when none
+is.  A content-addressed or resolved package's outputs are placeholders
+until the daemon finalises them, so a graft computed at lowering time sees
+reserved paths.  Upstream's non-self-references would query their references
+and, on the resulting store error, try to BUILD the derivation — sending the
+placeholder to the daemon, which refuses reserved paths and drops the
+connection.  This predicate lets the caller take the goonix path instead."
+  (let ((reserved (filter (lambda (output)
+                            (reserved-path?
+                             (derivation->output-path drv output)))
+                          outputs)))
+    (and (pair? reserved) reserved)))
+
+(define (goonix-references-of-realised store drv outputs)
+  "Return the references of the OUTPUTS of DRV that are real store items,
+skipping reserved ones.  An unrealised placeholder has no references to
+read: it contributes none, and the graft over it is computed from the
+derivation's own inputs instead.  Nothing is built here, and no reserved
+path is ever sent to the daemon."
+  (append-map
+   (lambda (output)
+     (let ((path (derivation->output-path drv output)))
+       (if (reserved-path? path)
+           '()
+           (references/cached store path))))
+   outputs))
 
 ;;; graft.scm ends here
