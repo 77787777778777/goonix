@@ -115,16 +115,30 @@
              (cadr rest)
              (loop (cdr rest))))))
 
+(define (strip-keyword arguments keyword)
+  "Return ARGUMENTS without KEYWORD and its value."
+  (let loop ((rest arguments) (result '()))
+    (cond ((null? rest) (reverse result))
+          ((eq? (car rest) keyword) (loop (cddr rest) result))
+          (else (loop (cdr rest) (cons (car rest) result))))))
+
 (define (gexp-with-addressing lower name exp . arguments)
-  "Apply LOWER with the requested kind for this derivation only."
+  "Apply LOWER with the requested kind for this derivation only.  An explicit
+#:addressing #f means 'no override': the keyword is dropped and the kind is
+decided as it would be without it, so a caller that passes #f for an
+input-addressed derivation (a graft, say) leaves its derivation upstream's."
   (let* ((package-name (%package-derivation-name))
-         (requested (cond ((keyword-argument arguments #:addressing) => identity)
+         (explicit (keyword-argument arguments #:addressing))
+         (requested (cond (explicit explicit)
                           ((and package-name (string=? name package-name))
                            (%package-addressing))
                           ((memq (%package-addressing-policy) '(content full))
                            'content)
                           ((eq? (%package-addressing-policy) 'mixed) 'mixed)
-                          (else 'input))))
+                          (else 'input)))
+         (arguments (if (memq #:addressing arguments)
+                        (strip-keyword arguments #:addressing)
+                        arguments)))
     (state-parameterize ((%package-derivation-name #f))
       (apply lower name exp
              (append arguments (list #:addressing requested))))))

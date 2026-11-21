@@ -132,5 +132,58 @@
       (not (assoc-ref (derivation-builder-environment-vars grafted)
                       "goonixAddressing")))))
 
+;;; Adoption forces a graft of an input-addressed derivation content-addressed:
+;;; under %graft-content-addressed? the helpers select the CA module and the
+;;; graft derivation carries the content marker and loads (guix ca build graft).
+(let* ((ia-name (fresh-name "ca-graft-adopt"))
+       (ia-drv  (run-with-store store
+                  (gexp->derivation ia-name
+                    #~(call-with-output-file #$output
+                        (lambda (p) (display "IA" p)))
+                    #:addressing 'input
+                    #:guile-for-build guile-drv)))
+       (_       (build-derivations store (list ia-drv)))
+       (repl    (run-with-store store
+                  (gexp->derivation ia-name
+                    #~(call-with-output-file #$output
+                        (lambda (p) (display "REPL" p)))
+                    #:addressing 'input
+                    #:guile-for-build guile-drv)))
+       (_       (build-derivations store (list repl)))
+       (base-modules '((guix build graft) (guix build utils)
+                       (guix build debug-link) (guix elf))))
+  (parameterize ((%graft-content-addressed? #t))
+    (test-equal "forced CA graft imports the content-addressed graft module"
+      (append base-modules '((guix ca build graft)))
+      (goonix-graft-modules ia-drv base-modules))
+    (test-eq "forced CA graft calls graft/content-addressed"
+      'graft/content-addressed
+      (goonix-graft-procedure ia-drv))
+    (test-equal "forced CA graft loads the module in its builder"
+      '((use-modules (guix ca build graft)))
+      (goonix-graft-load ia-drv))
+    (test-assert "a forced CA graft of an input-addressed derivation is content-addressed"
+      (let ((grafted (run-with-store store
+                       (graft-derivation/shallow ia-drv
+                         (list (graft (origin ia-drv) (replacement repl)))
+                         #:guile guile-drv))))
+        (and (equal? "content"
+                     (assoc-ref (derivation-builder-environment-vars grafted)
+                                "goonixAddressing"))
+             ;; The builder text loads the CA module and calls the two-pass
+             ;; procedure, and the graft builds to a content address.  On the
+             ;; host the output path is a placeholder; the realised path is a
+             ;; nix-base32 content address, not a token.
+             (let ((builder (any (match-lambda
+                                   ((key . value)
+                                    (and (string-prefix? "__file:" key)
+                                         value)))
+                                 (derivation-builder-environment-vars grafted))))
+               (build-derivations store (list grafted))
+               (and (string-contains (or builder "") "(guix ca build graft)")
+                    (placeholder-path? (derivation->output-path grafted))
+                    (not (token-store-path?
+                           (realised-output-path store grafted "out"))))))))))
+
 (close-connection store)
 (test-end)

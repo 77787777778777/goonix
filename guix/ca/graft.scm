@@ -11,9 +11,11 @@
 
 (define-module (guix ca graft)
   #:use-module (guix derivations)
-  #:export (goonix-graft-modules
+  #:export (%graft-content-addressed?
+            goonix-graft-modules
             goonix-graft-procedure
-            goonix-graft-load))
+            goonix-graft-load
+            goonix-graft-addressing))
 
 ;;; Commentary:
 ;;;
@@ -33,16 +35,24 @@
 ;;;
 ;;; Code:
 
+(define %graft-content-addressed?
+  ;; Whether grafts are forced content-addressed even over an input-addressed
+  ;; derivation.  Adoption (guix ca adopt) sets this: an adopted item is a
+  ;; content-addressed graft of an upstream input-addressed binary.  Off by
+  ;; default, so an ordinary input-addressed graft stays exactly upstream's.
+  (make-parameter #f))
+
 (define (content-addressed-graft? drv)
-  "Whether grafting DRV writes content-addressing self-tokens.  DRV is not
-input-addressed — it carries a goonixAddressing marker — so the graft
-derivation over it is content-addressed and writes its own outputs at
-self-tokens rather than nix-base32 paths.  (The marker, not the output path,
-is the test: on the host a content-addressed derivation's output path is a
-placeholder, and the self-token only appears in the builder's environment.)"
-  (and (assoc-ref (derivation-builder-environment-vars drv)
-                  "goonixAddressing")
-       #t))
+  "Whether grafting DRV writes content-addressing self-tokens.  Either DRV is
+not input-addressed — it carries a goonixAddressing marker — so the graft
+derivation over it is content-addressed; or %graft-content-addressed? forces
+it (adoption).  (The marker, not the output path, is the test: on the host a
+content-addressed derivation's output path is a placeholder, and the
+self-token only appears in the builder's environment.)"
+  (or (%graft-content-addressed?)
+      (and (assoc-ref (derivation-builder-environment-vars drv)
+                      "goonixAddressing")
+           #t)))
 
 (define (goonix-graft-modules drv modules)
   "Return MODULES, the import list of a graft builder for DRV: unchanged for
@@ -70,5 +80,12 @@ graft/content-addressed is called."
   (if (content-addressed-graft? drv)
       '((use-modules (guix ca build graft)))
       '()))
+
+(define (goonix-graft-addressing drv)
+  "Return the #:addressing argument for a graft derivation over DRV: 'content
+when the graft writes self-tokens (DRV is content-addressed, or adoption
+forces it), otherwise #f so the graft's addressing is decided as upstream's
+is.  Returning #f keeps an input-addressed graft's derivation upstream's."
+  (and (content-addressed-graft? drv) 'content))
 
 ;;; graft.scm ends here

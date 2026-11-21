@@ -159,6 +159,7 @@ are not recursively applied to dependencies of DRV."
                     #:local-build? #t
                     #:substitutable? #f
 
+                    #:addressing ((@ (guix ca graft) goonix-graft-addressing) drv) ;goonix: CA graft addressing
                     #:properties properties))
 
 (define graft-derivation/shallow*

@@ -176,6 +176,10 @@ is a list of file name pairs.  See the module commentary for the two passes."
    own-outputs)
 
   ;; Upstream's grafting hooks (debug-link repair) run on the final outputs.
+  ;; (guix build graft) defines %graft-hooks but does not export it (only
+  ;; replace-store-references, rewrite-directory and graft are exported), so
+  ;; the hook list is spelled out here; if upstream exports %graft-hooks
+  ;; later, use it so a hook it adds applies to content-addressed grafts too.
   (for-each (lambda (hook)
               (hook old-outputs new-outputs mapping #:log-port log-port))
             (list graft-debug-links)))
