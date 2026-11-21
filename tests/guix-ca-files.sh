@@ -23,10 +23,10 @@ export GOONIX_SHELL_SOURCE=$root/shell
 export GOONIX_MKDIR_SOURCE=$HOME/.cache/goonix-test-seed/3c68020130d6d813-mkdir
 export GOONIX_ASYNC_ROOT=$root
 
-server_pid= publisher_pid=
+server_pid= publisher_pid= proxy_pid=
 completed=false
 cleanup() {
-  for pid in $publisher_pid $server_pid; do
+  for pid in $proxy_pid $publisher_pid $server_pid; do
     if test -n "$pid"; then kill "$pid" 2>/dev/null || true; fi
   done
   wait 2>/dev/null || true
@@ -111,6 +111,13 @@ test "$(grep -c "^GET /nar/.*$v2" "$root/publish.log")" -eq 0
 # it; the build succeeded and the content is right, asserted by the client).
 test -e "$client/store/$v2"
 
+# The mixed item (a symlink + a space-name file) substituted file by file: the
+# server saw /goonix/file requests for its two regular files and NO NAR for it.
+mixed=$(sed -n 's/.*(mixed-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
+test "$(grep -c "^GET /goonix/file/$mixed/" "$root/publish.log")" -eq 2
+test "$(grep -c "^GET /nar/.*$mixed" "$root/publish.log")" -eq 0
+test -e "$client/store/$mixed"
+
 # Security regression: /goonix/file must not serve anything outside the item.
 # A secret file outside the store item; requests with "..", "%2e%2e" and a
 # mid-path symlink must get 404 and must NOT contain the secret's bytes.
@@ -152,5 +159,48 @@ if grep -qF 'TRAVERSAL-SECRET-BYTES' "$root/trav-body"; then
 fi
 # A normal file still serves (the guard did not break the happy path).
 test "$(curl -s -o /dev/null -w '%{http_code}' "$url/goonix/file/$v1/a")" = 200
+
+# Corrupt-cache fallback: a proxy serves WRONG bytes for one of V3's files
+# (/goonix/file/<v3>/a) while forwarding the correct NAR and file list.  The
+# file-level NAR hash then differs from the narinfo's, and the substituter must
+# fall back to the (correct) NAR and succeed, never fail the substitution.
+# This fails on d7705cf03b4 (the hash mismatch ended the substitution).
+v3=$(sed -n 's/.*(v3-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
+# Start the corrupt proxy in front of the real publisher.
+./pre-inst-env guile --no-auto-compile tests/ca-files-corrupt-proxy.scm "$url" \
+  >"$root/proxy.log" 2>&1 & proxy_pid=$!
+for i in $(seq 1 100); do
+  if curl -fsS "http://127.0.0.1:6793/nix-cache-info" >/dev/null 2>&1; then break; fi
+  sleep .1
+done
+# A FRESH client store so V3 is not already present, pointing at the proxy.
+client3=$root/client3
+mkdir -p "$client3/store" "$client3/db" "$client3/etc" "$client3/log"
+chmod 700 "$client3/etc"
+cp "$client/etc/acl" "$client3/etc/acl"
+cat > "$root/client3-part.sh" <<EOF
+set -euo pipefail
+export NIX_STORE_DIR=$store GUIX_DATABASE_DIRECTORY=$client3/db
+export GUIX_CONFIGURATION_DIRECTORY=$client3/etc GUIX_STATE_DIRECTORY=$client3
+export GUIX_DAEMON_SOCKET=$client3/socket GUIX_LOG_DIRECTORY=$client3/log
+export GOONIX_SERVER_URL=http://127.0.0.1:6793
+export GOONIX_SHELL_SOURCE=$root/shell
+export GOONIX_MKDIR_SOURCE=$HOME/.cache/goonix-test-seed/3c68020130d6d813-mkdir
+./pre-inst-env ./guix-daemon --disable-chroot --listen="\$GUIX_DAEMON_SOCKET" \
+  --substitute-urls="http://127.0.0.1:6793" >"$root/client3-daemon.log" 2>&1 &
+daemon_pid=\$!
+trap 'kill "\$daemon_pid" 2>/dev/null || true' EXIT
+for i in \$(seq 1 100); do test -S "\$GUIX_DAEMON_SOCKET" && break; sleep .1; done
+./pre-inst-env guile --no-auto-compile tests/ca-files-client.scm "$root/fixture.scm" "$root" v3
+EOF
+unshare --user --map-root-user --mount bash -c \
+  "mount --bind '$client3/store' '$store' && exec unshare --user --map-user=$(id -u) --map-group=$(id -g) bash '$root/client3-part.sh'"
+kill "$proxy_pid" 2>/dev/null || true
+# V3 substituted via the NAR fallback and is valid with the CORRECT content.
+grep -F 'V3_OK=1' "$root/result-v3"
+test -e "$client3/store/$v3"
+# The server saw a NAR request for V3 (the fallback), and the file-level attempt.
+test "$(grep -c "^GET /nar/.*$v3" "$root/publish.log")" -ge 1
+test "$(grep -c "^GET /goonix/files/$v3" "$root/publish.log")" -ge 1
 completed=true
 printf 'CA-7 file-level substitution gate: PASS\n'

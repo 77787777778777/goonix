@@ -85,6 +85,7 @@ EXTRA_DIST +=					\
   tests/ca-two-store-fixture.scm			\
   tests/ca-files-fixture.scm			\
   tests/ca-files-client.scm			\
+  tests/ca-files-corrupt-proxy.scm		\
   tests/ca-untrusted-cache.scm			\
   tests/ca-cutoff.scm				\
   tests/fixtures/flake-shells.scm			\

@@ -291,7 +291,7 @@
        ;; A symlink entry "a" -> outside, then a regular file "a/evil" beneath
        ;; it.  The list is valid per-entry, but assembly must refuse to write
        ;; through the symlink: ensure-parents lstats "a" and finds a symlink.
-       (let ((files (list (list "a" 'symlink %good-hash 7)
+       (let ((files (list (list "a" 'symlink %good-hash 7 outside)
                           (list "a/evil" 'regular %good-hash 5))))
          (test-assert "assembly refuses to write through a symlink parent"
            (catch #t
@@ -299,10 +299,7 @@
                (assemble-file-tree
                 files dst
                 (lambda (entry)
-                  (match entry
-                    ((_ 'symlink _ _) outside)
-                    ((_ _ _ _) (open-input-file
-                                (string-append outside "/marker")))))
+                  (open-input-file (string-append outside "/marker")))
                 #:links-dir links)
                #f)
              (lambda (k . a) #t)))
@@ -312,5 +309,62 @@
                 (equal? '("marker")
                         (scandir outside
                                  (lambda (e) (not (member e '("." "..")))))))))))))
+
+(test-group "symlinks and names with spaces round-trip and assemble"
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((src (string-append root "/src"))
+           (dst (string-append root "/dst"))
+           (links (string-append root "/links")))
+       (mkdir src) (mkdir dst) (mkdir links)
+       ;; A regular file whose name contains a space, and a symlink to it.
+       (call-with-output-file (string-append src "/a file")
+         (lambda (p) (display "SPACE-CONTENT" p)))
+       (symlink "a file" (string-append src "/link"))
+       (let* ((files (store-item-files src))
+              (serialized (file-list->string files))
+              (parsed (string->file-list serialized)))
+         (test-assert "the list round-trips with a space name and a symlink"
+           (equal? files parsed))
+         (test-assert "the symlink entry carries its target"
+           (let ((sym (find (lambda (e) (eq? 'symlink (cadr e))) parsed)))
+             (and sym (string=? "a file" (list-ref sym 4)))))
+         (test-assert "the serialized path is percent-encoded (no raw space)"
+           (not (string-contains serialized "a file")))
+         ;; Assemble: the symlink is made from the carried target, the space
+         ;; name file is fetched.
+         (let ((n (assemble-file-tree
+                   parsed dst
+                   (lambda (entry)
+                     (open-input-file
+                      (string-append src "/" (car entry))))
+                   #:links-dir links)))
+           (test-equal "only the regular file is fetched (symlink not fetched)"
+             1 n)
+           (test-assert "the space-name file is assembled"
+             (string=? "SPACE-CONTENT"
+                       (read-all (string-append dst "/a file"))))
+           (test-assert "the symlink is assembled with its target"
+             (and (eq? 'symlink (stat:type (lstat (string-append dst "/link"))))
+                  (string=? "a file"
+                            (readlink (string-append dst "/link")))))))))))
+
+(test-group "a single-file item assembles when the root does not exist yet"
+  ;; The substituter passes a fresh <temp>/restored path that does not exist.
+  ;; A single-file item's root IS the file: it must be created fresh, not
+  ;; pre-created as a directory (which made O_EXCL fail with EEXIST).
+  (call-with-temporary-directory
+   (lambda (root)
+     (let ((src (string-append root "/src-file"))
+           (dst (string-append root "/fresh-destination")))
+       (call-with-output-file src (lambda (p) (display "SINGLE" p)))
+       (let* ((files (store-item-files src))
+              (n (assemble-file-tree
+                  files dst
+                  (lambda (entry) (open-input-file src)))))
+         (test-equal "the single file is fetched" 1 n)
+         (test-assert "the destination is a regular file with the content"
+           (and (eq? 'regular (stat:type (lstat dst)))
+                (string=? "SINGLE" (read-all dst)))))))))
 
 (test-end "ca-files")

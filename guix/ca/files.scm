@@ -22,7 +22,7 @@
   #:use-module ((guix store deduplication)
                 #:select (deduplicate nar-sha256))
   #:use-module ((guix build utils) #:select (mkdir-p delete-file-recursively))
-  #:use-module (web uri)
+  #:use-module ((web uri) #:select (uri-encode uri-decode string->uri))
   #:use-module (web response)
   #:use-module (ice-9 ftw)
   #:use-module (ice-9 match)
@@ -56,14 +56,31 @@
 ;;;
 ;;; A file list is a list of entries (RELATIVE-PATH TYPE HASH SIZE), where
 ;;; RELATIVE-PATH is relative to the item root ("" for a single-file item),
-;;; TYPE is regular, executable or symlink, HASH is the nix-base32 NAR hash
-;;; (for a symlink, the hash of its target string's NAR form), and SIZE is the
-;;; byte size (for a symlink, the target string length).  Directories are
-;;; implied by the paths and are not listed.
+;;; TYPE is regular or executable, HASH is the nix-base32 NAR hash and SIZE is
+;;; the byte size.  A symlink entry has a fifth field, its TARGET string, and
+;;; HASH is the NAR hash of the symlink (its target's NAR form); the assembler
+;;; makes the symlink from the carried target without following it.
+;;; Directories are implied by the paths and are not listed.
+;;;
+;;; The serialized form (version goonix-files-2) percent-encodes paths and
+;;; symlink targets, so a name with a space or newline cannot break the line
+;;; format; a line that does not parse invalidates the whole list.  The list
+;;; comes from an untrusted cache: every entry is validated before the first
+;;; write, and any failure of the file-level path falls back to the NAR (the
+;;; substituter's NarHash check is unchanged).
 ;;;
 ;;; Code:
 
-(define %file-list-version "goonix-files-1")
+(define %file-list-version "goonix-files-2")
+
+;; Paths and symlink targets are percent-encoded in the serialized list so a
+;; name with a space or newline cannot break the line format or vanish.  The
+;; encoding cannot contain whitespace or newlines (uri-encode escapes them).
+(define (encode-path path)
+  (if (string-null? path) "." (uri-encode path)))
+
+(define (decode-path token)
+  (if (string=? token ".") "" (uri-decode token)))
 
 (define (file-nar-hash file)
   "Return the nix-base32 NAR hash of FILE, the hash .links keys on."
@@ -107,44 +124,61 @@ regular file / symlink."
          (let ((target (readlink file)))
            (list (list relative 'symlink
                        (symlink-nar-hash target)
-                       (string-length target)))))
+                       (string-length target)
+                       target))))
         (else '()))))
   (walk root ""))
 
 (define (file-list->string files)
-  "Serialize FILES, a file list, to a string (one entry per line)."
+  "Serialize FILES, a file list, to a string (one entry per line).  Paths and
+symlink targets are percent-encoded so they cannot contain whitespace or
+newlines.  A symlink entry carries its target as a fifth field."
   (call-with-output-string
     (lambda (port)
       (format port "~a~%" %file-list-version)
       (for-each (match-lambda
                   ((path type hash size)
                    (format port "~a ~a ~a ~a~%"
-                           (if (string-null? path) "." path)
-                           type hash size)))
+                           (encode-path path) type hash size))
+                  ((path 'symlink hash size target)
+                   (format port "~a symlink ~a ~a ~a~%"
+                           (encode-path path) hash size
+                           (uri-encode target))))
                 files))))
 
 (define (valid-file-entry? entry)
-  "Whether ENTRY is a well-formed file-list entry: a non-empty path whose
-components are non-empty and not \".\" or \"..\" (or the empty path for a
-single-file item), a known type, a nix-base32 sha256 hash of exactly 52
-characters, and a non-negative integer size.  A cache is untrusted: any entry
-failing this can name a path outside the destination or a .links file outside
-the store, so the whole list is refused."
+  "Whether ENTRY is a well-formed file-list entry: a path whose components are
+non-empty and not \".\" or \"..\" (or the empty path for a single-file item), a
+known type, a nix-base32 sha256 hash of exactly 52 characters, and a
+non-negative integer size.  A symlink entry carries a target string as a fifth
+field.  A cache is untrusted: any entry failing this can name a path outside
+the destination or a .links file outside the store, so the whole list is
+refused."
+  (define (good-path? path)
+    (and (string? path)
+         (or (string-null? path)
+             (every (lambda (c)
+                      (and (not (string-null? c))
+                           (not (string=? c "."))
+                           (not (string=? c ".."))))
+                    (string-split path #\/)))))
+  (define (good-hash? hash)
+    (and (string? hash)
+         (= 52 (string-length hash))
+         (string-every %nix-base32-charset hash)))
+  (define (good-size? size)
+    (and (integer? size) (>= size 0)))
   (match entry
     ((path type hash size)
-     (and (string? path)
-          (or (string-null? path)
-              (every (lambda (c)
-                       (and (not (string-null? c))
-                            (not (string=? c "."))
-                            (not (string=? c ".."))))
-                     (string-split path #\/)))
-          (memq type '(regular executable symlink directory))
-          (string? hash)
-          (= 52 (string-length hash))
-          (string-every %nix-base32-charset hash)
-          (integer? size)
-          (>= size 0)))
+     (and (good-path? path)
+          (memq type '(regular executable directory))
+          (good-hash? hash)
+          (good-size? size)))
+    ((path 'symlink hash size target)
+     (and (good-path? path)
+          (good-hash? hash)
+          (good-size? size)
+          (string? target)))
     (_ #f)))
 
 (define (valid-file-list? files)
@@ -153,9 +187,11 @@ the store, so the whole list is refused."
        (every valid-file-entry? files)))
 
 (define (string->file-list str)
-  "Parse STR, a serialized file list, back to a list of entries.  A list with
-any malformed entry is refused whole (returns #f), so the substituter falls
-back to the NAR rather than trusting a malicious cache's paths or hashes."
+  "Parse STR, a serialized file list, back to a list of entries.  Paths and
+symlink targets are percent-decoded.  A list with any malformed entry is
+refused whole (returns #f), so the substituter falls back to the NAR rather
+than trusting a malicious cache's paths or hashes.  A line that does not parse
+makes the whole list invalid, never silently dropped."
   (let ((lines (string-split str #\newline)))
     (match lines
       ((version rest ...)
@@ -166,10 +202,15 @@ back to the NAR rather than trusting a malicious cache's paths or hashes."
                       (and (not (string-null? line))
                            (match (string-tokenize line)
                              ((path type hash size)
-                              (list (if (string=? path ".") "" path)
+                              (list (decode-path path)
                                     (string->symbol type)
                                     hash
                                     (string->number size)))
+                             ((path "symlink" hash size target)
+                              (list (decode-path path) 'symlink
+                                    hash
+                                    (string->number size)
+                                    (uri-decode target)))
                              (_ #f))))
                     rest)))
               ;; Every non-empty line must parse to a valid entry; a line that
@@ -262,6 +303,13 @@ only when it is a regular file.  Nothing is written or chmodded outside ROOT."
 
   (define (assemble-entry entry)
     (match entry
+      ((path 'symlink hash size target)
+       ;; The target is carried in the (validated) list; make the symlink with
+       ;; it, never following it.  No fetch needed.
+       (let ((dest (if (string-null? path) root (string-append root "/" path))))
+         (unless (string-null? path)
+           (ensure-parents path))
+         (symlink target dest)))
       ((path type hash size)
        (let ((dest (if (string-null? path) root (string-append root "/" path))))
          (unless (string-null? path)
@@ -271,10 +319,6 @@ only when it is a regular file.  Nothing is written or chmodded outside ROOT."
             (unless (file-exists? dest)
               (mkdir dest)
               (chmod dest #o755)))
-           ((symlink)
-            ;; FETCH-FILE returns the target string; stored as-is, never
-            ;; followed during assembly.
-            (symlink (fetch-file entry) dest))
            ((regular executable)
             (if (have-links? hash)
                 (link-from-links hash dest)
@@ -284,8 +328,11 @@ only when it is a regular file.  Nothing is written or chmodded outside ROOT."
   (unless (valid-file-list? files)
     (error "invalid file list" files))
   ;; The destination root itself may not exist yet (the substituter passes a
-  ;; fresh <temp>/restored path); create it as a real directory.
-  (unless (file-exists? root)
+  ;; fresh <temp>/restored path).  Create it as a directory only when the list
+  ;; describes a tree (some entry has a non-empty path); a single-file item's
+  ;; root IS the file, created fresh by write-regular below.
+  (when (and (not (file-exists? root))
+             (any (lambda (e) (not (string-null? (car e)))) files))
     (mkdir root)
     (chmod root #o755))
   ;; Deepest paths last so parents exist; sort by depth then name.
@@ -346,20 +393,29 @@ type is not the only guard."
 
 (define (render-file store request name path)
   "Render the raw bytes of one file (PATH, relative) of the store item NAME.
-Returns two values: the response headers (with x-raw-file for the web server)
-and #f.  A missing item or file, or a path that escapes the item, gives a 404."
+An empty PATH serves the item itself when it is a single regular file (the
+file list of a single-file item has one entry with the empty path).  Returns
+two values: the response headers (with x-raw-file for the web server) and #f.
+A missing item or file, or a path that escapes the item, gives a 404."
   (define (not-found)
     (values (build-response #:code 404) "not found"))
   (let* ((item (string-append (%store-prefix) "/" name))
          (file (and (valid-path? store item)
-                    (safe-item-file item path))))
+                    (if (string-null? path)
+                        ;; The item itself, only when it IS a regular file.
+                        (and (file-exists? item)
+                             (eq? 'regular (stat:type (lstat item)))
+                             item)
+                        (safe-item-file item path)))))
     ;; Second guard: the canonical (symlink-resolved) file must stay inside the
-    ;; canonical item directory.  safe-item-file already refuses a symlink on
-    ;; any component; this catches anything that slips through.
+    ;; canonical item (or be the single-file item itself).  safe-item-file
+    ;; already refuses a symlink on any component; this catches anything that
+    ;; slips through.
     (if (and file
              (let ((canon-item (canonicalize-path item))
                    (canon-file (canonicalize-path file)))
-               (string-prefix? (string-append canon-item "/") canon-file)))
+               (or (string=? canon-file canon-item)
+                   (string-prefix? (string-append canon-item "/") canon-file))))
         (values `((content-type . (application/octet-stream
                                    (charset . "ISO-8859-1")))
                   (x-raw-file . ,file))
@@ -389,13 +445,15 @@ Returns the number of files fetched over the network."
      files root
      (lambda (entry)
        (match entry
-         ((path 'symlink hash size)
-          (error "symlink file-level fetch not supported" path))
          ((path type hash size)
           ;; Return an input port with the file's content; assemble-file-tree
-          ;; creates the destination safely and copies from it.
+          ;; creates the destination safely and copies from it.  A single-file
+          ;; item's entry has the empty path: no trailing slash in the URL.
+          ;; (Symlinks carry their target in the list and are never fetched.)
           (let-values (((port resp)
-                        (http-fetch (url "goonix" "file" name path)
+                        (http-fetch (if (string-null? path)
+                                        (url "goonix" "file" name)
+                                        (url "goonix" "file" name path))
                                     #:timeout timeout)))
             port))))
      #:links-dir links-dir)))
@@ -403,14 +461,18 @@ Returns the number of files fetched over the network."
 (define* (substitute-files/nar narinfo destination
                                #:key (links-dir #f) timeout
                                (open-connection-for-uri #f))
-  "File-level substitution for the daemon's substituter: fetch the file list
-of NARINFO's item from its cache, assemble the tree under DESTINATION
-(hard-linking files already in LINKS-DIR, fetching the rest over
-/goonix/file), and return two values like 'download-nar': the expected NAR
-hash from NARINFO and the actual NAR hash of the assembled tree.  The caller's
-bytevector=? check of those two is what makes file-level fetching safe; it is
-unchanged.  Returns (values #f #f) when the cache offers no file list, so the
-caller falls back to the NAR."
+  "File-level substitution for the daemon's substituter: an OPTIMISATION over
+the NAR.  Fetch the file list of NARINFO's item from its cache, assemble the
+tree under DESTINATION (hard-linking files already in LINKS-DIR, fetching the
+rest over /goonix/file), and return two values like 'download-nar': the
+expected NAR hash from NARINFO and the actual NAR hash of the assembled tree.
+
+Any failure of the file-level path — a parse error, an unsupported entry, an
+assembly error, or an actual NAR hash different from the expected one — deletes
+DESTINATION and returns (values #f #f), so the caller downloads the NAR, which
+its unchanged bytevector=? check then verifies.  File-level fetching must never
+make a substitution fail that the NAR path would complete.  A message goes to
+stderr so a failing cache is visible."
   (define cache-url (narinfo-uri-base narinfo))
   (define name (basename (narinfo-path narinfo)))
   (define (url . components)
@@ -423,14 +485,23 @@ caller falls back to the NAR."
       (let ((text (get-string-all port)))
         (close-port port)
         text)))
-  (guard (c ((or (http-get-error? c) (network-error? c))
-             ;; No file list (or unreachable): fall back to the NAR.
-             (values #f #f)))
+  (define (fallback reason)
+    ;; Delete any partial assembly and signal "no file list" so the caller
+    ;; downloads the NAR.
+    (format (current-error-port)
+            "goonix: file-level substitution of '~a' fell back to the NAR: ~a~%"
+            name reason)
+    (catch 'system-error
+      (lambda () (delete-file-recursively destination))
+      (const #f))
+    (values #f #f))
+  ;; Catch ANY failure of the file-level path, not just network errors: an
+  ;; unsupported entry, a refused parent, EEXIST, etc. must fall back too.
+  (guard (c (#t (fallback (format #f "~s" c))))
     (let* ((list-text (fetch-text (url "goonix" "files" name)))
            (files (string->file-list list-text)))
       (if (not files)
-          ;; A malformed (malicious) file list: fall back to the NAR.
-          (values #f #f)
+          (fallback "invalid file list")
           (begin
             ;; Delete DESTINATION first, as download-nar does.
             (catch 'system-error
@@ -440,39 +511,46 @@ caller falls back to the NAR."
              files destination
              (lambda (entry)
                (match entry
-                 ((path 'symlink hash size)
-                  (error "symlink file-level fetch not supported" path))
                  ((path type hash size)
                   ;; Return an input port with the file's content;
                   ;; assemble-file-tree creates the destination safely
-                  ;; (O_NOFOLLOW|O_EXCL) and copies.
+                  ;; (O_NOFOLLOW|O_EXCL) and copies.  Symlinks carry their
+                  ;; target in the list and are not fetched.  A single-file
+                  ;; item's entry has the empty path: no trailing slash.
                   (let-values (((port resp)
-                                (http-fetch (url "goonix" "file" name path)
+                                (http-fetch (if (string-null? path)
+                                                (url "goonix" "file" name)
+                                                (url "goonix" "file" name path))
                                             #:timeout timeout)))
                     port))))
              #:links-dir links-dir)
-            ;; Deduplicate the assembled files into the store's .links, as the
-            ;; NAR path's dump-file/deduplicate does, so a later item sharing a
-            ;; file hard-links it instead of fetching it again.  Only regular
-            ;; files past the dedup minimum are registered.
-            (when links-dir
-              (for-each (match-lambda
-                          ((path type hash size)
-                           (when (memq type '(regular executable))
-                             (let ((file (if (string-null? path)
-                                             destination
-                                             (string-append destination "/" path))))
-                               (deduplicate file (nar-sha256 file)
-                                            #:store (dirname links-dir))))))
-                        files))
             ;; The actual NAR hash of the assembled tree, computed the same way
             ;; the daemon's hashPath does (file-hash* recursive writes the NAR
-            ;; form).
+            ;; form).  If it differs from the narinfo's, the cache served wrong
+            ;; bytes: fall back to the NAR rather than fail the substitution.
             (let-values (((algorithm expected)
                           (narinfo-hash-algorithm+value narinfo)))
-              (values expected
-                      (file-hash* destination #:algorithm algorithm
-                                  #:recursive? #t
-                                  #:select? (const #t)))))))))
+              (let ((actual (file-hash* destination #:algorithm algorithm
+                                        #:recursive? #t
+                                        #:select? (const #t))))
+                (if (bytevector=? actual expected)
+                    (begin
+                      ;; Deduplicate the assembled files into the store's
+                      ;; .links, as the NAR path's dump-file/deduplicate does,
+                      ;; so a later item sharing a file hard-links it instead
+                      ;; of fetching it again.
+                      (when links-dir
+                        (for-each (match-lambda
+                                    ((path type hash size)
+                                     (when (memq type '(regular executable))
+                                       (let ((file (if (string-null? path)
+                                                       destination
+                                                       (string-append destination "/" path))))
+                                         (deduplicate file (nar-sha256 file)
+                                                      #:store (dirname links-dir)))))
+                                    ((path 'symlink hash size target) #f))
+                                  files))
+                      (values expected actual))
+                    (fallback "assembled NAR hash differs from the narinfo")))))))))
 
 ;;; files.scm ends here
