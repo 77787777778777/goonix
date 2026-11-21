@@ -6,6 +6,7 @@ module Goonix.Store.Archive
   ( exportPath
   , importPaths
   , importPathsFrom
+  , rewriteNarPaths
   ) where
 
 import Control.Exception (SomeException, throwIO, try)
@@ -23,6 +24,7 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.Wire
 import Goonix.Store.Writing
 import Goonix.Store.Files (deleteTree, restoreNar, deduplicateTree)
+import System.Posix.ByteString (RawFilePath)
 import System.IO (Handle, hPutStrLn, hFlush)
 import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
 import System.Posix.Env (getEnv)
@@ -96,6 +98,39 @@ byteStringSource input = do
   bytes <- readIORef state
   writeIORef state B.empty
   pure bytes
+
+-- | Rewrite store paths inside a built output, in place, matching the C++
+-- daemon's check-mode hash rewriting (build.cc rewritesFromTmp): serialise the
+-- output to a NAR, replace each @from@ path with the same-length @to@ path in
+-- the NAR bytes, and restore the result.  Used in check mode to turn the
+-- redirected (temporary) output paths back into the original paths before the
+-- determinism hash is computed, so a builder that embeds $out in its output
+-- (e.g. the bootstrap Guile wrapper) compares equal to the original build.
+-- Every replacement must preserve length, or the NAR framing would break.
+rewriteNarPaths :: RawFilePath -> [(ByteString, ByteString)] -> IO ()
+rewriteNarPaths path replacements = do
+  mapM_ (\(from, to) -> when (B.length from /= B.length to)
+    (throwIO (storeError "check-mode path rewrite must preserve length"))) replacements
+  nar <- dumpNar path
+  let rewritten = foldl (\bytes (from, to) -> rewriteBytes from to bytes) nar replacements
+  if rewritten == nar then pure () else do
+    state <- newIORef rewritten
+    let consume count = do
+          bytes <- readIORef state
+          when (B.length bytes < count) (throwIO (storeError "truncated rewritten NAR"))
+          let (wanted, rest) = B.splitAt count bytes
+          writeIORef state rest
+          pure wanted
+        integer = readInteger consume
+        string = readString consume integer
+    (_, tree) <- readNar consume string
+    deleteTree path
+    restoreNar path tree
+  where
+    rewriteBytes from to bytes = B.intercalate to (splitOnBytes from bytes)
+    splitOnBytes separator input = case B.breakSubstring separator input of
+      (before, after) | B.null after -> [before]
+                      | otherwise -> before : splitOnBytes separator (B.drop (B.length separator) after)
 
 type Consume = Int -> IO ByteString
 type ReadString = IO ByteString

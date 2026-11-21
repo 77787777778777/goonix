@@ -24,6 +24,11 @@ run_one() {
   local daemon step pid daemon_scope
   for step in 1 2 3; do
     case "$step" in 1) daemon=$first ;; 2) daemon=$second ;; 3) daemon=$first ;; esac
+    # The previous step's daemon left its socket file; remove it so the test -S
+    # wait below only sees this step's daemon (a stale file would pass the wait
+    # at once and race the new daemon's unlink/bind, errno 111 on the dead file).
+    rm -f "$GUIX_DAEMON_SOCKET"
+    test ! -e "$GUIX_DAEMON_SOCKET"
     goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon-$step.log" 2>&1
     daemon_scope=$GOONIX_TEST_SCOPE
     if test "$name" = cxx-hs-cxx; then pid1=$GOONIX_TEST_PID; scope1=$daemon_scope; else pid2=$GOONIX_TEST_PID; scope2=$daemon_scope; fi

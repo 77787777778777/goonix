@@ -35,6 +35,7 @@ import Goonix.Store.Derivation
 import Goonix.Store.Files
 import Goonix.Store.Hash
 import Goonix.Store.Nar (dumpNar, hashNar)
+import Goonix.Store.Archive (rewriteNarPaths)
 import Goonix.Store.Path (storePathToName)
 import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
@@ -107,7 +108,15 @@ type HookPool = (IORef (Maybe Hook), ByteString)
 buildThingsInternal config rootFd store settings trace hook things mode cancel = do
   let userPool = config >>= configBuildUsers
   attemptedDownloads <- newIORef Set.empty
-  let discover path wanted role = case role of
+  -- C++ gives only the top-level goals the caller's build mode; the inputs of a
+  -- derivation are built in normal mode unless the caller is repairing
+  -- (DerivationGoal::haveDerivation).  A valid input in normal mode is done at
+  -- once, so --check of a derivation rebuilds that derivation and nothing else.
+  -- Passing the caller's mode to every job would rebuild valid inputs in check
+  -- mode with redirected outputs (re-downloading fixed-output inputs, rebuilding
+  -- the whole input closure), which C++ never does.
+  let inputMode = if mode == Repair then Repair else Normal
+  let discover jobMode path wanted role = case role of
         DownloadJob -> pure JobSpec
           { jobId = path, jobWanted = wanted, jobKind = DownloadJob
           , jobRun = \_ -> do
@@ -125,19 +134,19 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                 discovered <- readIORef phase
                 if discovered
                   then do
-                    buildDerivationNow userPool config rootFd store settings trace hook mode requested path
+                    buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
                     pure Done
                   else do
                     writeIORef phase True
-                    buildDerivation attemptedDownloads discover config rootFd store settings trace hook mode requested path }
+                    buildDerivation attemptedDownloads (discover inputMode) config rootFd store settings trace hook jobMode requested path }
   specs <- forM things $ \thing -> do
     let (path, wanted) = case B.break (== 33) thing of
           (drv, selected) | not (B.null selected) ->
             (drv, Set.fromList (filter (not . B.null) (C.split ',' (B.drop 1 selected))))
           _ -> (thing, Set.empty)
     if ".drv" `B.isSuffixOf` path
-      then discover path wanted BuildJob
-      else discover (downloadJobId thing) Set.empty DownloadJob
+      then discover mode path wanted BuildJob
+      else discover mode (downloadJobId thing) Set.empty DownloadJob
   let maxJobs = settingInt "build-max-jobs" 1 settings
       separateDownloads = if settingBool "build-separate-download-slots" False settings
         then Just (settingInt "build-max-download-jobs" 1 settings)
@@ -145,7 +154,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
   when (maxJobs == 0 && separateDownloads == Nothing &&
       not (settingBool "build-use-build-hook" True settings) && not (null things)) $
     throwIO (storeError "unable to start any build; either increase `--max-jobs' or enable distributed builds")
-  runScheduledWithCancel maxJobs separateDownloads (keepGoing settings) discover specs cancel
+  runScheduledWithCancel maxJobs separateDownloads (keepGoing settings) (discover inputMode) specs cancel
 
 ensureStorePath :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO ()
 ensureStorePath config rootFd store settings trace path = do
@@ -757,6 +766,12 @@ checkBuiltOutputs :: Store -> ByteString -> [(ByteString, ByteString)] -> Bool -
 checkBuiltOutputs store drvPath replacements retain = forM_ replacements $ \(original, temporary) -> do
   exists <- Files.fileExist temporary
   unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' did not produce output `" ++ C.unpack original ++ "'"))
+  -- The check build ran with the output redirected to `temporary`, so a builder
+  -- that embeds $out (e.g. the bootstrap Guile wrapper) wrote `temporary` into
+  -- its output.  Rewrite those paths back to `original` before hashing, as the
+  -- C++ daemon does with rewritesFromTmp; otherwise the determinism check would
+  -- spuriously report a difference.
+  rewriteNarPaths temporary [(temporary, original)]
   _ <- canonicaliseAndHash store temporary
   valid <- isValidPath store original
   if not valid
