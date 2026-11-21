@@ -24,6 +24,7 @@ module Goonix.Store.Files
   , withdrawRoots
   , storeGcLockPathOf
   , withOwnCollector
+  , withCollectorGCLock
   , deduplicateTree
   , makeSymlinkAtomic
   , mkdirParents
@@ -41,6 +42,7 @@ import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVa
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Control.Monad (foldM, forM_, unless, when)
+import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -308,8 +310,20 @@ withTempRootFile path gcPath action = do
         Just root -> pure (Map.insert path root { rootUsers = rootUsers root + 1 } roots, root)
         Nothing -> do
           own <- ownCollectorHolds gcPath
-          root <- if own then openRoot else withGCReadLock gcPath openRoot
+          root <- if own then testDelay >> openRoot else withGCReadLock gcPath openRoot
           pure (Map.insert path root roots, root)
+    -- Test-only: widen the flag-check -> file-creation window of a client that
+    -- skips the shared GC lock (collector-release-race.sh).  No-op unless the
+    -- env var is set.  With the pre-fix release (flag and lock released WITHOUT
+    -- tempRootLock) this delay lets the collector release and another process's
+    -- collector enumerate before this client's file exists.  With the fix the
+    -- collector's release waits for tempRootLock, which this client holds across
+    -- the delay and openRoot, so the file exists before the GC lock is freed.
+    testDelay = do
+      delay <- lookupEnv "GOONIX_TEST_TEMPROOT_CREATE_DELAY_US"
+      forM_ delay $ \value -> case reads value of
+        [(micros, "")] | micros > 0 -> threadDelay micros
+        _ -> pure ()
     openRoot = do
       fd <- withCStringBytes path c_lock_exclusive
       if fd >= 0 then do
@@ -416,6 +430,31 @@ withOwnCollector gcPath =
 -- | Does this process's own collector currently hold the GC lock on this path?
 ownCollectorHolds :: RawFilePath -> IO Bool
 ownCollectorHolds gcPath = Set.member gcPath <$> readTVarIO ownCollector
+
+-- | Run a collection under the exclusive GC lock, with the own-collector flag
+-- set, and release BOTH the flag and the lock while holding tempRootLock.
+--
+-- The release ordering matters.  A new client checks ownCollectorHolds and then
+-- creates its temporary-root file, both under tempRootLock (withTempRootFile).
+-- If the collector cleared the flag and released the GC lock WITHOUT
+-- tempRootLock, a client could see the flag set, skip the shared GC lock, and
+-- create its file after this process's collection ended but before another
+-- process's collector took the GC lock and enumerated temproots/ — the same gap
+-- the shared lock at creation exists to close, narrowed to a few microseconds.
+-- Clearing the flag and releasing the lock under tempRootLock means a client
+-- that saw the flag set has finished creating its file (it holds tempRootLock
+-- through openRoot) before this release completes, so no other process can take
+-- the GC lock until the file exists.
+withCollectorGCLock :: RawFilePath -> IO a -> IO a
+withCollectorGCLock gcPath action = do
+  mkdirParents (parent gcPath)
+  bracket (acquireFileLock gcPath Exclusive) (const releaseLocked) $ \_ -> do
+    atomically (modifyTVar' ownCollector (Set.insert gcPath))
+    action
+  where
+    releaseLocked = withMVar tempRootLock $ \() -> uninterruptibleMask_ $ do
+      atomically (modifyTVar' ownCollector (Set.delete gcPath))
+      releaseFileLock gcPath False
 
 withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
 withTemporaryRoots = withTemporaryRootsExcept Nothing

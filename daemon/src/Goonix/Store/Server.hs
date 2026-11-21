@@ -43,7 +43,7 @@ import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import System.Posix.Env.ByteString (getEnv)
-import Goonix.Store.Files (withTempRootFile, withGCLock, withOwnCollector, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
+import Goonix.Store.Files (withTempRootFile, withCollectorGCLock, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
 import qualified System.Posix.Files.ByteString as Files
 import System.Posix.User (getUserEntryForID, userName)
@@ -271,7 +271,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       pure ()
     when (ignoreLiveness == 1) (throwIO (storeError "you are not allowed to ignore liveness"))
     settings <- readIORef settingsRef
-    (deleted, freed) <- withGCLock (storeGcLockPath config) $ withOwnCollector (storeGcLockPath config) $ do
+    (deleted, freed) <- withCollectorGCLock (storeGcLockPath config) $ do
       roots <- findRoots store
       withOtherTemporaryRoots (temporaryRootsPath config) rootFd $ \temporary -> do
         live <- Collector.livePaths (map snd roots ++ temporary) store
