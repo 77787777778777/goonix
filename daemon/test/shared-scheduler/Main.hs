@@ -70,14 +70,20 @@ main = do
   buildCount <- readIORef builds
   check "two clients same derivation cause one build" (buildCount == 1)
 
-  -- A failed goal is shared: both clients see the failure, builder runs once.
+  -- Only SUCCESS is shared.  The starter's build fails (its own settings); the
+  -- starter gets the failure.  A waiter whose goal failed runs its OWN attempt
+  -- with its own settings, which succeeds — as a waiter on the output lock would
+  -- in C++.  So the builder runs twice (starter fails, waiter succeeds).
   shared3 <- newShared 4
   failBuilds <- newIORef (0 :: Int)
   failRelease <- newEmptyMVar
+  -- The starter's attempt fails; the waiter's own attempt succeeds.  The first
+  -- call (starter) throws; the second call (waiter re-run) succeeds.
   let failing = do
-        atomicModifyIORef' failBuilds (\n -> (n + 1, ()))
-        takeMVar failRelease
-        throwIO (storeError "shared goal failed")
+        n <- atomicModifyIORef' failBuilds (\n -> (n + 1, n))
+        if n == 0
+          then do takeMVar failRelease; throwIO (storeError "starter goal failed")
+          else pure ()
   f1 <- newEmptyMVar
   f2 <- newEmptyMVar
   let runFailing out = do
@@ -90,10 +96,10 @@ main = do
   putMVar failRelease ()
   r1 <- takeMVar f1
   r2 <- takeMVar f2
-  check "failed goal shared with first client" (isLeft r1)
-  check "failed goal shared with second client" (isLeft r2)
+  check "starter gets its own goal failure" (isLeft r1)
+  check "waiter re-runs its own attempt and succeeds" (isRight r2)
   failCount <- readIORef failBuilds
-  check "failed goal built once" (failCount == 1)
+  check "failed goal: starter fails, waiter builds again" (failCount == 2)
 
   -- A client arriving after the goal ended re-runs (output valid -> no-op).
   shared4 <- newShared 4
@@ -107,3 +113,5 @@ main = do
   where
     isLeft (Left _) = True
     isLeft _ = False
+    isRight (Right _) = True
+    isRight _ = False

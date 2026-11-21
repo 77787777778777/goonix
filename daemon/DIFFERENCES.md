@@ -42,6 +42,22 @@ derivation across all clients, as in the C++ daemon's single goal loop:
   interested client disconnects, the worker is killed — a single client's
   disconnect still kills its build, as before.
 
+Goal sharing is bounded by two rules, so a client gets what it would get from
+the C++ daemon, where each client has its own goals and clients meet only at the
+output locks:
+
+- Goals are shared only between Normal-mode requests. A Check or Repair request
+  always runs its own build: attaching a check to a normal goal would check
+  nothing, and attaching a normal request to a check goal would take "success"
+  from a build that writes redirected paths and registers nothing.
+- Only success is shared. The starter gets the goal's failure (it ran the build
+  with its own settings); a waiter whose goal failed runs its own attempt with
+  its own settings, as a waiter on the output lock would. The goal may have
+  failed because of the starter's settings (max-silent-time, timeout,
+  keep-failed, the substituters it allows) or a transient fault, which need not
+  apply to the waiter. The failure cache, when enabled, stays the only shared
+  failure, as in C++.
+
 The lock files stay, for helpers and for other daemons: this sharing is
 in-process only. Two daemon processes on one store still serialize through the
 output locks and the GC lock. The observable build results are unchanged from

@@ -141,10 +141,17 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                     -- client, so it outlives the client that started it while any
                     -- other client is still interested (and is killed when the
                     -- last leaves).  The output locks still exclude other daemons.
+                    --
+                    -- Goals are shared only between NORMAL-mode requests.  A
+                    -- Check or Repair request always runs its own build, as in
+                    -- C++: attaching a check to a normal goal would check nothing,
+                    -- and attaching a normal request to a check goal would take
+                    -- "success" from a build that writes redirected paths and
+                    -- registers nothing.
                     case config >>= configSharedScheduler of
-                      Nothing -> buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
-                      Just shared -> withGoal shared path
+                      Just shared | jobMode == Normal -> withGoal shared path
                         (daemonOwnedBuild config userPool settings trace hook jobMode requested path)
+                      _ -> buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
                     pure Done
                   else do
                     writeIORef phase True

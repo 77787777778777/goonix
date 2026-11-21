@@ -106,6 +106,12 @@ releaseSlot shared = atomically $
 -- (the output is then valid, so it is a no-op recheck).  This is the in-process
 -- "one goal per derivation"; the output locks still exclude other processes.
 --
+-- Only SUCCESS is shared.  The starter gets the goal's failure (it ran the
+-- build with its own settings); a waiter whose goal failed runs its own attempt
+-- with its own settings, as a waiter on the output lock would in C++.  The
+-- caller shares goals only between Normal-mode requests — Check and Repair run
+-- their own build (see the engine).
+--
 -- @build@ must own its temporary roots and store handle and tolerate a gone
 -- client: the daemon-owned worker may outlive the client that started it.
 withGoal :: Shared -> ByteString -> IO () -> IO ()
@@ -134,7 +140,7 @@ withGoal shared derivation build = do
       -- Wait for the goal; if this client is cancelled (disconnect), detach.
       -- When the last interested client detaches, kill the daemon-owned worker.
       r <- atomically (readTMVar w) `onException` detach w
-      finish r
+      finish start r
   where
     attach goal = do
       waiter <- newEmptyTMVar
@@ -158,8 +164,16 @@ withGoal shared derivation build = do
                 pure worker
               else pure Nothing
       forM_ toKill killThread
-    finish GoalSucceeded = pure ()
-    finish (GoalFailed exception) = throwIO exception
+    -- Share only SUCCESS.  The starter ran the build with its own settings, so
+    -- it gets the goal's failure.  A WAITER whose goal failed runs its own
+    -- attempt with its own settings, exactly as a waiter on the output lock
+    -- would in C++: the goal may have failed because of the starter's settings
+    -- (silent-time, timeout, substituters) or a transient fault, which need not
+    -- apply to this client.  The failure cache, when enabled, stays the only
+    -- shared failure.
+    finish _ GoalSucceeded = pure ()
+    finish True (GoalFailed exception) = throwIO exception
+    finish False (GoalFailed _exception) = build
 
 -- | Fork the daemon-owned worker for a goal, once.  The worker runs the build,
 -- records the result, notifies every waiter and removes the goal.  It is not
