@@ -11,6 +11,7 @@
 
 (define-module (guix ca policy)
   #:use-module (guix monads)
+  #:use-module (guix store)
   #:use-module (guix packages)
   #:use-module (guix sets)
   #:use-module (guix build-system)
@@ -25,6 +26,7 @@
             %package-addressing
             upstream-package-set
             package-addressing
+            adopt-package?
             package-addressing-key
             lower-bag-with-addressing
             gexp-with-addressing
@@ -93,20 +95,62 @@
         ((memq (%package-addressing-policy) '(content full)) 'content)
         ((eq? (%package-addressing-policy) 'mixed)
          (if ((%upstream-package?) package) 'input 'content))
+        ((eq? (%package-addressing-policy) 'adopted)
+         ;; Upstream's unmodified packages are lowered input-addressed and
+         ;; then adopted (their binary rewritten to a content-addressed item,
+         ;; see lower-bag-with-addressing); everything else is built
+         ;; content-addressed.  Opaque packages stay resolved (above).
+         (if ((%upstream-package?) package) 'input 'content))
         (else 'input)))
+
+(define (adopt-package? package)
+  "Whether PACKAGE's own derivation is adopted under the current policy: the
+policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
+  (and (eq? (%package-addressing-policy) 'adopted)
+       ((%upstream-package?) package)
+       (not (eq? 'opaque
+                 (assq-ref (package-properties package) 'self-references)))))
 
 (define (package-addressing-key)
   "Return the current mode and marker for the package derivation cache."
   (list (%package-addressing-policy) (%upstream-package?)))
 
 (define (lower-bag-with-addressing lower bag . arguments)
-  "Apply the package's own addressing around its bag build, after inputs."
+  "Apply the package's own addressing around its bag build, after inputs.
+Under the 'adopted policy an upstream package's input-addressed derivation is
+adopted (its binary rewritten to a content-addressed item); a flagged item or
+glibc is re-lowered content-addressed from source instead."
   (let ((context (and (pair? arguments) (car arguments))))
     (if (package? context)
         (state-parameterize ((%package-addressing (package-addressing context))
                              (%package-derivation-name (bag-name bag)))
-          (apply lower bag arguments))
+          (let ((drv (apply lower bag arguments)))
+            (if (adopt-package? context)
+                (adopt-lowered-derivation lower bag arguments drv)
+                drv)))
         (apply lower bag arguments))))
+
+(define (adopt-lowered-derivation lower bag arguments drv)
+  "Adopt DRV, the monadic input-addressed derivation of an upstream package
+under the 'adopted policy.  DRV is built with input-addressed inputs (the
+upstream graph); adoption then rewrites its references to adopted items.  If
+the scanner flags the item or it is glibc, re-lower it content-addressed from
+source instead."
+  (with-monad %store-monad
+    (>>= (state-parameterize ((%package-addressing-policy 'input))
+           drv)
+         (lambda (d)
+           (lambda (store)
+             (let ((adopt ((module-ref (resolve-module '(guix ca adopt))
+                                       'adopt-derivation)
+                           store d)))
+               (if (eq? adopt d)
+                   ;; Flagged or glibc: build content-addressed from source.
+                   (values (run-with-store store
+                             (state-parameterize ((%package-addressing 'content))
+                               (apply lower bag arguments)))
+                           store)
+                   (values adopt store))))))))
 
 (define (keyword-argument arguments keyword)
   (let loop ((rest arguments))

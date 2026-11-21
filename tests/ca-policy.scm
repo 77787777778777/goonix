@@ -312,5 +312,54 @@
       (test-assert "opaque B refers to A's realised path"
         (member (second a-result) (references store (second b-result)))))))
 
+(test-group "the adopted policy adopts upstream packages and builds the rest"
+  (let* ((leaf (trivial "ca-policy-adopt-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p)))))
+         (mid  (trivial "ca-policy-adopt-mid"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (format p "~a/MID" #$leaf)))
+                        `(("leaf" ,leaf))))
+         (top  (trivial "ca-policy-adopt-top"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (format p "~a/TOP" #$mid)))
+                        `(("mid" ,mid))))
+         (inherited (package (inherit top)))
+         (opaque (trivial "ca-policy-adopt-opaque"
+                          #~(call-with-output-file #$output
+                              (lambda (p) (display "OPAQUE" p)))
+                          '() '((self-references . opaque)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf mid top opaque %bootstrap-guile)))))
+      (test-assert "an upstream package is adopted"
+        (adopt-package? top))
+      (test-assert "an inherited package is not adopted"
+        (not (adopt-package? inherited)))
+      (test-assert "an opaque package is not adopted"
+        (not (adopt-package? opaque)))
+      (let ((d (package-derivation store top))
+            (original-mid
+             (parameterize ((%package-addressing-policy 'input))
+               (let ((mid-drv (package-derivation store mid)))
+                 (build-derivations store (list mid-drv))
+                 (realised-output-path store mid-drv "out")))))
+        (test-equal "the adopted top is content-addressed"
+          "content" (addressing d))
+        (build-derivations store (list d))
+        (let* ((out (realised-output-path store d "out"))
+               (refs (references store out)))
+          (test-assert "the adopted top references an adopted mid, not the original"
+            (and (not (member original-mid refs))
+                 (every (lambda (r) (string-contains r "ca-policy-adopt-mid"))
+                        refs)))
+          (test-assert "the adopted top keeps its payload"
+            (string-suffix? "/TOP" (call-with-input-file out get-string-all)))))
+      (test-equal "an inherited package is content-addressed from source"
+        "content" (addressing (package-derivation store inherited)))
+      (test-equal "an opaque package stays resolved"
+        "resolved" (addressing (package-derivation store opaque))))))
+
 (close-connection store)
 (test-end)
