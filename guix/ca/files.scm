@@ -199,11 +199,16 @@ response headers and the body string.  A missing item gives a 404."
 (define (safe-item-file item path)
   "Resolve PATH (relative, slash-separated) under the store item directory
 ITEM, returning the absolute file name only when it is a regular file safely
-inside ITEM, else #f.  Rejects empty, \".\" and \"..\" components, and refuses
-a symlink anywhere along the path (a mid-path symlink could lead out of the
-item, and upstream's NAR serving never follows one).  Each component is
-checked with lstat so the final component's type is not the only guard."
+inside ITEM, else #f.  ITEM itself must be a real directory: a store item can
+be a symlink with any target (a builder may write (symlink \"/etc\" out)), and
+walking through it would serve files outside the store.  Rejects empty, \".\"
+and \"..\" components, and refuses a symlink anywhere along the path (a
+mid-path symlink could lead out of the item, and upstream's NAR serving never
+follows one).  Each component is checked with lstat so the final component's
+type is not the only guard."
   (and (not (string-null? path))
+       (file-exists? item)
+       (eq? 'directory (stat:type (lstat item)))
        (let ((components (string-split path #\/)))
          (and (every (lambda (c)
                        (and (not (string-null? c))

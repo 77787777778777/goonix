@@ -24,13 +24,24 @@
 (define v2 (item "ca-files-v2" "alpha" "BETA-CHANGED" "gamma"))
 (build-derivations store (list v2))
 
+;; A store item that IS a symlink to a directory holding a secret.  A builder
+;; can write (symlink "/etc" out); /goonix/file must not walk through it.
+;; Added directly with add-to-store (recursive, preserves the symlink) since
+;; the pure build environment has no 'ln'.
+(define secret-dir (getenv "GOONIX_SECRET_DIR"))
+(define symlink-source (string-append (getenv "GOONIX_ASYNC_ROOT") "/symlink-src"))
+(symlink secret-dir symlink-source)
+(define symlink-item-path
+  (add-to-store store "ca-files-symlink-item" #t "sha256" symlink-source))
+
 (define out (match (command-line) ((_ file) file)))
 (call-with-output-file out
   (lambda (port)
     (write (list (list 'v1-name (basename (derivation->output-path v1)))
                  (list 'v2-name (basename (derivation->output-path v2)))
                  (list 'v1-output (derivation->output-path v1))
-                 (list 'v2-output (derivation->output-path v2)))
+                 (list 'v2-output (derivation->output-path v2))
+                 (list 'symlink-name (basename symlink-item-path)))
            port)
     (newline port)))
 (close-connection store)

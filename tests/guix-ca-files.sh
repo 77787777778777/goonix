@@ -21,6 +21,7 @@ printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$root/shell"
 chmod 755 "$root/shell"
 export GOONIX_SHELL_SOURCE=$root/shell
 export GOONIX_MKDIR_SOURCE=$HOME/.cache/goonix-test-seed/3c68020130d6d813-mkdir
+export GOONIX_ASYNC_ROOT=$root
 
 server_pid= publisher_pid=
 completed=false
@@ -46,6 +47,10 @@ export GUIX_DAEMON_SOCKET=$server/socket GUIX_LOG_DIRECTORY=$server/log
 for i in $(seq 1 100); do test -S "$server/socket" && break; sleep .1; done
 
 # Build V1 (three files) and V2 (one file changed) in the server store.
+# A secret directory the symlink-item regression points at.
+mkdir -p "$root/secret-dir"
+printf 'TRAVERSAL-SECRET-BYTES\n' > "$root/secret-dir/secret"
+export GOONIX_SECRET_DIR=$root/secret-dir
 ./pre-inst-env guile --no-auto-compile tests/ca-files-fixture.scm "$root/fixture.scm"
 
 NIX_STORE_DIR=$store GUIX_DATABASE_DIRECTORY=$server/db \
@@ -112,6 +117,19 @@ check_traversal '../../../secret-outside'
 check_traversal 'sub/../../../secret-outside'
 check_traversal '%2e%2e/%2e%2e/%2e%2e/secret-outside'
 check_traversal 'escape/secret-outside'
+# A store item that IS a symlink to the secret directory: /goonix/file must
+# not walk through it.  This fails on 4b3025aea95 (safe-item-file did not
+# lstat the item itself, and the canonical-prefix guard matched /etc-style).
+sym=$(sed -n 's/.*(symlink-name "\([^"]*\)").*/\1/p' "$root/fixture.scm")
+symcode=$(curl -s -o "$root/trav-body" -w '%{http_code}' "$url/goonix/file/$sym/secret")
+if test "$symcode" != 404; then
+  printf 'FAIL: symlink item %s gave %s, expected 404\n' "$sym" "$symcode" >&2
+  exit 1
+fi
+if grep -qF 'TRAVERSAL-SECRET-BYTES' "$root/trav-body"; then
+  printf 'FAIL: symlink item %s leaked outside bytes\n' "$sym" >&2
+  exit 1
+fi
 # A normal file still serves (the guard did not break the happy path).
 test "$(curl -s -o /dev/null -w '%{http_code}' "$url/goonix/file/$v1/a")" = 200
 completed=true

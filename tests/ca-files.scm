@@ -191,6 +191,17 @@
        (test-assert "a mid-path symlink is refused"
          (not (safe-item-file item "lib/secret")))
        (test-assert "a missing file is refused"
-         (not (safe-item-file item "nope")))))))
+         (not (safe-item-file item "nope")))
+       ;; A store item that IS a symlink to a directory holding a secret:
+       ;; walking through it would serve the secret, so it must be refused.
+       (let ((symlink-item (string-append root "/symlink-item")))
+         (symlink outside symlink-item)
+         (test-assert "a symlink item is refused (no walking through it)"
+           (not (safe-item-file symlink-item "secret")))
+         (test-assert "store-item-files lists a symlink item as itself"
+           (let ((entries (store-item-files symlink-item)))
+             (and (= 1 (length entries))
+                  (eq? 'symlink (cadr (car entries)))
+                  (string=? "" (car (car entries)))))))))))
 
 (test-end "ca-files")
