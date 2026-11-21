@@ -71,6 +71,7 @@ SH_TESTS +=					\
   tests/guix-ca-async.sh			\
   tests/guix-ca-two-store.sh			\
   tests/guix-ca-files.sh			\
+  tests/guix-ca-second-machine.sh		\
   tests/guix-pure-eval.sh			\
   tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\
@@ -89,6 +90,7 @@ EXTRA_DIST +=					\
   tests/ca-files-fixture.scm			\
   tests/ca-files-client.scm			\
   tests/ca-files-corrupt-proxy.scm		\
+  tests/ca-second-machine-fixture.scm		\
   tests/ca-untrusted-cache.scm			\
   tests/ca-cutoff.scm				\
   tests/fixtures/flake-shells.scm			\
