@@ -376,10 +376,22 @@ buildTrace settings client = BuildTrace
   { traceStarted = \drv platform log pid -> emit ("@ build-started " <> drv <> " - " <> platform <> " " <> log <> " " <> C.pack (show pid))
   , traceSucceeded = \drv -> emit ("@ build-succeeded " <> drv <> " -")
   , traceFailed = \drv reason -> emit ("@ build-failed " <> drv <> " - " <> C.pack reason)
-  , traceOutput = \bytes -> writeSocket client (encodeInt stderrNext <> encodeString bytes)
+  , traceOutput = \bytes ->
+      -- C++ handleChildOutput sends builder output to the client only when
+      -- verbosity >= buildVerbosity (build.cc).  Sending it unconditionally
+      -- gives the client @ build-log lines for builds whose @ build-started
+      -- trace it did not receive, and the client's status.scm update-build
+      -- then fails on a missing build id.
+      when (verbosity settings >= buildVerbosity settings) $
+        writeSocket client (encodeInt stderrNext <> encodeString bytes)
   }
   where
-    emit message = when (printBuildTrace settings) $ writeSocket client (encodeInt stderrNext <> encodeString message)
+    -- C++ printMsg_ appends "\n" to every trace message (util.cc), so each
+    -- "@ build-..." line reaches the client terminated.  The client's
+    -- build-event-output-port splits on newlines and drops the trailing one;
+    -- without it, a build-started line runs into the following "@ build-log"
+    -- header and its pid token parses as #f (guix-pack.sh crash).
+    emit message = when (printBuildTrace settings) $ writeSocket client (encodeInt stderrNext <> encodeString (message <> "\n"))
 
 repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> ByteString -> IO Bool
 repairStorePath config rootFd store settings path = do
