@@ -43,6 +43,9 @@
             graft-derivation
             graft-derivation/shallow
 
+            non-self-references                   ;goonix: adoption recursion
+            reference-origins                     ;goonix: adoption recursion
+
             %graft-with-utf8-locale?)
   #:re-export (%graft?                            ;for backward compatibility
                without-grafting
