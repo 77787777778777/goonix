@@ -268,7 +268,17 @@ buildWithHook userPool rootFd store settings trace pool mode drvPath drv = do
                         (HelperExited 0, True) -> traceSucceeded trace drvPath
                         _ -> offloadFailed settings store trace drvPath drv status)
                   (stopHook hook)
-              BuildLocally -> localBuild
+              BuildLocally -> do
+                -- `offer` returns BuildLocally for an output that is already
+                -- valid (as well as when the hook declines).  Re-check inside
+                -- the output locks: another client may have registered the
+                -- output since this goal decided to build, and rebuilding it
+                -- would delete a path a concurrent build is using.  C++
+                -- re-checks validity after acquiring the output locks and skips
+                -- a valid output (DerivationGoal::tryToBuild, "someone beat us
+                -- to it").
+                ready <- allOutputsValid store drv
+                if ready && mode == Normal then pure () else localBuild
       offer currentPool hook = do
         ready <- allOutputsValid store drv
         if ready then releaseHook currentPool hook >> pure BuildLocally else do
