@@ -20,7 +20,7 @@ import qualified Data.Set as Set
 import Data.Word (Word64)
 import Goonix.Store.Database (Value (Bytes, Integer), execute, withTransaction)
 import Goonix.Store.Hash (HashAlgorithm (SHA256))
-import Goonix.Store.Files (deleteTree, withGCLock)
+import Goonix.Store.Files (deleteTree, withGCLock, announcedRoots, storeGcLockPathOf)
 import Goonix.Store.Hash (hashDigest)
 import Goonix.Store.Nar (hashNar, dumpNar)
 import Goonix.Store.ReadOnly
@@ -83,8 +83,8 @@ canReachRoot settings roots store = go
 data GCLimitReached = GCLimitReached deriving (Show, Typeable)
 instance Exception GCLimitReached
 
-collectPaths :: Settings -> [ByteString] -> Word64 -> Store -> IO ([ByteString], Word64)
-collectPaths settings roots maximumFreed store = do
+collectPaths :: Settings -> [ByteString] -> Word64 -> Store -> ByteString -> IO ([ByteString], Word64)
+collectPaths settings roots maximumFreed store requester = do
   let rootSet = Set.fromList roots
   paths <- queryAllValidPaths store
   freed <- newIORef 0
@@ -92,7 +92,7 @@ collectPaths settings roots maximumFreed store = do
   handle (\GCLimitReached -> collectResult freed deleted) $ do
     forM_ paths $ \path -> do
       (_, live) <- canReachRoot settings rootSet store (Reachability Set.empty Set.empty) path
-      unless live $ deleteRecursive settings rootSet maximumFreed freed deleted store path
+      unless live $ deleteRecursive settings rootSet maximumFreed freed deleted store requester path
     collectResult freed deleted
 
 collectResult :: IORef Word64 -> IORef [ByteString] -> IO ([ByteString], Word64)
@@ -101,8 +101,8 @@ collectResult freed deleted = do
   amount <- readIORef freed
   pure (result, amount)
 
-deleteSpecificPaths :: Settings -> [ByteString] -> [ByteString] -> Word64 -> Store -> IO ([ByteString], Word64)
-deleteSpecificPaths settings roots paths maximumFreed store = do
+deleteSpecificPaths :: Settings -> [ByteString] -> [ByteString] -> Word64 -> Store -> ByteString -> IO ([ByteString], Word64)
+deleteSpecificPaths settings roots paths maximumFreed store requester = do
   let rootSet = Set.fromList roots
   mapM_ (assertStorePath store) paths
   freed <- newIORef 0
@@ -110,12 +110,12 @@ deleteSpecificPaths settings roots paths maximumFreed store = do
   forM_ paths $ \path -> do
     (_, live) <- canReachRoot settings rootSet store (Reachability Set.empty Set.empty) path
     when live $ throwIO (storeError ("cannot delete path `" ++ C.unpack path ++ "' since it is still alive"))
-    deleteRecursive settings rootSet maximumFreed freed deleted store path
+    deleteRecursive settings rootSet maximumFreed freed deleted store requester path
   collectResult freed deleted
 
 deleteRecursive :: Settings -> Set.Set ByteString -> Word64 -> IORef Word64
-  -> IORef [ByteString] -> Store -> ByteString -> IO ()
-deleteRecursive settings roots maximumFreed freed deleted store path = do
+  -> IORef [ByteString] -> Store -> ByteString -> ByteString -> IO ()
+deleteRecursive settings roots maximumFreed freed deleted store requester path = do
   already <- elem path <$> readIORef deleted
   unless already $ do
     valid <- isValidPath store path
@@ -124,15 +124,29 @@ deleteRecursive settings roots maximumFreed freed deleted store path = do
       unless live $ do
         referrers <- queryReferrers store path
         forM_ (filter (/= path) referrers) $ \referrer ->
-          deleteRecursive settings roots maximumFreed freed deleted store referrer
-        info <- queryPathInfo store path
-        -- C++ invalidates and schedules deletion without checking maxFreed.
-        invalidatePathChecked store path
-        modifyIORef' deleted (path:)
-        modifyIORef' freed (+ infoNarSize info)
-        deleteTree path
-        amount' <- readIORef freed
-        when (amount' > maximumFreed) $ throwIO GCLimitReached
+          deleteRecursive settings roots maximumFreed freed deleted store requester referrer
+        -- A root may have been registered by another thread of this process
+        -- since the live set was computed (DECISIONS.md point 3).  Re-read the
+        -- other connections' shared STM announcements before each deletion and
+        -- keep a newly rooted path.  The requester's own announcements are
+        -- omitted, exactly as withOtherTemporaryRoots omits its temporary-root
+        -- file, so a client can still collect its own dead items.
+        announced <- Set.fromList <$> announcedRoots (gcPathOf store) requester
+        rooted <- if Set.member path announced
+          then isValidPath store path
+          else pure False
+        unless rooted $ do
+          info <- queryPathInfo store path
+          -- C++ invalidates and schedules deletion without checking maxFreed.
+          invalidatePathChecked store path
+          modifyIORef' deleted (path:)
+          modifyIORef' freed (+ infoNarSize info)
+          deleteTree path
+          amount' <- readIORef freed
+          when (amount' > maximumFreed) $ throwIO GCLimitReached
+
+gcPathOf :: Store -> ByteString
+gcPathOf store = storeGcLockPathOf (storeDirectory store) (storeStateDirectory store)
 
 invalidatePath :: Store -> ByteString -> IO ()
 invalidatePath store = withTransaction (database store) . invalidatePathSQL store

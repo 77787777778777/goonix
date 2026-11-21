@@ -19,6 +19,10 @@ module Goonix.Store.Files
   , withOtherTemporaryRoots
   , readLock
   , appendTempRoot
+  , announceRoot
+  , announcedRoots
+  , withdrawRoots
+  , storeGcLockPathOf
   , deduplicateTree
   , makeSymlinkAtomic
   , mkdirParents
@@ -34,6 +38,7 @@ import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar_, modifyMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Control.Monad (foldM, forM_, unless, when)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
@@ -289,10 +294,15 @@ withTempRootFile path gcPath action = do
   mkdirParents (parent path)
   bracket acquire release (action . rootDescriptor)
   where
+    -- A new client no longer takes the shared GC lock for its whole connection:
+    -- builds and new clients run during a collection (DECISIONS.md point 3).
+    -- The temporary-root file's own exclusive flock still excludes other
+    -- processes, and the collector learns of this client's roots through the
+    -- shared STM announcement table and the temporary-root files it reads.
     acquire = withMVar tempRootLock $ \() -> modifyMVar tempRoot $ \roots ->
       case Map.lookup path roots of
         Just root -> pure (Map.insert path root { rootUsers = rootUsers root + 1 } roots, root)
-        Nothing -> withGCReadLock gcPath $ do
+        Nothing -> do
           root <- openRoot
           pure (Map.insert path root roots, root)
     openRoot = do
@@ -300,7 +310,7 @@ withTempRootFile path gcPath action = do
       if fd >= 0 then do
         let descriptor = Fd fd
         readLock descriptor
-        pure (Root descriptor [] 1)
+        pure (Root descriptor [] 1 gcPath)
       else do
         Errno errno <- getErrno
         if Errno errno == eAGAIN then Files.removeLink path `catchMissing` pure () >> openRoot
@@ -313,12 +323,14 @@ withTempRootFile path gcPath action = do
           | otherwise -> do
               closeFd (rootDescriptor current)
               Files.removeLink path `catchMissing` pure ()
+              withdrawRoots (rootGcPath current) path
               pure (Map.delete path roots)
 
 data Root = Root
   { rootDescriptor :: !Fd
   , rootPaths :: ![ByteString]
   , rootUsers :: !Int
+  , rootGcPath :: !RawFilePath
   }
 
 {-# NOINLINE tempRoot #-}
@@ -328,6 +340,54 @@ tempRoot = unsafePerformIO (newMVar Map.empty)
 {-# NOINLINE tempRootLock #-}
 tempRootLock :: MVar ()
 tempRootLock = unsafePerformIO (newMVar ())
+
+-- A running collector learns of new roots from the other threads of this
+-- process through shared STM state (DECISIONS.md point 3, after parity).
+-- Every temporary root appended by a build or upload, and every indirect root,
+-- is announced here.  The table is keyed by the store's GC-lock path, then by
+-- the announcing connection's temporary-root file path, so two daemons on one
+-- store keep separate tables (they exclude each other through the lock files)
+-- and the collector can omit the requesting connection's own roots exactly as
+-- withOtherTemporaryRoots omits its temporary-root file.  The collector re-reads
+-- the other connections' announcements before each deletion and treats them as
+-- roots, so an item rooted while a collection runs is kept.  A connection's
+-- announcements are dropped when its temporary-root file is released, so a
+-- stale announcement cannot keep a dead item alive.  This is what lets builds
+-- and new clients run during a collection instead of waiting on the GC lock;
+-- the lock files still exclude other daemon processes.
+{-# NOINLINE rootAnnouncements #-}
+rootAnnouncements :: TVar (Map.Map RawFilePath (Map.Map RawFilePath (Set.Set ByteString)))
+rootAnnouncements = unsafePerformIO (newTVarIO Map.empty)
+
+-- | Announce a newly registered root for the store named by its GC-lock path,
+-- attributed to the announcing connection's temporary-root file.
+announceRoot :: RawFilePath -> RawFilePath -> ByteString -> IO ()
+announceRoot gcPath owner path = atomically $
+  modifyTVar' rootAnnouncements $
+    Map.insertWith (Map.unionWith Set.union) gcPath
+      (Map.singleton owner (Set.singleton path))
+
+-- | The roots announced for this store by connections other than the requester
+-- (identified by its temporary-root file path).  Mirrors withOtherTemporaryRoots.
+announcedRoots :: RawFilePath -> RawFilePath -> IO [ByteString]
+announcedRoots gcPath requester = do
+  table <- readTVarIO rootAnnouncements
+  let owners = Map.findWithDefault Map.empty gcPath table
+      others = Map.delete requester owners
+  pure (Set.toAscList (Set.unions (Map.elems others)))
+
+-- | Drop a connection's announcements when its temporary-root file is released.
+withdrawRoots :: RawFilePath -> RawFilePath -> IO ()
+withdrawRoots gcPath owner = atomically $
+  modifyTVar' rootAnnouncements $
+    Map.adjust (Map.delete owner) gcPath
+
+-- | The GC-lock path of a store, the key of its root-announcement table and
+-- the file two daemons on one store exclude each other through.
+storeGcLockPathOf :: ByteString -> Maybe ByteString -> ByteString
+storeGcLockPathOf storeDir stateDir = case stateDir of
+  Just state -> state <> "/gc.lock"
+  Nothing -> storeDir <> "/.gc.lock"
 
 withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
 withTemporaryRoots = withTemporaryRootsExcept Nothing
@@ -389,9 +449,11 @@ readLock (Fd fd) = checkIO "cannot acquire temporary roots read lock" (c_lock_up
 appendTempRoot fd path = withMVar tempRootLock $ \() -> do
   found <- modifyMVar tempRoot $ \roots ->
     case [(name, root) | (name, root) <- Map.toList roots, rootDescriptor root == fd] of
-      [] -> pure (roots, False)
-      (name, root):_ -> pure (Map.insert name root { rootPaths = path : rootPaths root } roots, True)
-  unless found $ throwIO (userError "cannot append to an unowned temporary roots file")
+      [] -> pure (roots, Nothing)
+      (name, root):_ -> pure (Map.insert name root { rootPaths = path : rootPaths root } roots, Just (rootGcPath root, name))
+  case found of
+    Nothing -> throwIO (userError "cannot append to an unowned temporary roots file")
+    Just (gcPath, owner) -> announceRoot gcPath owner path
   checkIO "cannot upgrade temporary roots lock" (c_lock_upgrade (case fd of Fd raw -> raw) 1)
   result <- B.useAsCStringLen (path <> "\0") $ \(bytes, len) -> c_write_at_end (case fd of Fd raw -> raw) (castPtr bytes) (fromIntegral len)
   when (result < 0) (errnoIO "cannot write temporary root")

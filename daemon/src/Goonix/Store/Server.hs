@@ -270,13 +270,13 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       withOtherTemporaryRoots (temporaryRootsPath config) rootFd $ \temporary -> do
         live <- Collector.livePaths (map snd roots ++ temporary) store
         if action == 3
-          then Collector.deleteSpecificPaths settings live paths minFreed store
+          then Collector.deleteSpecificPaths settings live paths minFreed store rootPath
           else do
             allPaths <- queryAllValidPaths store
             case action of
               0 -> pure (live, 0)
               1 -> pure (filter (`notElem` live) allPaths, 0)
-              2 -> Collector.collectPaths settings live minFreed store
+              2 -> Collector.collectPaths settings live minFreed store rootPath
               _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
