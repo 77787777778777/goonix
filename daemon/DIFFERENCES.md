@@ -25,6 +25,30 @@ substitutions and builders share `build-max-jobs`, as in the C++ daemon. The
 setting is not enabled in parity comparisons and must not be enabled before
 those comparisons pass and the user asks for it.
 
+The build scheduler is shared across the clients of one daemon (HS-12;
+DECISIONS.md point 2; inventory 5.1). There is one job limit and one goal per
+derivation across all clients, as in the C++ daemon's single goal loop:
+
+- One job limit: a process-wide running-job count bounds all clients together.
+  A client's `build-max-jobs` raises the shared limit (the C++ daemon reads the
+  connection's setting), so the shared limit is never tighter than a client's
+  request. Each request still bounds its own jobs by its `build-max-jobs`.
+- One goal per derivation: the first client to reach a derivation's build phase
+  starts the build in a daemon-owned worker thread; a later client asking for
+  the same derivation attaches to that goal and shares its result instead of
+  starting a second builder. The goal owns its temporary roots and its store
+  handle and tolerates a gone client's trace, so it outlives the client that
+  started it while any other client is still interested. When the last
+  interested client disconnects, the worker is killed — a single client's
+  disconnect still kills its build, as before.
+
+The lock files stay, for helpers and for other daemons: this sharing is
+in-process only. Two daemon processes on one store still serialize through the
+output locks and the GC lock. The observable build results are unchanged from
+the C++ daemon (tests/guix-build.sh, the engine differential tests, and the
+two-client build test pass identically); the difference is that the job limit
+and goal deduplication are shared across clients rather than per connection.
+
 The collector no longer holds the global GC lock against the other threads of
 this process for a whole collection (DECISIONS.md point 3, after parity;
 inventory 5.3). A running collector learns of new roots from the other

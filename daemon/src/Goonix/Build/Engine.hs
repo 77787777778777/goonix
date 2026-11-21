@@ -40,7 +40,7 @@ import Goonix.Store.Path (storePathToName)
 import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
 import Goonix.Store.Settings
-import Goonix.Store.Config (ServerConfig, configGuixProgram, configBuildUsers)
+import Goonix.Store.Config (ServerConfig, configGuixProgram, configBuildUsers, configSharedScheduler, configStore, configDatabase, configStateDirectory)
 import Goonix.Store.Substitute (substitutableInfos, substitutePath)
 import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
@@ -65,8 +65,9 @@ import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
-import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runScheduledWithCancel)
+import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runScheduledWithCancel, runScheduledShared)
 import Goonix.Build.Scheduler (JobKind (..))
+import Goonix.Build.Shared (raiseLimit, withGoal)
 import Goonix.Build.Offload
 import Goonix.Build.Users (BuildUser (..), UserPool, loadUserPool, withBuildUser)
 import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
@@ -134,7 +135,16 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                 discovered <- readIORef phase
                 if discovered
                   then do
-                    buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
+                    -- HS-12: one goal per derivation across the clients of this
+                    -- daemon.  The build runs in a daemon-owned thread that owns
+                    -- its temporary roots and store handle and tolerates a gone
+                    -- client, so it outlives the client that started it while any
+                    -- other client is still interested (and is killed when the
+                    -- last leaves).  The output locks still exclude other daemons.
+                    case config >>= configSharedScheduler of
+                      Nothing -> buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
+                      Just shared -> withGoal shared path
+                        (daemonOwnedBuild config userPool settings trace hook jobMode requested path)
                     pure Done
                   else do
                     writeIORef phase True
@@ -151,10 +161,15 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
       separateDownloads = if settingBool "build-separate-download-slots" False settings
         then Just (settingInt "build-max-download-jobs" 1 settings)
         else Nothing
+      shared = config >>= configSharedScheduler
+  -- HS-12: this client's build-max-jobs raises the daemon-wide shared limit, so
+  -- the one shared limit is never tighter than a client's request (the C++
+  -- daemon reads the connection's build-max-jobs setting).
+  forM_ shared (\s -> raiseLimit s maxJobs)
   when (maxJobs == 0 && separateDownloads == Nothing &&
       not (settingBool "build-use-build-hook" True settings) && not (null things)) $
     throwIO (storeError "unable to start any build; either increase `--max-jobs' or enable distributed builds")
-  runScheduledWithCancel maxJobs separateDownloads (keepGoing settings) (discover inputMode) specs cancel
+  runScheduledShared shared maxJobs separateDownloads (keepGoing settings) (discover inputMode) specs cancel
 
 ensureStorePath :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO ()
 ensureStorePath config rootFd store settings trace path = do
@@ -224,6 +239,41 @@ buildDerivationNow userPool config rootFd store settings trace hook mode wanted 
     present <- isValidPath store input
     unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
   buildWithHook userPool rootFd store settings trace hook mode drvPath drv
+
+-- | HS-12: a build run by the daemon-owned shared goal.  It owns its temporary
+-- roots and its store handle (the client that started the goal may disconnect,
+-- releasing its roots and closing its store), and its trace tolerates a gone
+-- client.  The goal outlives any one client while another is still interested.
+daemonOwnedBuild :: Maybe ServerConfig -> Maybe UserPool -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
+daemonOwnedBuild config userPool settings trace hook mode wanted drvPath = case config of
+  Nothing -> pure ()
+  Just serverConfig -> do
+    pid <- getProcessID
+    let rootPath = tempRootsDir serverConfig <> "/" <> C.pack (show pid <> "-goal-" <> C.unpack (storePathToName (configStore serverConfig) drvPath))
+        gcPath = storeGcLockPathOf (configStore serverConfig) (configStateDirectory serverConfig)
+        tolerant = tolerantTrace trace
+    withTempRootFile rootPath gcPath $ \goalRootFd ->
+      bracket (openStore (configStore serverConfig) (configDatabase serverConfig)) closeStore $ \goalStore ->
+        buildDerivationNow userPool config goalRootFd goalStore { storeStateDirectory = configStateDirectory serverConfig } settings tolerant hook mode wanted drvPath
+
+-- | The temporary-roots directory of a store, as the server uses it.
+tempRootsDir :: ServerConfig -> ByteString
+tempRootsDir config = case configStateDirectory config of
+  Just state -> state <> "/temproots"
+  Nothing -> "/tmp/goonix-temproots"
+
+-- | A trace that tolerates a gone client: the daemon-owned goal may outlive the
+-- client that started it, whose socket is then closed.  A write to that socket
+-- fails; swallow the error so the build keeps running for the other clients.
+tolerantTrace :: BuildTrace -> BuildTrace
+tolerantTrace trace = BuildTrace
+  { traceStarted = \drv platform log pid -> swallow (traceStarted trace drv platform log pid)
+  , traceSucceeded = \drv -> swallow (traceSucceeded trace drv)
+  , traceFailed = \drv reason -> swallow (traceFailed trace drv reason)
+  , traceOutput = \bytes -> swallow (traceOutput trace bytes)
+  }
+  where
+    swallow action = action `catch` (\(_ :: SomeException) -> pure ())
 
 buildWithHook :: Maybe UserPool -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> ByteString -> Derivation -> IO ()
 buildWithHook userPool rootFd store settings trace pool mode drvPath drv = do

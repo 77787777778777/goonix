@@ -8,6 +8,7 @@ module Goonix.Store.Config
 import Data.ByteString (ByteString)
 import Goonix.Store.Settings (Settings, defaultSettings)
 import Goonix.Build.Users (UserPool, loadUserPool)
+import Goonix.Build.Shared (Shared)
 
 data ServerConfig = ServerConfig
   { configStore :: !ByteString
@@ -18,8 +19,11 @@ data ServerConfig = ServerConfig
   , configStateDirectory :: !(Maybe ByteString)
   , configGuixProgram :: !ByteString
   , configBuildUsers :: !(Maybe UserPool)
+  , configSharedScheduler :: !(Maybe Shared)
+  -- ^ HS-12: the process-wide shared scheduler (one job limit, one goal per
+  -- derivation across clients).  Nothing for a standalone per-request build.
   }
 
 defaultConfig :: ServerConfig
 defaultConfig = ServerConfig "/gnu/store" "/var/guix/db/db.sqlite"
-  (defaultSettings True False) False True Nothing "guix" Nothing
+  (defaultSettings True False) False True Nothing "guix" Nothing Nothing

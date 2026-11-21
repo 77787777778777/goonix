@@ -35,6 +35,7 @@ import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitu
 import Goonix.Store.Archive (exportPath, importPathsFrom)
 import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
 import Goonix.Build.Users (loadUserPool)
+import Goonix.Build.Shared (newShared)
 import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
 import Goonix.Store.Base32 (decodeBase32)
 import Goonix.Store.Wire
@@ -66,7 +67,12 @@ serveListener :: ServerConfig -> Socket -> IO ()
 serveListener config listener = do
   initialiseState config
   users <- loadUserPool (maybe "/var/guix" id (configStateDirectory config)) (setting "build-users-group" "" (configDefaultSettings config))
-  let sharedConfig = config { configBuildUsers = users }
+  -- HS-12: one shared scheduler per daemon process — one job limit and one goal
+  -- per derivation across all clients.  The daemon-wide build-max-jobs comes
+  -- from the default settings; a client's own --max-jobs still bounds its
+  -- request, but the shared limit bounds the whole process.
+  shared <- newShared (settingInt "build-max-jobs" 1 (configDefaultSettings config))
+  let sharedConfig = config { configBuildUsers = users, configSharedScheduler = Just shared }
   counter <- newMVar (0 :: Integer)
   forever $ do
     client <- acceptSocket listener

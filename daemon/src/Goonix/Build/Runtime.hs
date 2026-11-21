@@ -8,6 +8,7 @@ module Goonix.Build.Runtime
   , Outcome (..)
   , runScheduled
   , runScheduledWithCancel
+  , runScheduledShared
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread)
@@ -20,6 +21,7 @@ import qualified Data.ByteString.Char8 as C
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Goonix.Build.Scheduler (Action (..), Event (..), Job (..), JobKind (..), Status (..), State, addJob, addDependencyJobsWithKinds, initialState, jobs, step)
+import Goonix.Build.Shared (Shared, acquireSlot, releaseSlot)
 import Goonix.Store.ReadOnly (StoreError (..), storeError)
 
 data JobSpec = JobSpec
@@ -42,6 +44,8 @@ data Runtime = Runtime
   , rtFailures :: !(TVar (Map.Map ByteString SomeException))
   , rtKeepGoing :: !Bool
   , rtCancelled :: !(TVar Bool)
+  , rtShared :: !(Maybe Shared)
+  -- ^ HS-12: the process-wide shared job limit, if this request runs under one.
   }
 
 -- The callback creates a newly discovered job, or adds its wanted outputs
@@ -49,10 +53,12 @@ data Runtime = Runtime
 runScheduled :: Int -> Maybe Int -> Bool -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> [JobSpec] -> IO ()
 runScheduled slots downloadSlots keepGoing discover initialSpecs = runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs (atomically retry)
 runScheduledWithCancel :: Int -> Maybe Int -> Bool -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> [JobSpec] -> IO () -> IO ()
-runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs cancel = do
+runScheduledWithCancel = runScheduledShared Nothing
+runScheduledShared :: Maybe Shared -> Int -> Maybe Int -> Bool -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> [JobSpec] -> IO () -> IO ()
+runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs cancel = do
   state <- foldM add (initialState (max 0 slots) downloadSlots keepGoing) initialSpecs
   runtime <- Runtime <$> newTVarIO Map.empty <*> newTQueueIO
-    <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> pure keepGoing <*> newTVarIO False
+    <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> pure keepGoing <*> newTVarIO False <*> pure shared
   forM_ initialSpecs (register runtime)
   watcher <- forkIO $ cancel >> atomically (writeTVar (rtCancelled runtime) True)
   dispatch runtime state `onException` uninterruptibleMask_ (cancelActive runtime)
@@ -133,7 +139,16 @@ runScheduledWithCancel slots downloadSlots keepGoing discover initialSpecs cance
           worker <- forkIO $ do
             takeMVar start
             (do
-              result <- try (jobRun spec (jobWanted spec))
+              -- HS-12: admit this job against the process-wide shared job limit
+              -- before it runs, so the daemon-wide build-max-jobs bounds all
+              -- clients together.  Acquired in the worker (not the dispatch
+              -- loop) so the loop stays free to process completions that
+              -- release slots.  Released once acquired, even if the job fails.
+              result <- case rtShared runtime of
+                Nothing -> try (jobRun spec (jobWanted spec))
+                Just shared -> do
+                  acquireSlot shared
+                  (try (jobRun spec (jobWanted spec))) `finally` releaseSlot shared
               atomically $ writeTQueue (rtQueue runtime) (Result name result))
               `finally` (void (tryPutMVar done ()))
           atomically $ do
