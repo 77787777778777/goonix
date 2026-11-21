@@ -29,7 +29,7 @@ module Goonix.Store.Files
   , writeBytes
   ) where
 
-import Control.Exception (IOException, bracket, bracket_, bracketOnError, finally, mask, onException, throwIO, try, uninterruptibleMask_)
+import Control.Exception (IOException, bracket, bracket_, finally, mask, onException, throwIO, try, uninterruptibleMask_)
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar_, modifyMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
@@ -135,7 +135,7 @@ withWritableDirectory path action = bracket_ acquire release action
         Files.setFileMode path original `finally` atomically (modifyTVar' writableDirectories (Map.delete path))
 
 writeBytes :: RawFilePath -> ByteString -> IO ()
-writeBytes path bytes = bracketOnError (openFd path WriteOnly defaultFileFlags { System.Posix.IO.ByteString.creat = Just 0o666 }) closeFd $ \fd -> do
+writeBytes path bytes = bracket (openFd path WriteOnly defaultFileFlags { System.Posix.IO.ByteString.creat = Just 0o666 }) closeFd $ \fd -> do
   let writeAll rest
         | B.null rest = pure ()
         | otherwise = do
