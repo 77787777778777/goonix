@@ -41,6 +41,7 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
 import Goonix.Store.Settings
 import Goonix.Store.Config (ServerConfig, configGuixProgram, configBuildUsers, configSharedScheduler, configStore, configDatabase, configStateDirectory)
+import Goonix.Store.GuixProgram (guixProgram)
 import Goonix.Store.Substitute (substitutableInfos, substitutePath)
 import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
@@ -498,9 +499,9 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
   (readFd, writeFd) <- createPipe
   writeHandle <- fdToHandle writeFd
   readHandle <- fdToHandle readFd
-  guixProgram <- maybe "guix" C.unpack <$> getEnv "GUIX"
+  guixProgram' <- C.unpack <$> guixProgram
   let command = if "builtin:" `B.isPrefixOf` builder drv
-        then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
+        then proc guixProgram' ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack (args drv))
   (childPid, wait, sandboxRoot, sandboxOutputs) <-
     try (mask $ \restore -> do

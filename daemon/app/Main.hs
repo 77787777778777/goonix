@@ -16,6 +16,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
 import qualified Goonix.Config as Config
 import Goonix.Store.Config
+import Goonix.Store.GuixProgram (guixProgram)
 import Goonix.Store.Server
 import Goonix.Store.Settings
 import Goonix.Store.Socket (Socket)
@@ -66,7 +67,7 @@ main = do
                 store <- storeDirectory args
                 database <- databasePath
                 state <- getEnv "GUIX_STATE_DIRECTORY"
-                guix <- getEnv "GUIX"
+                guix <- guixProgram
                 case parseDaemonOptions args of
                     Left message -> hPutStrLn stderr message >> exitFailure
                     Right options -> do
@@ -75,7 +76,7 @@ main = do
                               , configDatabase = database
                               , configDefaultSettings = settings options
                               , configStateDirectory = state
-                              , configGuixProgram = maybe (C.pack (Config.binaryDirectory ++ "/guix")) id guix
+                              , configGuixProgram = guix
                               }
                         when (settingBool "build-discover" False (configDefaultSettings config)) $
                           startDiscovery (configGuixProgram config)
