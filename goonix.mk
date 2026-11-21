@@ -37,6 +37,7 @@ SCM_TESTS +=					\
   tests/ca.scm					\
   tests/ca-build.scm				\
   tests/ca-compiler.scm				\
+  tests/ca-grafts.scm				\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\

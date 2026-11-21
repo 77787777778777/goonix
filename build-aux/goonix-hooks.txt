@@ -4,6 +4,7 @@ Makefile.am 5 0
 build-aux/pre-inst-env.in 3 0
 config-daemon.ac 7 0
 gnu/local.mk 4 0
+guix/build/graft.scm 25 4
 guix/config.scm.in 4 0
 guix/derivations.scm 42 2
 guix/gexp.scm 33 8
