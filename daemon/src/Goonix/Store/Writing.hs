@@ -66,6 +66,10 @@ addNarToStore rootFd store name recursive algorithm dump = do
 
 addTextToStore :: Fd -> Store -> ByteString -> ByteString -> [ByteString] -> IO ByteString
 addTextToStore rootFd store name contents references = do
+  -- C++ checkStoreName runs inside makeStorePath (store-api.cc), which
+  -- computeStorePathForText calls, so an invalid name is rejected here with
+  -- "invalid character ..." before any path is computed or written.
+  either (throwIO . storeError) pure (validateStoreName name)
   mapM_ (assertStorePath store) references
   let destination = makeTextPath (storeDirectory store) name contents references
   appendTempRoot rootFd destination
