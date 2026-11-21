@@ -16,14 +16,16 @@
       baseVersion = "1.5.0";
 
       # The commit is recorded because a flake source has no .git directory.
-      # The recipe retains the upstream daemon by default until its own switch.
+      # The default package ships the Haskell daemon (HS-8 switch 1); the C++
+      # daemon stays available as goonix-cxx-daemon below.
       mkGoonix = pkgs:
         pkgs.guix.overrideAttrs (old: {
           pname = "goonix";
           version = "${baseVersion}-goonix.${rev}";
           src = self;
-          # goonix: make the compiler available but leave the daemon choice alone.
+          # goonix: the daemon choice is explicit, not configure's auto probe.
           nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.haskell.packages.ghc910.ghc ];
+          configureFlags = (old.configureFlags or []) ++ [ "--enable-haskell-daemon" ];
           meta = old.meta // {
             description = "Fork of GNU Guix, a functional package manager with a Scheme interface";
             homepage = "https://github.com/hurdkit/goonix";
