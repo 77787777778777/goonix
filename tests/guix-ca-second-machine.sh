@@ -5,8 +5,9 @@
 # independently arrive at the same names).  A non-reproducible builder (writes
 # $RANDOM) must produce DIFFERENT realised names, so the gate cannot pass
 # trivially.  Each machine is a private mount namespace binding a separate
-# directory over the store prefix, with its own database and daemon — not a
-# second connection to the same store.  Set GOONIX_SECOND_MACHINE_TMPDIR.
+# directory over a COMMON tmp store prefix (the guix-ca-files.sh pattern), with
+# its own database and daemon — not a second connection to the same store, and
+# no host /gnu/store touched.  Set GOONIX_SECOND_MACHINE_TMPDIR.
 set -euo pipefail
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   printf 'SKIP: user/mount namespaces are unavailable\n'
@@ -15,9 +16,11 @@ fi
 
 root=$(mktemp -d "${GOONIX_SECOND_MACHINE_TMPDIR:-${TMPDIR:-/tmp}}/goonix-second-machine-XXXXXX")
 # The common store prefix both machines see (the daemon hashes it into every
-# CA path).  A private directory is bound over it in each namespace.
-prefix=/gnu/store
-mkdir -p "$root"
+# CA path).  A private directory is bound over it in each namespace.  It is a
+# tmp path (the guix-ca-files.sh pattern), NOT /gnu/store: both machines share
+# this prefix, so their CA names match, and no host store is touched.
+prefix=$root/store-prefix
+mkdir -p "$prefix"
 
 completed=false
 cleanup() {
@@ -37,6 +40,8 @@ run_machine() {
   local m=$root/$name
   mkdir -p "$m/store" "$m/db" "$m/etc" "$m/log"
   chmod 700 "$m/etc"
+  cp tests/keys/openpgp/signing-key.sec tests/keys/openpgp/signing-key.pub "$m/etc/"
+  chmod 400 "$m/etc/signing-key.sec"
   cat > "$root/$name-part.sh" <<EOF
 set -euo pipefail
 export NIX_STORE_DIR=$prefix GUIX_DATABASE_DIRECTORY=$m/db

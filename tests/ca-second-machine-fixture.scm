@@ -37,13 +37,18 @@
   (ca-item "ca8-top"
            (format #f "printf 'top-payload %%s' '~a' > \"$out\"" node)))
 
-;; A NON-reproducible item: it writes a random value, so its content (and thus
-;; its realised name) differs between two independent builds.  The test cannot
-;; pass trivially: if the gate compared only derivation names this would still
-;; match, but the realised names must differ.
+;; A NON-reproducible item: it reads bytes from /dev/urandom (the build
+;; environment exposes it) with bash's built-in read, so its content — and
+;; thus its realised name — differs between two independent builds.  The test
+;; cannot pass trivially: if the gate compared only derivation names this
+;; would still match, but the realised names must differ.  The bootstrap bash
+;; is 4.2: $RANDOM seeds from pid/time (coincided across the two namespaces)
+;; and $SRANDOM (5.1+) does not exist, so urandom is the sound source.  read is
+;; a builtin (no external binary in the build env); non-printable bytes
+;; (including NUL) are stripped with a [:print:] pattern substitution.
 (define nonce
   (ca-item "ca8-nonce"
-           "printf 'nonce-%%s' \"$RANDOM\" > \"$out\""))
+           "IFS= read -r -N 32 raw < /dev/urandom; printf 'nonce-%s' \"${raw//[^[:print:]]/}\" > \"$out\""))
 
 (define out (match (command-line) ((_ file) file)))
 (call-with-output-file out
