@@ -15,16 +15,23 @@
   #:use-module (guix serialization)
   #:use-module (guix store)
   #:use-module ((guix build utils) #:select (mkdir-p))
+  #:use-module ((guix build download) #:select (http-fetch))
+  #:use-module (web uri)
   #:use-module (ice-9 ftw)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
+  #:use-module (rnrs io ports)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-11)
   #:export (store-item-files
             file-list->string
             string->file-list
             links-path
             file-in-links?
             assemble-file-tree
+            render-file-list
+            render-file
+            substitute-files
             %file-list-version))
 
 ;;; Commentary:
@@ -141,7 +148,14 @@ hard-linked instead.  Returns the number of files fetched."
   (define (have-links? hash)
     (and links-dir (file-exists? (string-append links-dir "/" hash))))
   (define (link-from-links hash dest)
-    (link (string-append links-dir "/" hash) dest))
+    ;; Hard-link from .links; fall back to a copy when they are on different
+    ;; filesystems (the assembly root need not be in the store).
+    (catch 'system-error
+      (lambda () (link (string-append links-dir "/" hash) dest))
+      (lambda args
+        (if (= EXDEV (system-error-errno args))
+            (copy-file (string-append links-dir "/" hash) dest)
+            (apply throw args)))))
   (for-each
    (match-lambda
      ((path type hash size)
@@ -169,5 +183,72 @@ hard-linked instead.  Returns the number of files fetched."
                        (string<? (car a) (car b))
                        (< da db))))))
   fetched)
+
+(define (render-file-list store request name)
+  "Render the file list of the store item named NAME (a base name) as a
+text/plain response, for file-level substitution.  Returns two values: the
+response headers and the body string.  A missing item gives a 404."
+  (let ((item (string-append (%store-prefix) "/" name)))
+    (if (valid-path? store item)
+        (values '((content-type . (text/plain (charset . "UTF-8"))))
+                (file-list->string (store-item-files item)))
+        (values '((content-type . (text/plain)))
+                "not found"))))
+
+(define (render-file store request name path)
+  "Render the raw bytes of one file (PATH, relative) of the store item NAME.
+Returns two values: the response headers (with x-raw-file for the web server)
+and #f.  A missing item or file gives a 404."
+  (let* ((item (string-append (%store-prefix) "/" name))
+         (file (string-append item "/" path)))
+    (if (and (valid-path? store item)
+             (file-exists? file)
+             (eq? 'regular (stat:type (lstat file))))
+        (values `((content-type . (application/octet-stream
+                                   (charset . "ISO-8859-1")))
+                  (x-raw-file . ,file))
+                #f)
+        (values '((content-type . (text/plain)))
+                "not found"))))
+
+(define* (substitute-files cache-url name root #:key (links-dir #f) timeout)
+  "File-level substitution: fetch the file list of the store item NAME from
+the cache at CACHE-URL, then assemble its tree under ROOT, fetching only the
+files whose NAR hash is not already in LINKS-DIR (hard-linking the rest).
+Returns the number of files fetched over the network."
+  (define (url . components)
+    (string->uri (string-append (if (string-suffix? "/" cache-url)
+                                    cache-url
+                                    (string-append cache-url "/"))
+                                (string-join components "/"))))
+  (define (fetch-text uri)
+    (let-values (((port len) (http-fetch uri #:timeout timeout)))
+      (let ((text (get-string-all port)))
+        (close-port port)
+        text)))
+  (let* ((list-text (fetch-text (url "goonix" "files" name)))
+         (files (string->file-list list-text)))
+    (assemble-file-tree
+     files root
+     (lambda (entry dest)
+       (match entry
+         ((path 'symlink hash size)
+          ;; A symlink's "content" is its target; the list does not carry the
+          ;; target string, so symlinks are fetched as a file would be.  For
+          ;; the gate's regular-file items this branch is not used.
+          (error "symlink file-level fetch not supported" path))
+         ((path type hash size)
+          (let-values (((port len)
+                        (http-fetch (url "goonix" "file" name path)
+                                    #:timeout timeout)))
+            (call-with-output-file dest
+              (lambda (out)
+                (let loop ()
+                  (let ((bv (get-bytevector-n port 65536)))
+                    (unless (eof-object? bv)
+                      (put-bytevector out bv)
+                      (loop))))))
+            (close-port port)))))
+     #:links-dir links-dir)))
 
 ;;; files.scm ends here

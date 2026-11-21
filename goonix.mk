@@ -67,6 +67,7 @@ SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
   tests/guix-ca-async.sh			\
   tests/guix-ca-two-store.sh			\
+  tests/guix-ca-files.sh			\
   tests/guix-pure-eval.sh			\
   tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\
@@ -82,6 +83,8 @@ EXTRA_DIST +=					\
   tests/ca-vectors.json				\
   tests/ca-async-fixture.scm			\
   tests/ca-two-store-fixture.scm			\
+  tests/ca-files-fixture.scm			\
+  tests/ca-files-client.scm			\
   tests/ca-untrusted-cache.scm			\
   tests/ca-cutoff.scm				\
   tests/fixtures/flake-shells.scm			\
