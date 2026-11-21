@@ -883,7 +883,13 @@ registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \outp
   (refs, hash) <- scanOutputReferences store path
   enforceReferencePolicy store drv path refs
   size <- fromIntegral . B.length <$> dumpNar path
-  registerPath store path hash size (filter (/= path) refs) drvPath
+  -- C++ keeps self-references: scanForReferences searches the output's own
+  -- path among the candidates (build.cc allPaths inserts drv.outputs) and
+  -- registerValidPaths adds every reference, including the path itself
+  -- (local-store.cc, no self-filter).  A self-referencing output (e.g. a
+  -- `self -> $out` symlink) must report itself in queryReferences, as the
+  -- grafts indirect-dependency test requires.
+  registerPath store path hash size refs drvPath
   where
     scanOutputReferences store path = do
       valid <- queryAllValidPaths store
