@@ -34,14 +34,23 @@ the other connections' announcements before each deletion. A root registered
 while a collection runs is therefore kept. A connection's announcements are
 withdrawn when its temporary-root file is released, and the requesting
 connection's own announcements are omitted, exactly as the C++ daemon omits the
-requester's own temporary-root file. Builds and new clients no longer wait for a
-whole collection: a new client does not take the shared GC read lock for its
-connection. The GC lock file is still held exclusively for the collection, so two
-daemon processes on one store still exclude each other through the lock files.
-The observable live/dead sets and collection results are unchanged from the C++
-daemon (tests/guix-gc.sh and the collector tests of tests/store.scm pass
-identically); the difference is only that in-process builds and clients are not
-blocked for the duration.
+requester's own temporary-root file.
+
+A new client skips the shared GC lock at temporary-root-file creation only while
+THIS process's own collector holds the GC lock (a process-wide STM flag records
+that); that collector reads the announcements, so the new root is still kept.
+Against another process's collector — a C++ daemon or a second Haskell daemon on
+the same store — the shared lock is still taken and the new client waits, because
+that collector cannot see this process's announcements and the shared lock at
+creation is what guarantees no temporary-root file appears after it has
+enumerated the directory. So a new client waits only for another process's
+collection, never for its own process's. The GC lock file is still held
+exclusively for the collection, so two daemon processes on one store still
+exclude each other through the lock files. The observable live/dead sets and
+collection results are unchanged from the C++ daemon (tests/guix-gc.sh and the
+collector tests of tests/store.scm pass identically); the difference is only that
+in-process builds and clients are not blocked for the duration of their own
+process's collection.
 
 The build-user pool reads `/etc/passwd` and `/etc/group` directly rather than
 calling `getgrnam`, `getpwnam`, and `getgrouplist` (inventory 4.1). This keeps

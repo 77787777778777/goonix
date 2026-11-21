@@ -23,6 +23,7 @@ module Goonix.Store.Files
   , announcedRoots
   , withdrawRoots
   , storeGcLockPathOf
+  , withOwnCollector
   , deduplicateTree
   , makeSymlinkAtomic
   , mkdirParents
@@ -294,16 +295,20 @@ withTempRootFile path gcPath action = do
   mkdirParents (parent path)
   bracket acquire release (action . rootDescriptor)
   where
-    -- A new client no longer takes the shared GC lock for its whole connection:
-    -- builds and new clients run during a collection (DECISIONS.md point 3).
-    -- The temporary-root file's own exclusive flock still excludes other
-    -- processes, and the collector learns of this client's roots through the
-    -- shared STM announcement table and the temporary-root files it reads.
+    -- A new client skips the shared GC lock only while THIS process's own
+    -- collector holds it (DECISIONS.md point 3): that collector reads the shared
+    -- STM announcements, so a root registered during the collection is kept.
+    -- Against another process's collector the shared lock is still taken, so a
+    -- new client waits for that collection — the shared lock at creation is what
+    -- guarantees no temporary-root file appears after the other collector has
+    -- enumerated the directory.  The temporary-root file's own exclusive flock
+    -- still excludes other processes.
     acquire = withMVar tempRootLock $ \() -> modifyMVar tempRoot $ \roots ->
       case Map.lookup path roots of
         Just root -> pure (Map.insert path root { rootUsers = rootUsers root + 1 } roots, root)
         Nothing -> do
-          root <- openRoot
+          own <- ownCollectorHolds gcPath
+          root <- if own then openRoot else withGCReadLock gcPath openRoot
           pure (Map.insert path root roots, root)
     openRoot = do
       fd <- withCStringBytes path c_lock_exclusive
@@ -388,6 +393,29 @@ storeGcLockPathOf :: ByteString -> Maybe ByteString -> ByteString
 storeGcLockPathOf storeDir stateDir = case stateDir of
   Just state -> state <> "/gc.lock"
   Nothing -> storeDir <> "/.gc.lock"
+
+-- While THIS process's collector holds the GC lock exclusively, a new client of
+-- this process may create its temporary-root file without taking the shared GC
+-- lock: the collector reads the shared STM announcements, so a root registered
+-- during the collection is still kept (DECISIONS.md point 3).  Against another
+-- process's collector the shared lock is still required — that collector cannot
+-- see our announcements, and the shared lock at creation is what guarantees no
+-- temporary-root file appears after it has enumerated the directory.  The flag
+-- names the GC-lock paths our own collector currently holds.
+{-# NOINLINE ownCollector #-}
+ownCollector :: TVar (Set.Set RawFilePath)
+ownCollector = unsafePerformIO (newTVarIO Set.empty)
+
+-- | Run an action while recording that this process's collector holds the GC
+-- lock on the given path.  Cleared on release, even on exception.
+withOwnCollector :: RawFilePath -> IO a -> IO a
+withOwnCollector gcPath =
+  bracket_ (atomically (modifyTVar' ownCollector (Set.insert gcPath)))
+           (atomically (modifyTVar' ownCollector (Set.delete gcPath)))
+
+-- | Does this process's own collector currently hold the GC lock on this path?
+ownCollectorHolds :: RawFilePath -> IO Bool
+ownCollectorHolds gcPath = Set.member gcPath <$> readTVarIO ownCollector
 
 withTemporaryRoots :: RawFilePath -> ([ByteString] -> IO a) -> IO a
 withTemporaryRoots = withTemporaryRootsExcept Nothing
