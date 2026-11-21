@@ -45,6 +45,7 @@ SCM_TESTS +=					\
   tests/ca-graft-identity.scm			\
   tests/ca-adopt.scm				\
   tests/ca-files.scm				\
+  tests/ca-full.scm				\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\
