@@ -243,15 +243,12 @@ reserved, so the caller falls back to upstream's reference-origins."
        (goonix-reference-origins store drv items)))
 
 (define (goonix-graft-origin store drv outputs origin output)
-  "Return the path to compare against DEPS for a graft: the origin's
-REALISED path when DRV's OUTPUTS are reserved, otherwise upstream's declared
-output path.  ORIGIN and OUTPUT are the graft's fields, passed by the
-caller: they are record macros in (guix grafts), so they cannot be looked up
-here, and that module imports this one."
-  (if (goonix-unrealised-outputs drv outputs)
-      (goonix-graft-origin-realised store origin output)
-      (if (derivation? origin)
-          (derivation->output-path origin output)
-          origin)))
+  "Return the origin's REALISED output path when DRV's OUTPUTS are reserved,
+or #f so the caller falls back to upstream's graft-origin-file-name.  ORIGIN
+and OUTPUT are the graft's fields, passed by the caller: they are record
+macros in (guix grafts), so they cannot be looked up here, and that module
+imports this one."
+  (and (goonix-unrealised-outputs drv outputs)
+       (goonix-graft-origin-realised store origin output)))
 
 ;;; graft.scm ends here

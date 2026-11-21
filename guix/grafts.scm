@@ -301,9 +301,11 @@ derivations to the corresponding set of grafts."
          (mlet %state-monad ((grafts (dependency-grafts deps)))
            (let ((grafts (delete-duplicates (concatenate grafts) equal?)))
              (match (filter (lambda (graft)
-                              (member ((@ (guix ca graft) goonix-graft-origin) ;goonix:
-                                       store drv outputs (graft-origin graft)
-                                       (graft-origin-output graft)) deps))
+                              (member (or ((@ (guix ca graft) goonix-graft-origin) ;goonix:
+                                           store drv outputs (graft-origin graft)
+                                           (graft-origin-output graft))
+                                          (graft-origin-file-name graft))
+                                      deps))
                             grafts)
                (()
                 (return grafts))
