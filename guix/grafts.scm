@@ -179,24 +179,11 @@ references."
                     (append-map (cut references/cached store <>) items))))
       (append-map (cut references/cached store <>) items)))
 
-  ;; goonix: a reserved output (a placeholder or a self token) is not a store
-  ;; item yet, so querying its references would make the daemon refuse the
-  ;; reserved path and drop the connection.  The goonix helper builds DRV by
-  ;; its .drv file name when needed and reads the references of the REALISED
-  ;; outputs, keeping upstream's "graft only what the output refers to" rule.
-  ;; With no reserved output the upstream path below runs unchanged.
-  (if ((@ (guix ca graft) goonix-unrealised-outputs) drv outputs)
-      (let ((refs ((@ (guix ca graft) goonix-references-of-realised)
-                   store drv outputs))
-            (self (filter-map
-                   (lambda (output)
-                     ((@ (guix ca graft) goonix-realised-output-path)
-                      store drv output))
-                   outputs)))
-        (remove (cut member <> self) refs))
-      (let* ((self (map (cut derivation->output-path drv <>) outputs))
-             (refs (references* self)))
-        (remove (cut member <> self) refs))))
+  (let* ((self (map (cut derivation->output-path drv <>) outputs))
+         (refs (or ((@ (guix ca graft) goonix-non-self-references) ;goonix: hook
+                    store drv outputs)
+                   (references* self))))
+    (remove (cut member <> self) refs)))
 
 (define %graft-cache
   ;; Cache that maps derivation/outputs/grafts tuples to lists of grafts.
@@ -302,12 +289,8 @@ derivations to the corresponding set of grafts."
                      (cumulative-grafts store drv grafts
                                         #:guile guile
                                         #:system system)))))
-            ;; goonix: resolve against REALISED output paths when DRV's own
-            ;; outputs are reserved: a content-addressed input's declared path
-            ;; is a placeholder and would match none of the realised ITEMS,
-            ;; silently dropping every graft.
-            (if ((@ (guix ca graft) goonix-unrealised-outputs) drv outputs)
-                ((@ (guix ca graft) goonix-reference-origins) store drv items)
+            (or ((@ (guix ca graft) goonix-reference-origins*) ;goonix: hook
+                 store drv items)
                 (reference-origins drv items))))
 
     (with-cache (list (derivation-file-name drv) outputs grafts)
@@ -318,19 +301,9 @@ derivations to the corresponding set of grafts."
          (mlet %state-monad ((grafts (dependency-grafts deps)))
            (let ((grafts (delete-duplicates (concatenate grafts) equal?)))
              (match (filter (lambda (graft)
-                              ;; goonix: compare the origin's REALISED path
-                              ;; when DRV's outputs are reserved, since DEPS
-                              ;; are realised paths.
-                              (member
-                               (if ((@ (guix ca graft) goonix-unrealised-outputs)
-                                    drv outputs)
-                                   ((@ (guix ca graft)
-                                       goonix-graft-origin-realised)
-                                    store
-                                    (graft-origin graft)
-                                    (graft-origin-output graft))
-                                   (graft-origin-file-name graft))
-                               deps))
+                              (member ((@ (guix ca graft) goonix-graft-origin) ;goonix:
+                                       store drv outputs (graft-origin graft)
+                                       (graft-origin-output graft)) deps))
                             grafts)
                (()
                 (return grafts))

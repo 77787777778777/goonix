@@ -25,6 +25,9 @@
             goonix-realised-output-path
             goonix-references-of-realised
             goonix-reference-origins
+            goonix-reference-origins*
+            goonix-non-self-references
+            goonix-graft-origin
             goonix-graft-origin-realised))
 
 ;;; Commentary:
@@ -216,5 +219,39 @@ does not import (guix grafts), which imports it."
       (or (goonix-realised-output-path store origin output)
           (derivation->output-path origin output))
       origin))
+
+(define (goonix-non-self-references store drv outputs)
+  "Return the references of DRV's OUTPUTS with self references removed, or
+#f when no output is reserved so the caller uses upstream's expression.
+
+Upstream's rule is kept: graft only what the output really refers to.  A
+reserved output cannot be queried, so DRV is BUILT by its .drv file name
+(as upstream's build-on-missing fallback does) and the references are read
+from the REALISED outputs."
+  (and (goonix-unrealised-outputs drv outputs)
+       (let ((refs (goonix-references-of-realised store drv outputs))
+             (self (filter-map
+                    (lambda (output)
+                      (goonix-realised-output-path store drv output))
+                    outputs)))
+         (remove (lambda (ref) (member ref self)) refs))))
+
+(define (goonix-reference-origins* store drv items)
+  "Like goonix-reference-origins, but return #f when none of DRV's outputs is
+reserved, so the caller falls back to upstream's reference-origins."
+  (and (goonix-unrealised-outputs drv (derivation-output-names drv))
+       (goonix-reference-origins store drv items)))
+
+(define (goonix-graft-origin store drv outputs origin output)
+  "Return the path to compare against DEPS for a graft: the origin's
+REALISED path when DRV's OUTPUTS are reserved, otherwise upstream's declared
+output path.  ORIGIN and OUTPUT are the graft's fields, passed by the
+caller: they are record macros in (guix grafts), so they cannot be looked up
+here, and that module imports this one."
+  (if (goonix-unrealised-outputs drv outputs)
+      (goonix-graft-origin-realised store origin output)
+      (if (derivation? origin)
+          (derivation->output-path origin output)
+          origin)))
 
 ;;; graft.scm ends here
